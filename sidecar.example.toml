@@ -1,6 +1,7 @@
 # Example configuration for s3-sidecar.
-# This milestone forwards requests to one origin endpoint.
-# Set cache.mode to "off" for the proxy core.
+#
+# Cache mode forwards reads to the cache S3 endpoint and can accept writes
+# before origin receives them. Cluster mode is rejected by this build.
 
 mode = "cache"                 # cache | cluster
 
@@ -17,13 +18,29 @@ secret_access_key = "minioadmin"
 # force_path_style = true
 
 [cache]
-mode = "off"                   # off | read | write | read_write
-# max_bytes = 0                # Required when cache.mode is not "off". 0 is unlimited.
-# max_object_bytes = 1073741824
-# write_policy = "write_back"  # write_back | write_through
-# on_cache_error = "origin"    # origin | fail
-# high_watermark = 0.9
-# low_watermark = 0.8
+endpoint = "http://127.0.0.1:9002"
+region = "us-east-1"
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+# force_path_style = true
+prefix = "cache"
+node_id = "node-a"
+mode = "read_write"            # off | read | write | read_write
+max_bytes = 0                  # Required when mode is not "off". 0 is unlimited.
+max_object_bytes = 1073741824
+write_policy = "write_back"    # write_back | write_through
+on_cache_error = "origin"      # origin | fail
+high_watermark = 0.9
+low_watermark = 0.8
+# staging_ttl = "1h"           # Age at which a blob with no metadata is an orphan.
+# orphan_ttl = "24h"           # Age at which a failed journal entry is removed.
+# sync_workers = 4
+# sync_max_attempts = 5
+# sync_retry_base_ms = 200
+# sync_debounce_ms = 100
+# gc_interval = "60s"
+# index_path = "s3-sidecar-cache-index.redb"
+# serve_quarantined = false
 
 [backing]
 # Cluster mode only.
