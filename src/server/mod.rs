@@ -181,6 +181,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/_coord/propose",
             post(crate::cluster::consul::http::propose),
         )
+        .route(
+            "/_blob/{uuid}",
+            get(crate::cluster::blob::get)
+                .put(crate::cluster::blob::put)
+                .head(crate::cluster::blob::head)
+                .delete(crate::cluster::blob::delete),
+        )
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024));
     Router::new()
         .route("/healthz", get(health))

@@ -30,6 +30,7 @@ const SYSTEM: TableDefinition<&str, u64> = TableDefinition::new("system");
 const RAFT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const RAFT_META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
 const SNAPSHOT: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot");
+const REPLICATION: TableDefinition<&[u8], &[u8]> = TableDefinition::new("replication");
 
 const APPLIED_KEY: &str = "applied";
 const LAST_APPLIED_KEY: &str = "last_applied";
@@ -156,6 +157,39 @@ pub struct UploadRecord {
     pub created_at: i64,
 }
 
+/// One blob operation in the replication queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationOp {
+    /// Copy a local blob to a target node.
+    Put,
+    /// Delete a blob on a target node.
+    Delete,
+}
+
+/// One durable replication job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicationJob {
+    /// Blob identifier. It is the queue key.
+    pub uuid: String,
+    /// Blob operation.
+    pub op: ReplicationOp,
+    /// Nodes that must receive the operation.
+    pub targets: Vec<String>,
+    /// Nodes that completed the operation.
+    pub done: Vec<String>,
+    /// Number of completed retry rounds.
+    pub attempts: u32,
+    /// Earliest time for the next attempt, in Unix seconds.
+    pub next_at: i64,
+    /// Queue time in Unix seconds.
+    pub created_at: i64,
+    /// Bucket that references the blob.
+    pub bucket: String,
+    /// Object key that references the blob.
+    pub key: String,
+}
+
 /// Result of one applied entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ApplyResult {
@@ -269,6 +303,11 @@ impl MetadataStore {
             {
                 write
                     .open_table(SNAPSHOT)
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+            }
+            {
+                write
+                    .open_table(REPLICATION)
                     .map_err(|error| CoordError::Storage(error.to_string()))?;
             }
             {
@@ -1091,6 +1130,276 @@ impl MetadataStore {
             .map_err(|error| CoordError::Storage(error.to_string()))
     }
 
+    /// Return one replication job.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn replication_job(&self, uuid: &str) -> Result<Option<ReplicationJob>, CoordError> {
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let table = read
+            .open_table(REPLICATION)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = table
+            .get(uuid.as_bytes())
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let job = serde_json::from_slice(value.value())
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        Ok(Some(job))
+    }
+
+    /// Add or merge one replication job.
+    ///
+    /// A put job keeps its progress and adds new targets. A delete job
+    /// replaces an existing job for the same blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn enqueue_replication_job(&self, job: &ReplicationJob) -> Result<(), CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let existing = read_replication_job_in_write(&write, &job.uuid)?;
+        let merged = match (existing, job.op) {
+            (Some(existing), ReplicationOp::Put) if existing.op == ReplicationOp::Put => {
+                let before = existing.targets.len();
+                let mut merged = existing;
+                for target in &job.targets {
+                    if !merged.targets.contains(target) {
+                        merged.targets.push(target.clone());
+                    }
+                    merged.done.retain(|done| done != target);
+                }
+                if merged.targets.len() > before {
+                    merged.attempts = 0;
+                }
+                merged.next_at = merged.next_at.min(job.next_at);
+                merged
+            }
+            _ => job.clone(),
+        };
+        write_replication_job(&write, &merged)?;
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))
+    }
+
+    /// Remove one replication job.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn remove_replication_job(&self, uuid: &str) -> Result<(), CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(REPLICATION)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            table
+                .remove(uuid.as_bytes())
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))
+    }
+
+    /// Claim one due replication job for the lease period.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn claim_due_replication_job(
+        &self,
+        now: i64,
+        lease: i64,
+    ) -> Result<Option<ReplicationJob>, CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let candidates = {
+            let table = write
+                .open_table(REPLICATION)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let range = table
+                .range::<&[u8]>(..)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut found = None;
+            for item in range {
+                let (_, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
+                let job: ReplicationJob = serde_json::from_slice(value.value())
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                if job.next_at <= now {
+                    found = Some(job);
+                    break;
+                }
+            }
+            found
+        };
+        let Some(job) = candidates else {
+            return Ok(None);
+        };
+        let mut leased = job.clone();
+        leased.next_at = now.saturating_add(lease);
+        write_replication_job(&write, &leased)?;
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        Ok(Some(job))
+    }
+
+    /// Mark one target as complete for a replication job.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn complete_replication_target(&self, uuid: &str, target: &str) -> Result<(), CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let Some(mut job) = read_replication_job_in_write(&write, uuid)? else {
+            return Ok(());
+        };
+        job.targets.retain(|value| value != target);
+        if !job.done.iter().any(|value| value == target) {
+            job.done.push(target.to_owned());
+        }
+        {
+            let mut table = write
+                .open_table(REPLICATION)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            if job.targets.is_empty() {
+                table
+                    .remove(uuid.as_bytes())
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+            } else {
+                let value = serde_json::to_vec(&job)
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                table
+                    .insert(uuid.as_bytes(), value.as_slice())
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+            }
+        }
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))
+    }
+
+    /// Set the retry time for one replication job.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn reschedule_replication_job(
+        &self,
+        uuid: &str,
+        attempts: u32,
+        next_at: i64,
+    ) -> Result<(), CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let Some(mut job) = read_replication_job_in_write(&write, uuid)? else {
+            return Ok(());
+        };
+        job.attempts = attempts;
+        job.next_at = next_at;
+        write_replication_job(&write, &job)?;
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))
+    }
+
+    /// Return every replication job.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn replication_jobs(&self) -> Result<Vec<ReplicationJob>, CoordError> {
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let table = read
+            .open_table(REPLICATION)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let range = table
+            .range::<&[u8]>(..)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let mut output = Vec::new();
+        for item in range {
+            let (_, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
+            let job = serde_json::from_slice(value.value())
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            output.push(job);
+        }
+        Ok(output)
+    }
+
+    /// Return the queue depth and the age of the oldest job in seconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn replication_stats(&self, now: i64) -> Result<(u64, u64), CoordError> {
+        let jobs = self.replication_jobs()?;
+        let depth = u64::try_from(jobs.len()).unwrap_or(u64::MAX);
+        let oldest = jobs
+            .iter()
+            .map(|job| job.created_at)
+            .min()
+            .map_or(0, |created| now.saturating_sub(created));
+        Ok((depth, u64::try_from(oldest).unwrap_or(u64::MAX)))
+    }
+
+    /// Return true when committed metadata references a blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn has_committed_blob_reference(&self, blob: &str) -> Result<bool, CoordError> {
+        for (_, _, metadata) in self.scan_all()? {
+            if metadata.is_committed() && metadata.blob == blob {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Export the applied state as JSON bytes.
     ///
     /// # Errors
@@ -1399,6 +1708,38 @@ fn read_metadata_in_write(
     let metadata = serde_json::from_slice(value.value())
         .map_err(|error| CoordError::Storage(error.to_string()))?;
     Ok(Some(metadata))
+}
+
+fn read_replication_job_in_write(
+    write: &redb::WriteTransaction,
+    uuid: &str,
+) -> Result<Option<ReplicationJob>, CoordError> {
+    let table = write
+        .open_table(REPLICATION)
+        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    let value = table
+        .get(uuid.as_bytes())
+        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let job = serde_json::from_slice(value.value())
+        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    Ok(Some(job))
+}
+
+fn write_replication_job(
+    write: &redb::WriteTransaction,
+    job: &ReplicationJob,
+) -> Result<(), CoordError> {
+    let value = serde_json::to_vec(job).map_err(|error| CoordError::Storage(error.to_string()))?;
+    let mut table = write
+        .open_table(REPLICATION)
+        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    table
+        .insert(job.uuid.as_bytes(), value.as_slice())
+        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    Ok(())
 }
 
 fn write_metadata(

@@ -1,15 +1,17 @@
 //! Single-node cluster mode: staged writes, metadata reads, and garbage
 //! collection.
 
+pub mod blob;
 pub mod consul;
 pub mod coordinator;
 pub mod raft;
+pub mod replication;
 pub mod state;
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -68,8 +70,10 @@ pub struct Cluster {
     consul: Option<Arc<ConsulCoordinator>>,
     client: S3Client,
     credential: Arc<ClientCredential>,
+    http: reqwest::Client,
     node_id: String,
     metrics: Arc<Metrics>,
+    reconcile_cursor: AtomicUsize,
 }
 
 impl Cluster {
@@ -171,6 +175,13 @@ impl Cluster {
             config.backing.session_token.clone(),
             Vec::new(),
         ));
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .build()
+            .map_err(|_| S3Error::internal())?;
         Ok(Some(Arc::new(Self {
             config,
             state,
@@ -180,8 +191,10 @@ impl Cluster {
             consul,
             client,
             credential,
+            http,
             node_id,
             metrics,
+            reconcile_cursor: AtomicUsize::new(0),
         })))
     }
 
@@ -220,6 +233,36 @@ impl Cluster {
                 };
                 if let Err(error) = cluster.gc_once().await {
                     warn!(%error, "cluster garbage collection failed");
+                }
+            }
+        });
+        for _ in 0..self.config.cluster.replicate_workers.max(1) {
+            let weak = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    let Some(cluster) = weak.upgrade() else {
+                        break;
+                    };
+                    let worked = cluster.replication_tick().await;
+                    drop(cluster);
+                    if !worked {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+            });
+        }
+        let interval = self.config.cluster.reconcile_interval.as_duration();
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(cluster) = weak.upgrade() else {
+                    break;
+                };
+                if let Err(error) = cluster.reconcile_once().await {
+                    warn!(%error, "cluster reconciliation failed");
                 }
             }
         });
@@ -348,6 +391,9 @@ impl Cluster {
         } else if let Some(single) = &self.single {
             single.refresh_metrics();
         }
+        if let Ok((depth, age)) = self.state.replication_stats(state::unix_now()) {
+            self.metrics.set_replication_queue(depth, age);
+        }
     }
 
     /// Apply one object write.
@@ -383,6 +429,8 @@ impl Cluster {
             return Err(error);
         }
         let (etag, checksum, size) = fingerprint_result(&fingerprint);
+        let bucket_config = self.bucket_config(bucket)?;
+        let replicas = self.replicas_for(bucket, key, bucket_config.replicas);
         let request = CommitRequest {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
@@ -394,7 +442,7 @@ impl Cluster {
             etag: etag.clone(),
             user_metadata: user_metadata(headers),
             owner: self.node_id.clone(),
-            replicas: vec![self.node_id.clone()],
+            replicas,
             if_none_match,
             if_match,
             cache_control: header_string(headers, header::CACHE_CONTROL),
@@ -418,6 +466,7 @@ impl Cluster {
                 let ApplyResult::Commit(metadata) = applied.result else {
                     return Err(S3Error::internal());
                 };
+                self.enqueue_put_replication(bucket, key, &metadata);
                 Ok(put_response(&metadata))
             }
             Err(error) => {
@@ -530,6 +579,8 @@ impl Cluster {
             }
             return Err(S3Error::from_status(response.status()));
         }
+        let bucket_config = self.bucket_config(bucket)?;
+        let replicas = self.replicas_for(bucket, key, bucket_config.replicas);
         let request = CommitRequest {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
@@ -541,7 +592,7 @@ impl Cluster {
             etag: source.etag.clone(),
             user_metadata,
             owner: self.node_id.clone(),
-            replicas: vec![self.node_id.clone()],
+            replicas,
             if_none_match,
             if_match,
             cache_control,
@@ -565,6 +616,7 @@ impl Cluster {
                 let ApplyResult::Commit(metadata) = applied.result else {
                     return Err(S3Error::internal());
                 };
+                self.enqueue_put_replication(bucket, key, &metadata);
                 Ok(copy_response(&metadata))
             }
             Err(error) => {
@@ -612,6 +664,31 @@ impl Cluster {
         if !metadata.is_committed() {
             return Err(no_such_key());
         }
+        if config.read == ReadMode::Local {
+            return if let Some(response) = self.local_blob(&metadata, method, headers).await? {
+                Ok(response)
+            } else {
+                self.metrics.missing_blob();
+                Err(no_such_key().with_header("x-s3-sidecar-owner", &metadata.owner))
+            };
+        }
+        if let Some(response) = self.local_blob(&metadata, method, headers).await? {
+            return Ok(response);
+        }
+        if let Some(response) = self.fetch_from_peers(&metadata, method, headers).await? {
+            Ok(response)
+        } else {
+            self.metrics.missing_blob();
+            Err(no_such_key().with_header("x-s3-sidecar-owner", &metadata.owner))
+        }
+    }
+
+    async fn local_blob(
+        &self,
+        metadata: &Metadata,
+        method: &Method,
+        headers: &HeaderMap,
+    ) -> Result<Option<Response>, S3Error> {
         let mut request_headers = HeaderMap::new();
         if let Some(range) = headers.get(header::RANGE) {
             request_headers.insert(header::RANGE, range.clone());
@@ -629,8 +706,7 @@ impl Cluster {
             .await
             .map_err(|error| storage_error(error, None))?;
         if response.status() == StatusCode::NOT_FOUND {
-            self.metrics.missing_blob();
-            return Err(no_such_key().with_header("x-s3-sidecar-owner", &metadata.owner));
+            return Ok(None);
         }
         if !response.status().is_success() {
             return Err(S3Error::from_status(response.status()));
@@ -641,9 +717,9 @@ impl Cluster {
             .fetch_add(metadata.size, Ordering::Relaxed);
         if method == Method::HEAD {
             drop(response);
-            return Ok(metadata_response(&metadata));
+            return Ok(Some(metadata_response(metadata)));
         }
-        Ok(stream_response(response, &metadata))
+        Ok(Some(stream_response(response, metadata)))
     }
 
     /// Delete one object. A missing key also returns `204`.
@@ -671,6 +747,9 @@ impl Cluster {
             .await
             .map_err(map_coord_error)?;
         self.refresh_metrics();
+        if let Some(current) = &current {
+            self.enqueue_delete_replication(bucket, key, current);
+        }
         if let Some(blob) = blob {
             let client = self.client.clone();
             let credential = Arc::clone(&self.credential);
@@ -935,6 +1014,8 @@ impl Cluster {
             .state
             .get_metadata(&record.bucket, &record.key)
             .map_err(map_coord_error)?;
+        let bucket_config = self.bucket_config(&record.bucket)?;
+        let replicas = self.replicas_for(&record.bucket, &record.key, bucket_config.replicas);
         let request = CommitRequest {
             bucket: record.bucket.clone(),
             key: record.key.clone(),
@@ -946,7 +1027,7 @@ impl Cluster {
             etag: etag.clone(),
             user_metadata: record.user_metadata.clone(),
             owner: self.node_id.clone(),
-            replicas: vec![self.node_id.clone()],
+            replicas,
             if_none_match: false,
             if_match: None,
             cache_control: record.cache_control.clone(),
@@ -973,6 +1054,7 @@ impl Cluster {
                 let ApplyResult::Commit(metadata) = applied.result else {
                     return Err(S3Error::internal());
                 };
+                self.enqueue_put_replication(&record.bucket, &record.key, &metadata);
                 Ok(xml_response(
                     StatusCode::OK,
                     format!(

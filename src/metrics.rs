@@ -1,5 +1,6 @@
 //! Per-function counters and a Prometheus text rendering.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
@@ -52,6 +53,24 @@ pub struct Metrics {
     pub cluster_term: AtomicU64,
     /// Calls to `read_index`.
     pub cluster_read_index_calls: AtomicU64,
+    /// Reads served by a peer blob fetch.
+    pub cluster_peer_fetches: AtomicU64,
+    /// Peer reads that stored the blob locally.
+    pub cluster_read_repairs: AtomicU64,
+    /// Replication operations that reached a target.
+    pub cluster_replication_success: AtomicU64,
+    /// Replication failures by status or transport class.
+    pub cluster_replication_failures: Mutex<BTreeMap<String, u64>>,
+    /// Pending replication jobs.
+    pub cluster_replication_queue_depth: AtomicU64,
+    /// Age of the oldest pending replication job in seconds.
+    pub cluster_replication_oldest_age_seconds: AtomicU64,
+    /// Replica targets checked by reconciliation.
+    pub cluster_reconcile_checked: AtomicU64,
+    /// Replica targets present during reconciliation.
+    pub cluster_reconcile_present: AtomicU64,
+    /// Replica targets missing during reconciliation.
+    pub cluster_reconcile_missing: AtomicU64,
     /// Current raft term.
     pub raft_term: AtomicU64,
     /// Last raft log index.
@@ -165,6 +184,49 @@ impl Metrics {
     pub fn read_index_called(&self) {
         self.cluster_read_index_calls
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one peer blob fetch.
+    pub fn peer_fetch(&self) {
+        self.cluster_peer_fetches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one read-repair write.
+    pub fn read_repaired(&self) {
+        self.cluster_read_repairs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one successful replication operation.
+    pub fn replication_success(&self) {
+        self.cluster_replication_success
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one replication failure by status or transport class.
+    pub fn replication_failure(&self, status: &str) {
+        let mut failures = self
+            .cluster_replication_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *failures.entry(status.to_owned()).or_insert(0) += 1;
+    }
+
+    /// Set the replication queue gauges.
+    pub fn set_replication_queue(&self, depth: u64, oldest_age_seconds: u64) {
+        self.cluster_replication_queue_depth
+            .store(depth, Ordering::Relaxed);
+        self.cluster_replication_oldest_age_seconds
+            .store(oldest_age_seconds, Ordering::Relaxed);
+    }
+
+    /// Record one reconciliation pass.
+    pub fn set_reconcile(&self, checked: u64, present: u64, missing: u64) {
+        self.cluster_reconcile_checked
+            .store(checked, Ordering::Relaxed);
+        self.cluster_reconcile_present
+            .store(present, Ordering::Relaxed);
+        self.cluster_reconcile_missing
+            .store(missing, Ordering::Relaxed);
     }
 
     /// Set the raft leader name.
@@ -366,6 +428,76 @@ pub fn render(metrics: &Metrics, pending: u64, sync_lag_seconds: u64) -> String 
         "Calls to the coordinator read index.",
         metrics.cluster_read_index_calls.load(Ordering::Relaxed),
     );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_peer_fetches_total",
+        "Reads served by a peer blob fetch.",
+        metrics.cluster_peer_fetches.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_read_repairs_total",
+        "Peer reads that stored the blob locally.",
+        metrics.cluster_read_repairs.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_replication_success_total",
+        "Replication operations that reached a target.",
+        metrics.cluster_replication_success.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_replication_queue_depth",
+        "Pending replication jobs.",
+        metrics
+            .cluster_replication_queue_depth
+            .load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_replication_oldest_age_seconds",
+        "Age of the oldest pending replication job in seconds.",
+        metrics
+            .cluster_replication_oldest_age_seconds
+            .load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_reconcile_checked_total",
+        "Replica targets checked by reconciliation.",
+        metrics.cluster_reconcile_checked.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_reconcile_present_total",
+        "Replica targets present during reconciliation.",
+        metrics.cluster_reconcile_present.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_reconcile_missing_total",
+        "Replica targets missing during reconciliation.",
+        metrics.cluster_reconcile_missing.load(Ordering::Relaxed),
+    );
+    {
+        let failures = metrics
+            .cluster_replication_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        output.push_str(
+            "# HELP s3_sidecar_cluster_replication_failures_total Replication failures by status.\n",
+        );
+        output.push_str("# TYPE s3_sidecar_cluster_replication_failures_total gauge\n");
+        for (status, count) in failures.iter() {
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                output,
+                "s3_sidecar_cluster_replication_failures_total{{status=\"{}\"}} {count}",
+                escape_label(status)
+            );
+        }
+    }
     push_counter(
         &mut output,
         "s3_sidecar_raft_term",
