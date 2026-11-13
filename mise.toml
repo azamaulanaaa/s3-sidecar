@@ -34,3 +34,15 @@ run = ".githooks/ci-check.sh push"
 [tasks.hooks]
 description = "Install the Git hooks for this clone"
 run = "git config core.hooksPath .githooks"
+
+[tasks.bench]
+description = "Build release and run the benchmark script"
+run = "bash scripts/bench.sh"
+
+[tasks.loadgen]
+description = "Build the load generator example"
+run = "cargo build --release --example loadgen"
+
+[tasks.fuzz]
+description = "Run both fuzz targets for 60 seconds each"
+run = "cd fuzz && cargo +nightly fuzz run sigv4 -- -max_total_time=60 && cargo +nightly fuzz run s3_xml -- -max_total_time=60"
