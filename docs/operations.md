@@ -77,6 +77,10 @@ Two or more sidecars with `consensus.backend = "consul"`.
 The knobs are per bucket. They are stored in the metadata backend and seeded
 from the config file. A restart does not overwrite them.
 
+The file default is `write_ack = "leader"`, `read = "local_then_peer"`,
+`replicas = 1`, and `min_replicas = 1`. A replicated cluster usually sets
+`replicas = 3` and `min_replicas = 2`.
+
 ### Definitions
 
 - A **commit** is a metadata entry applied by the leader.
@@ -208,8 +212,8 @@ series that the table marks as a counter.
 | `cache.low_watermark` | 0.8 | Eviction stops at or below this fraction. |
 | `cache.sync_workers` | 4 | Concurrent key syncs to origin. |
 | `cache.sync_max_attempts` | 5 | Retries before a sync is quarantined. |
-| `replicas` | 3 | Intended blob copies, including the owner. Must not exceed `cluster.nodes.len()`. |
-| `min_replicas` | 2 | Copies that must hold a blob before a quorum write is acknowledged. Must be at least 1 and at most `replicas`. |
+| `replicas` | 1 | Intended blob copies, including the owner. Must not exceed `cluster.nodes.len()`. |
+| `min_replicas` | 1 | Copies that must hold a blob before a quorum write is acknowledged. Must be at least 1 and at most `replicas`. |
 | `cluster.replicate_workers` | 4 | Concurrent asynchronous replication jobs per node. |
 | `cluster.replicate_timeout` | 10s | Bound for one synchronous peer copy. |
 | `server.max_connections` | 1024 | Concurrent S3 requests. An excess request returns `503 SlowDown` with `Retry-After: 1`. |
