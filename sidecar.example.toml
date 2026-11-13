@@ -1,9 +1,8 @@
 # Example configuration for s3-sidecar.
 #
 # Cache mode forwards reads to the cache S3 endpoint and can accept writes
-# before origin receives them. Cluster mode with consensus.backend = "single"
-# serves the object API from one node. The raft and consul backends are not in
-# this build.
+# before origin receives them. Cluster mode serves the object API from one or
+# more nodes. Use consensus.backend = "single", "raft", or "consul".
 
 mode = "cache"                 # cache | cluster
 
@@ -73,6 +72,19 @@ backend = "single"             # single | raft | consul
 # [[consensus.raft.nodes]]
 # id = "b"
 # addr = "http://127.0.0.1:9100"
+
+[consensus.consul]
+# The consul backend uses Consul KV as the metadata authority.
+# node_id = "a"
+# address = "http://127.0.0.1:8500"
+# advertise_addr = "http://127.0.0.1:9000"
+# Prefer S3_SIDECAR_CONSENSUS__CONSUL__TOKEN_FILE or
+# --consensus-consul-token-file in production.
+# token = ""
+# session_ttl = "15s"          # The Consul minimum is 10s.
+# Prefer S3_SIDECAR_CONSENSUS__CONSUL__SECRET_FILE or
+# --consensus-consul-secret-file in production.
+# secret = "replace-me"
 
 [cluster]
 # Cluster mode only.

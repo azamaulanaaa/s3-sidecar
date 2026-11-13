@@ -11,18 +11,20 @@ single-node foundation of M2 (coordination):
 - Read-through cache with TTL and `If-None-Match` revalidation.
 - Write-back journal with async origin sync, deletes, and tombstones.
 - Quarantine, retry with backoff, garbage collection, and LRU eviction.
-- Cluster mode with `consensus.backend = "single"` or `"raft"`: staged writes,
-  a `redb` metadata state machine, metadata-backed reads and listing, multipart,
-  tombstones, garbage collection, and metrics.
+- Cluster mode with `consensus.backend = "single"`, `"raft"`, or `"consul"`:
+  staged writes, a `redb` metadata state machine, metadata-backed reads and
+  listing, multipart, tombstones, garbage collection, and metrics.
 - Raft mode with an `openraft` leader, a `redb` log store, snapshots, and an
   HTTP transport for internal RPCs.
+- Consul mode with a session-based leader, KV compare-and-swap writes, a
+  materialized `redb` cache, and a blocking-query watcher.
 - Health, readiness, and Prometheus metrics endpoints.
 - `s3-sidecar check --show-config` with redacted secrets and field sources.
 
 Raft mode replicates metadata. Blob bytes stay on the node that accepted the
 write. Peer blob replication, `write_ack = quorum|all`, and
-`read = local_then_peer` peer fetch are later milestones. The `consul` backend
-returns `NotImplemented`.
+`read = local_then_peer` peer fetch are later milestones. Consul mode keeps the
+same limits and uses Consul KV as the metadata authority.
 
 ## Build and test
 
@@ -444,6 +446,97 @@ applied at least one entry.
   return an error while the write is visible.
 - Metadata replicates. Blobs stay on the owner node.
 
+### Consul mode
+
+Set `consensus.backend = "consul"`. Consul KV is the metadata authority. Each
+node keeps `cluster.metadata_path` as a materialized cache so reads, listing,
+multipart, and GC use the same local code path.
+
+```toml
+[consensus]
+backend = "consul"
+
+[consensus.consul]
+node_id = "a"
+address = "http://127.0.0.1:8500"
+advertise_addr = "http://127.0.0.1:9000"
+# Prefer S3_SIDECAR_CONSENSUS__CONSUL__TOKEN_FILE or
+# --consensus-consul-token-file in production.
+token = ""
+session_ttl = "15s"
+# Prefer S3_SIDECAR_CONSENSUS__CONSUL__SECRET_FILE or
+# --consensus-consul-secret-file in production.
+secret = "replace-me"
+```
+
+Rules:
+
+- `address`, `advertise_addr`, `node_id`, and `secret` are required.
+- `address` and `advertise_addr` must be absolute `http://` or `https://` URLs.
+- `session_ttl` must be at least `10s`, the Consul minimum.
+- `token` is optional. The sidecar sends it as `X-Consul-Token` when it is set.
+- `secret` is the proposal token. Internal `/_coord/propose` requests must send
+  `x-s3-sidecar-consul-token` with this value. A missing or wrong token returns
+  `401`.
+- Both `token` and `secret` accept `_FILE` environment variables, secret-file
+  flags, and the stdin flags. Do not put either value in `argv`.
+
+Consul keys:
+
+```
+s3-sidecar/leader                      {"id":"a","addr":"http://..."}
+s3-sidecar/meta/<hex(bucket)>/<hex(key)>   metadata JSON
+s3-sidecar/bucket/<hex(bucket)>            bucket consistency JSON
+```
+
+Hex encoding keeps keys URL-safe and keeps one prefix scan per bucket.
+
+At startup, the sidecar fetches `s3-sidecar/meta/?recurse` and applies every
+value to `redb`. A blocking query on the same prefix then applies changes.
+Each full prefix response reconciles deletions: a local row that Consul no
+longer has is removed. A local `Pending` multipart row is kept. This costs one
+full namespace scan per change. Use it for moderate namespaces, not millions
+of keys.
+
+The first node that acquires `s3-sidecar/leader` with its session is the
+leader. The leader renews the session at about half the TTL. A failed renewal
+or a lost leader key causes a step-down. A follower forwards a proposal to
+`POST <leader.addr>/_coord/propose`. If no leader exists, writes return `503`.
+
+The leader reads the current key from Consul, applies `If-None-Match` and
+`If-Match` against that value, then writes with `cas=<ModifyIndex>`. A new key
+uses `cas=0`. The leader retries a bounded number of compare-and-swap
+conflicts. A condition failure returns `412`. A conflict that persists returns
+`409`. On success, `version` is the new `ModifyIndex`, and the value is applied
+to local `redb`. A rejected proposal deletes the staged blob.
+
+`read = "local"` serves the materialized store. `read = "leader"` reads the
+key or bucket prefix from Consul with `?consistent`, updates `redb`, then
+serves. DELETE writes a tombstone with compare-and-swap. The leader removes
+tombstone keys older than `cluster.orphan_ttl`.
+
+Readiness is false until the first full reconcile completes and a leader
+exists.
+
+Consul metrics include `s3_sidecar_consul_leader`,
+`s3_sidecar_consul_materialized`,
+`s3_sidecar_consul_session_renewals_total`,
+`s3_sidecar_consul_session_losses_total`, and
+`s3_sidecar_consul_leader_changes_total`.
+
+#### Consul limits
+
+- Blob replication, peer fetch, read repair, and `write_ack = quorum|all` are
+  M3 work.
+- Multipart upload records and pending rows are node-local.
+- The watcher reconciles the full metadata prefix. Large namespaces pay one
+  full scan per change.
+- A forwarded proposal has no idempotency key. A commit-then-timeout retry can
+  return an error while the write is visible.
+- Metadata replicates through Consul. Blobs stay on the owner node.
+- Consul ACL policy is not created by the sidecar. Grant KV write access under
+  `s3-sidecar/` and session create, renew, and destroy access.
+
 Blobs live in `backing.bucket` under `objects/`:
 
 ```
@@ -519,13 +612,16 @@ index, term, and read-index calls.
 
 - Path-style bucket addressing only.
 - One origin endpoint and one cache endpoint.
-- Cluster mode supports `consensus.backend = "single"` and `"raft"`. The
-  `consul` backend, peer blob replication, quorum acknowledgements
+- Cluster mode supports `consensus.backend = "single"`, `"raft"`, and
+  `"consul"`. Peer blob replication, quorum acknowledgements
   (`write_ack = "quorum"|"all"`), and `local_then_peer` peer fetch are not
   implemented. Cluster mode requires `backing.bucket`.
 - Raft mode replicates metadata only. A committed blob is available only on the
   node that accepted the write until peer replication exists. A read on another
-  node returns `404` with `x-s3-sidecar-owner`.
+  node returns `404` with `x-s3-sidecar-owner`. Consul mode has the same blob
+  limit.
+- Consul mode materializes the full metadata prefix on each change. The cost
+  grows with the namespace size.
 - `bootstrap = true` belongs on one node. A restart of that node keeps the
   existing cluster. A fresh second node with `bootstrap = false` waits for the
   leader and does not form a cluster alone.
