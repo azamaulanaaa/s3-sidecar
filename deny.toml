@@ -1,0 +1,44 @@
+# cargo-deny policy for s3-sidecar.
+# The project uses the dual license MIT OR Apache-2.0.
+
+[graph]
+# Build the crate graph with all features enabled.
+all-features = true
+# An empty target list covers every target.
+targets = []
+
+[advisories]
+version = 2
+# Use the default RustSec advisory database.
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# Fail the check when a crate version is yanked.
+yanked = "deny"
+
+[licenses]
+version = 2
+# Allow only the two project licenses.
+allow = ["MIT", "Apache-2.0"]
+# Require a high confidence score for license text detection.
+confidence-threshold = 0.9
+
+[bans]
+# Fail the check when one crate has more than one version.
+multiple-versions = "deny"
+# Fail the check when a dependency uses a wildcard version.
+wildcards = "deny"
+# Show both duplicate paths in a graph.
+highlight = "all"
+# Allow default features for workspace crates.
+workspace-default-features = "allow"
+# Allow default features for external crates.
+external-default-features = "allow"
+
+[sources]
+# Fail the check for unknown registries.
+unknown-registry = "deny"
+# Fail the check for unknown git sources.
+unknown-git = "deny"
+# Allow only the crates.io registry.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Allow no git sources.
+allow-git = []
