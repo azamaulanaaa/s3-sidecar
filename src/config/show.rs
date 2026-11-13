@@ -8,7 +8,7 @@ use super::loader::{Source, SourceMap};
 // The table builder lists each field one time, in field order.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
-    let mut rows: Vec<(String, String, Source)> = Vec::new();
+    let mut rows: Vec<(String, String, String)> = Vec::new();
 
     push_row(&mut rows, sources, "mode", config.mode.to_string());
     push_row(
@@ -44,7 +44,7 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         "cache.secret_access_key",
         config.cache.secret_access_key.redacted().to_owned(),
     );
-    push_row(
+    push_optional(
         &mut rows,
         sources,
         "cache.session_token",
@@ -68,7 +68,7 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         "cache.mode",
         config.cache.mode.to_string(),
     );
-    push_row(
+    push_optional(
         &mut rows,
         sources,
         "cache.max_bytes",
@@ -147,7 +147,7 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
                 &format!("{base}.secret_access_key"),
                 client.secret_access_key.redacted().to_owned(),
             );
-            push_row(
+            push_optional(
                 &mut rows,
                 sources,
                 &format!("{base}.session_token"),
@@ -173,13 +173,13 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
                 &format!("{base}.name"),
                 bucket.name.clone(),
             );
-            push_row(
+            push_optional(
                 &mut rows,
                 sources,
                 &format!("{base}.ttl"),
                 bucket.ttl.map_or_else(String::new, |ttl| ttl.to_string()),
             );
-            push_row(
+            push_optional(
                 &mut rows,
                 sources,
                 &format!("{base}.cache_mode"),
@@ -187,7 +187,7 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
                     .cache_mode
                     .map_or_else(String::new, |value| value.to_string()),
             );
-            push_row(
+            push_optional(
                 &mut rows,
                 sources,
                 &format!("{base}.cache_write_policy"),
@@ -195,7 +195,7 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
                     .cache_write_policy
                     .map_or_else(String::new, |value| value.to_string()),
             );
-            push_row(
+            push_optional(
                 &mut rows,
                 sources,
                 &format!("{base}.write_ack"),
@@ -203,7 +203,7 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
                     .write_ack
                     .map_or_else(String::new, |value| value.to_string()),
             );
-            push_row(
+            push_optional(
                 &mut rows,
                 sources,
                 &format!("{base}.read"),
@@ -211,7 +211,7 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
                     .read
                     .map_or_else(String::new, |value| value.to_string()),
             );
-            push_row(
+            push_optional(
                 &mut rows,
                 sources,
                 &format!("{base}.replicas"),
@@ -219,7 +219,7 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
                     .replicas
                     .map_or_else(String::new, |value| value.to_string()),
             );
-            push_row(
+            push_optional(
                 &mut rows,
                 sources,
                 &format!("{base}.min_replicas"),
@@ -259,7 +259,7 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
 }
 
 fn push_endpoint(
-    rows: &mut Vec<(String, String, Source)>,
+    rows: &mut Vec<(String, String, String)>,
     sources: &SourceMap,
     prefix: &str,
     endpoint: &super::EndpointConfig,
@@ -288,7 +288,7 @@ fn push_endpoint(
         &format!("{prefix}.secret_access_key"),
         endpoint.secret_access_key.redacted().to_owned(),
     );
-    push_row(
+    push_optional(
         rows,
         sources,
         &format!("{prefix}.session_token"),
@@ -303,31 +303,41 @@ fn push_endpoint(
 }
 
 fn push_row(
-    rows: &mut Vec<(String, String, Source)>,
+    rows: &mut Vec<(String, String, String)>,
     sources: &SourceMap,
     field: &str,
     value: String,
 ) {
-    rows.push((field.to_owned(), value, source_at(sources, field)));
+    push_value(rows, sources, field, value, false);
 }
 
-fn source_at(sources: &SourceMap, field: &str) -> Source {
-    if let Some(source) = sources.get(field) {
-        return *source;
-    }
-    if let Some(bracket) = field.find('[')
-        && let Some(source) = sources.get(&field[..bracket])
-    {
-        return *source;
-    }
-    let mut current = field;
-    while let Some(dot) = current.rfind('.') {
-        current = &current[..dot];
-        if let Some(source) = sources.get(current) {
-            return *source;
-        }
-    }
-    Source::Default
+fn push_optional(
+    rows: &mut Vec<(String, String, String)>,
+    sources: &SourceMap,
+    field: &str,
+    value: String,
+) {
+    push_value(rows, sources, field, value, true);
+}
+
+fn push_value(
+    rows: &mut Vec<(String, String, String)>,
+    sources: &SourceMap,
+    field: &str,
+    value: String,
+    optional: bool,
+) {
+    let source = source_at(sources, field);
+    let (value, source) = match source {
+        Some(source) => (value, source.to_string()),
+        None if optional => ("(unset)".to_owned(), "unset".to_owned()),
+        None => (value, Source::Default.to_string()),
+    };
+    rows.push((field.to_owned(), value, source));
+}
+
+fn source_at(sources: &SourceMap, field: &str) -> Option<Source> {
+    sources.get(field).copied()
 }
 
 fn redact_option(value: Option<&super::secret::SecretString>) -> String {

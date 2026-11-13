@@ -325,16 +325,51 @@ fn merge(base: &mut Value, overlay: Value, source: Source, prefix: &str, sources
                         merge(existing, value, source, &path, sources);
                     }
                 } else {
+                    remove_descendants(sources, &path);
+                    record_sources(&value, source, &path, sources);
                     base_map.insert(key, value);
-                    sources.insert(path, source);
                 }
             }
         }
         (base_value, overlay_value) => {
+            remove_descendants(sources, prefix);
+            record_sources(&overlay_value, source, prefix, sources);
             *base_value = overlay_value;
-            sources.insert(prefix.to_owned(), source);
         }
     }
+}
+
+fn record_sources(value: &Value, source: Source, path: &str, sources: &mut SourceMap) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                record_sources(child, source, &child_path, sources);
+            }
+        }
+        Value::Array(items) => {
+            sources.insert(path.to_owned(), source);
+            for (index, child) in items.iter().enumerate() {
+                let child_path = format!("{path}[{index}]");
+                record_sources(child, source, &child_path, sources);
+            }
+        }
+        _ => {
+            sources.insert(path.to_owned(), source);
+        }
+    }
+}
+
+fn remove_descendants(sources: &mut SourceMap, path: &str) {
+    let dot_prefix = format!("{path}.");
+    let index_prefix = format!("{path}[");
+    sources.retain(|key, _| {
+        key != path && !key.starts_with(&dot_prefix) && !key.starts_with(&index_prefix)
+    });
 }
 
 /// Read a secret from a file. A final line break is removed.
@@ -524,5 +559,104 @@ buckets = ["media"]
         let env = vec![("S3_SIDECAR_BUCKETS".to_owned(), "not-json".to_owned())];
         let error = load_with(dir.path(), None, env, json!({})).unwrap_err();
         assert!(error.to_string().contains("S3_SIDECAR_BUCKETS"));
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{LoadOptions, load};
+    use crate::config::show_table;
+
+    fn line<'a>(table: &'a str, field: &str) -> &'a str {
+        table
+            .lines()
+            .find(|line| line.starts_with(field))
+            .unwrap_or_else(|| panic!("missing field {field} in\n{table}"))
+    }
+
+    #[test]
+    fn show_config_reports_each_field_source() {
+        let dir = tempdir().unwrap();
+        let file = r#"
+[origin]
+endpoint = "http://file:9000"
+[[clients]]
+access_key_id = "AKIA"
+secret_access_key = "secret"
+buckets = ["media"]
+[[buckets]]
+name = "media"
+"#;
+        let env = vec![(
+            "S3_SIDECAR_ORIGIN__REGION".to_owned(),
+            "eu-west-1".to_owned(),
+        )];
+        let flags = json!({"server": {"bind": "127.0.0.1:9999"}});
+        let path = dir.path().join("sidecar.toml");
+        std::fs::write(&path, file).unwrap();
+        let loaded = load(&LoadOptions {
+            config_flag: Some(path),
+            env,
+            flags,
+            cwd: dir.path().to_path_buf(),
+            default_paths: Vec::new(),
+        })
+        .unwrap();
+        let table = show_table(&loaded.config, &loaded.sources);
+
+        assert!(line(&table, "server.bind").contains("flag"));
+        assert!(line(&table, "server.bind").contains("127.0.0.1:9999"));
+        assert!(line(&table, "origin.endpoint").contains("file"));
+        assert!(line(&table, "origin.region").contains("env"));
+        assert!(line(&table, "origin.region").contains("eu-west-1"));
+        assert!(line(&table, "origin.force_path_style").contains("default"));
+        assert!(line(&table, "cache.prefix").contains("default"));
+        assert!(line(&table, "origin.session_token").contains("(unset)"));
+        assert!(line(&table, "origin.session_token").contains("unset"));
+        assert!(line(&table, "cache.max_bytes").contains("(unset)"));
+        assert!(line(&table, "clients[0].session_token").contains("(unset)"));
+        assert!(line(&table, "buckets[0].ttl").contains("(unset)"));
+    }
+
+    #[test]
+    fn flag_wins_over_env_and_file() {
+        let dir = tempdir().unwrap();
+        let file = r#"
+[server]
+bind = "127.0.0.1:1111"
+[origin]
+region = "us-east-1"
+"#;
+        let env = vec![
+            (
+                "S3_SIDECAR_SERVER__BIND".to_owned(),
+                "127.0.0.1:2222".to_owned(),
+            ),
+            (
+                "S3_SIDECAR_ORIGIN__REGION".to_owned(),
+                "eu-west-1".to_owned(),
+            ),
+        ];
+        let flags = json!({"server": {"bind": "127.0.0.1:3333"}});
+        let path = dir.path().join("sidecar.toml");
+        std::fs::write(&path, file).unwrap();
+        let loaded = load(&LoadOptions {
+            config_flag: Some(path),
+            env,
+            flags,
+            cwd: dir.path().to_path_buf(),
+            default_paths: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(loaded.config.server.bind, "127.0.0.1:3333");
+        assert_eq!(loaded.config.origin.region, "eu-west-1");
+        let table = show_table(&loaded.config, &loaded.sources);
+        assert!(line(&table, "server.bind").contains("flag"));
+        assert!(line(&table, "origin.region").contains("env"));
     }
 }
