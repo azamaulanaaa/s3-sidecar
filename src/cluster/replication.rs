@@ -16,7 +16,9 @@ use tracing::warn;
 
 use super::blob::CLUSTER_TOKEN_HEADER;
 use super::state::{Metadata, ReplicationJob, ReplicationOp, unix_now};
-use super::{Cluster, map_coord_error, metadata_response, set_metadata_headers};
+use super::{
+    Cluster, delete_backing_blob, map_coord_error, metadata_response, set_metadata_headers,
+};
 use crate::errors::S3Error;
 use crate::storage::{ForwardRequest, StorageError};
 
@@ -81,16 +83,24 @@ impl Cluster {
 
     /// Queue one put job for a newly committed blob.
     pub(crate) fn enqueue_put_replication(&self, bucket: &str, key: &str, metadata: &Metadata) {
-        if !metadata.is_committed() || metadata.blob.is_empty() {
-            return;
-        }
         let targets: Vec<String> = metadata
             .replicas
             .iter()
             .filter(|target| *target != &self.node_id)
             .cloned()
             .collect();
-        if targets.is_empty() {
+        self.enqueue_put_targets(bucket, key, metadata, targets);
+    }
+
+    /// Queue one put job for the intended peers that still need the blob.
+    pub(crate) fn enqueue_put_targets(
+        &self,
+        bucket: &str,
+        key: &str,
+        metadata: &Metadata,
+        targets: Vec<String>,
+    ) {
+        if !metadata.is_committed() || metadata.blob.is_empty() || targets.is_empty() {
             return;
         }
         let now = unix_now();
@@ -107,6 +117,81 @@ impl Cluster {
         };
         if let Err(error) = self.state.enqueue_replication_job(&job) {
             warn!(%error, "cannot queue blob replication");
+        }
+    }
+
+    /// Copy one staged blob to peers until the required count is reached.
+    ///
+    /// Return the peers that acknowledged the blob.
+    pub(crate) async fn replicate_blob_sync(
+        &self,
+        uuid: &str,
+        peers: &[String],
+        required: usize,
+    ) -> Vec<String> {
+        let mut acked = Vec::new();
+        if required == 0 {
+            return acked;
+        }
+        let timeout = self.config.cluster.replicate_timeout.as_duration();
+        for peer in peers {
+            if acked.len() >= required {
+                break;
+            }
+            let Some(address) = self.config.cluster.node_addr(peer).map(str::to_owned) else {
+                warn!(node = %peer, "replication target is not in cluster.nodes");
+                self.metrics.replica_ack_failure();
+                continue;
+            };
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(timeout, self.send_blob(&address, uuid)).await;
+            self.metrics.sync_replication(started.elapsed());
+            match result {
+                Ok(Ok(status)) if status.is_success() => {
+                    self.metrics.replica_ack();
+                    acked.push(peer.clone());
+                }
+                Ok(Ok(status)) => {
+                    self.metrics
+                        .replication_failure(&status.as_u16().to_string());
+                    self.metrics.replica_ack_failure();
+                    warn!(node = %peer, %status, "peer rejected the blob");
+                }
+                Ok(Err(error)) => {
+                    self.metrics.replication_failure("transport");
+                    self.metrics.replica_ack_failure();
+                    warn!(%error, node = %peer, "peer blob copy failed");
+                }
+                Err(_) => {
+                    self.metrics.replication_failure("timeout");
+                    self.metrics.replica_ack_failure();
+                    warn!(node = %peer, "peer blob copy timed out");
+                }
+            }
+        }
+        acked
+    }
+
+    /// Delete a staged blob on the owner and on the peers that accepted it.
+    pub(crate) async fn discard_staged_blob(&self, blob: &str, peers: &[String]) {
+        delete_backing_blob(
+            self.client.clone(),
+            std::sync::Arc::clone(&self.credential),
+            self.blob_bucket(),
+            blob.to_owned(),
+        )
+        .await;
+        let timeout = self.config.cluster.replicate_timeout.as_duration();
+        for peer in peers {
+            let Some(address) = self.config.cluster.node_addr(peer).map(str::to_owned) else {
+                continue;
+            };
+            if tokio::time::timeout(timeout, self.send_delete(&address, blob))
+                .await
+                .is_err()
+            {
+                warn!(node = %peer, "peer blob cleanup timed out");
+            }
         }
     }
 

@@ -434,6 +434,8 @@ pub struct ClusterConfig {
     pub read_repair: bool,
     /// Number of concurrent replication workers.
     pub replicate_workers: usize,
+    /// Maximum time to wait for one synchronous peer blob copy.
+    pub replicate_timeout: HumanDuration,
     /// Interval between replica reconciliation passes.
     pub reconcile_interval: HumanDuration,
     /// Every sidecar node and its listener address.
@@ -450,6 +452,7 @@ impl Default for ClusterConfig {
             secret: SecretString::default(),
             read_repair: true,
             replicate_workers: 4,
+            replicate_timeout: HumanDuration::new(Duration::from_secs(10)),
             reconcile_interval: HumanDuration::new(Duration::from_mins(5)),
             nodes: Vec::new(),
         }
@@ -797,15 +800,13 @@ fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
             "cluster.replicate_workers must be greater than 0",
         ));
     }
-    validate_cluster_nodes(config)?;
-    for bucket in &config.buckets {
-        if matches!(bucket.write_ack, Some(WriteAck::Quorum | WriteAck::All)) {
-            return Err(ConfigError::invalid(format!(
-                "bucket \"{}\" write_ack is not implemented in this build; use \"leader\"",
-                bucket.name
-            )));
-        }
+    if config.cluster.replicate_timeout.as_duration() == Duration::ZERO {
+        return Err(ConfigError::invalid(
+            "cluster.replicate_timeout must be greater than 0",
+        ));
     }
+    validate_cluster_nodes(config)?;
+    validate_bucket_replication(config)?;
     Ok(())
 }
 
@@ -863,6 +864,41 @@ fn validate_cluster_nodes(config: &Config) -> Result<(), ConfigError> {
             return Err(ConfigError::invalid(
                 "cluster.nodes must contain the local node id",
             ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_bucket_replication(config: &Config) -> Result<(), ConfigError> {
+    // A single-node cluster always has the local node. Use it when the
+    // directory is empty.
+    let node_count = config.cluster.nodes.len().max(1);
+    for bucket in &config.buckets {
+        let replicas = bucket.replicas.unwrap_or(1);
+        let min_replicas = bucket.min_replicas.unwrap_or(1);
+        if replicas == 0 {
+            return Err(ConfigError::invalid(format!(
+                "bucket \"{}\" replicas must be at least 1",
+                bucket.name
+            )));
+        }
+        if min_replicas == 0 {
+            return Err(ConfigError::invalid(format!(
+                "bucket \"{}\" min_replicas must be at least 1",
+                bucket.name
+            )));
+        }
+        if min_replicas > replicas {
+            return Err(ConfigError::invalid(format!(
+                "bucket \"{}\" min_replicas must not be greater than replicas",
+                bucket.name
+            )));
+        }
+        if u64::from(replicas) > u64::try_from(node_count).unwrap_or(u64::MAX) {
+            return Err(ConfigError::invalid(format!(
+                "bucket \"{}\" replicas must not be greater than cluster.nodes",
+                bucket.name
+            )));
         }
     }
     Ok(())
@@ -1407,15 +1443,62 @@ mod tests {
     }
 
     #[test]
-    fn quorum_write_ack_is_rejected() {
+    fn quorum_and_all_write_ack_are_accepted() {
+        for policy in [WriteAck::Quorum, WriteAck::All] {
+            let mut config = cluster_base();
+            config.buckets.push(BucketConfig {
+                name: "media".to_owned(),
+                write_ack: Some(policy),
+                replicas: Some(1),
+                min_replicas: Some(1),
+                ..BucketConfig::default()
+            });
+            assert!(validate(&config).is_ok());
+        }
+    }
+
+    #[test]
+    fn min_replicas_must_not_exceed_replicas() {
         let mut config = cluster_base();
+        config.cluster.nodes = vec![ClusterNodeConfig {
+            id: "a".to_owned(),
+            addr: "http://127.0.0.1:9000".to_owned(),
+        }];
+        config.cluster.secret = secret::SecretString::new("cluster-secret");
         config.buckets.push(BucketConfig {
             name: "media".to_owned(),
-            write_ack: Some(WriteAck::Quorum),
+            replicas: Some(1),
+            min_replicas: Some(2),
             ..BucketConfig::default()
         });
         let error = validate(&config).unwrap_err();
-        assert!(error.to_string().contains("not implemented"));
+        assert!(error.to_string().contains("min_replicas"));
+    }
+
+    #[test]
+    fn replicas_must_not_exceed_cluster_nodes() {
+        let mut config = cluster_base();
+        config.cluster.nodes = vec![ClusterNodeConfig {
+            id: "a".to_owned(),
+            addr: "http://127.0.0.1:9000".to_owned(),
+        }];
+        config.cluster.secret = secret::SecretString::new("cluster-secret");
+        config.buckets.push(BucketConfig {
+            name: "media".to_owned(),
+            replicas: Some(2),
+            min_replicas: Some(1),
+            ..BucketConfig::default()
+        });
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("cluster.nodes"));
+    }
+
+    #[test]
+    fn replicate_timeout_must_be_positive() {
+        let mut config = cluster_base();
+        config.cluster.replicate_timeout = HumanDuration::new(Duration::ZERO);
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("replicate_timeout"));
     }
 
     #[test]

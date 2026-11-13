@@ -277,12 +277,16 @@ impl RaftNode {
         &self,
         entry: Entry,
     ) -> Result<openraft::raft::ClientWriteResponse<TypeConfig>, CoordError> {
-        use openraft::errors::{ClientWriteError, RaftError};
+        use openraft::errors::{ClientWriteError, Fatal, RaftError};
         match self.raft.client_write(entry).await {
             Ok(response) => Ok(response),
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
                 Err(CoordError::Unavailable)
             }
+            Err(RaftError::Fatal(Fatal::StorageError(error))) => {
+                Err(CoordError::Storage(error.to_string()))
+            }
+            Err(RaftError::Fatal(_)) => Err(CoordError::Unavailable),
             Err(error) => Err(CoordError::Storage(error.to_string())),
         }
     }

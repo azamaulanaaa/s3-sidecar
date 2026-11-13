@@ -1224,7 +1224,7 @@ async fn leader_read_calls_the_read_index() {
 }
 
 #[tokio::test]
-async fn quorum_write_ack_is_rejected_at_startup() {
+async fn quorum_write_ack_is_accepted_at_startup() {
     let (backing, _) = spawn_backing().await;
     let dir = tempfile::tempdir().unwrap();
     let mut config = cluster_config(
@@ -1236,10 +1236,9 @@ async fn quorum_write_ack_is_rejected_at_startup() {
         86_400,
     );
     config.buckets[0].write_ack = Some(WriteAck::Quorum);
-    let valid = s3_sidecar::config::validate(&config).unwrap_err();
-    assert!(valid.to_string().contains("not implemented"));
-    let error = AppState::new(config).err().unwrap();
-    assert!(error.message.contains("not implemented"));
+    assert!(s3_sidecar::config::validate(&config).is_ok());
+    let state = AppState::new(config).unwrap();
+    assert!(state.cluster().is_some());
 }
 
 #[tokio::test]

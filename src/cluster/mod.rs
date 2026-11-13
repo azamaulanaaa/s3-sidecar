@@ -34,7 +34,7 @@ use self::raft::coordinator::RaftCoordinator;
 use self::state::{ApplyResult, BucketConfigRecord, Metadata, MetadataStore};
 use crate::auth::ClientCredential;
 use crate::auth::body::{BodyFailure, BodyStream, failure};
-use crate::config::{Config, ConsensusBackend, Mode, ReadMode};
+use crate::config::{Config, ConsensusBackend, Mode, ReadMode, WriteAck};
 use crate::errors::S3Error;
 use crate::metrics::Metrics;
 use crate::storage::{ForwardRequest, S3Client, StorageError};
@@ -102,21 +102,6 @@ impl Cluster {
     ) -> Result<Option<Arc<Self>>, S3Error> {
         if config.mode != Mode::Cluster {
             return Ok(None);
-        }
-        for bucket in &config.buckets {
-            if matches!(
-                bucket.write_ack,
-                Some(crate::config::WriteAck::Quorum | crate::config::WriteAck::All)
-            ) {
-                return Err(S3Error::new(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidRequest",
-                    &format!(
-                        "bucket \"{}\" write_ack is not implemented in this build; use \"leader\"",
-                        bucket.name
-                    ),
-                ));
-            }
         }
         let state = Arc::new(
             MetadataStore::open(Path::new(config.cluster.metadata_path.as_str())).map_err(
@@ -450,6 +435,60 @@ impl Cluster {
             content_disposition: header_string(headers, header::CONTENT_DISPOSITION),
             committed_at: state::unix_now(),
         };
+        let metadata = self
+            .commit_staged_write(bucket, key, &blob, request, &bucket_config)
+            .await?;
+        Ok(put_response(&metadata))
+    }
+
+    /// Replicate a staged blob as the bucket policy requires, then commit it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ServiceUnavailable` when the peer copies do not reach the
+    /// required count, and the coordinator error when the commit fails.
+    async fn commit_staged_write(
+        &self,
+        bucket: &str,
+        key: &str,
+        blob: &str,
+        mut request: CommitRequest,
+        bucket_config: &BucketConfigRecord,
+    ) -> Result<Metadata, S3Error> {
+        let policy = bucket_config.write_ack;
+        self.metrics.write_ack(&policy.to_string());
+        let intended: Vec<String> = request
+            .replicas
+            .iter()
+            .filter(|peer| *peer != &self.node_id)
+            .cloned()
+            .collect();
+        let required = match policy {
+            WriteAck::Leader => 0,
+            WriteAck::Quorum => {
+                usize::try_from(bucket_config.min_replicas.saturating_sub(1)).unwrap_or(usize::MAX)
+            }
+            WriteAck::All => intended.len(),
+        };
+        let acked = if policy == WriteAck::Leader {
+            Vec::new()
+        } else {
+            self.replicate_blob_sync(blob, &intended, required).await
+        };
+        if acked.len() < required {
+            self.metrics.aborted_write();
+            if policy == WriteAck::Quorum {
+                self.metrics.quorum_failure();
+            }
+            self.discard_staged_blob(blob, &acked).await;
+            return Err(S3Error::service_unavailable());
+        }
+        if policy != WriteAck::Leader {
+            let mut actual = Vec::with_capacity(acked.len().saturating_add(1));
+            actual.push(self.node_id.clone());
+            actual.extend(acked.iter().cloned());
+            request.replicas = actual;
+        }
         let started = Instant::now();
         let applied = self
             .coord
@@ -462,22 +501,31 @@ impl Cluster {
             Ok(applied) => {
                 self.metrics.commit_latency(started.elapsed());
                 self.metrics.committed_write();
+                if policy == WriteAck::Quorum {
+                    self.metrics.quorum_success();
+                }
                 self.refresh_metrics();
                 let ApplyResult::Commit(metadata) = applied.result else {
                     return Err(S3Error::internal());
                 };
-                self.enqueue_put_replication(bucket, key, &metadata);
-                Ok(put_response(&metadata))
+                if policy == WriteAck::Leader {
+                    self.enqueue_put_replication(bucket, key, &metadata);
+                } else {
+                    let remaining: Vec<String> = intended
+                        .iter()
+                        .filter(|peer| !acked.contains(peer))
+                        .cloned()
+                        .collect();
+                    self.enqueue_put_targets(bucket, key, &metadata, remaining);
+                }
+                Ok(metadata)
             }
             Err(error) => {
                 self.metrics.aborted_write();
-                delete_backing_blob(
-                    self.client.clone(),
-                    Arc::clone(&self.credential),
-                    self.blob_bucket(),
-                    blob,
-                )
-                .await;
+                if policy == WriteAck::Quorum {
+                    self.metrics.quorum_failure();
+                }
+                self.discard_staged_blob(blob, &acked).await;
                 Err(map_coord_error(error))
             }
         }
@@ -600,37 +648,10 @@ impl Cluster {
             content_disposition,
             committed_at: state::unix_now(),
         };
-        let started = Instant::now();
-        let applied = self
-            .coord
-            .propose(Entry::Commit {
-                term: self.coord.term(),
-                request: Box::new(request),
-            })
-            .await;
-        match applied {
-            Ok(applied) => {
-                self.metrics.commit_latency(started.elapsed());
-                self.metrics.committed_write();
-                self.refresh_metrics();
-                let ApplyResult::Commit(metadata) = applied.result else {
-                    return Err(S3Error::internal());
-                };
-                self.enqueue_put_replication(bucket, key, &metadata);
-                Ok(copy_response(&metadata))
-            }
-            Err(error) => {
-                self.metrics.aborted_write();
-                delete_backing_blob(
-                    self.client.clone(),
-                    Arc::clone(&self.credential),
-                    self.blob_bucket(),
-                    blob,
-                )
-                .await;
-                Err(map_coord_error(error))
-            }
-        }
+        let metadata = self
+            .commit_staged_write(bucket, key, &blob, request, &bucket_config)
+            .await?;
+        Ok(copy_response(&metadata))
     }
 
     /// Read one object or its metadata.
@@ -1035,52 +1056,37 @@ impl Cluster {
             content_disposition: record.content_disposition.clone(),
             committed_at: state::unix_now(),
         };
-        let started = Instant::now();
-        let applied = self
-            .coord
-            .propose(Entry::Commit {
-                term: self.coord.term(),
-                request: Box::new(request),
-            })
+        let result = self
+            .commit_staged_write(
+                &record.bucket,
+                &record.key,
+                &record.blob,
+                request,
+                &bucket_config,
+            )
             .await;
-        match applied {
-            Ok(applied) => {
-                self.metrics.commit_latency(started.elapsed());
-                self.metrics.committed_write();
-                self.state
-                    .remove_upload(&record.upload_id)
-                    .map_err(map_coord_error)?;
-                self.refresh_metrics();
-                let ApplyResult::Commit(metadata) = applied.result else {
-                    return Err(S3Error::internal());
-                };
-                self.enqueue_put_replication(&record.bucket, &record.key, &metadata);
-                Ok(xml_response(
-                    StatusCode::OK,
-                    format!(
-                        "<CompleteMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key>\
-                         <ETag>\"{}\"</ETag></CompleteMultipartUploadResult>",
-                        xml_escape(&record.bucket),
-                        xml_escape(&record.key),
-                        xml_escape(&metadata.etag)
-                    ),
-                ))
-            }
+        let metadata = match result {
+            Ok(metadata) => metadata,
             Err(error) => {
-                self.metrics.aborted_write();
-                delete_backing_blob(
-                    self.client.clone(),
-                    Arc::clone(&self.credential),
-                    self.blob_bucket(),
-                    record.blob.clone(),
-                )
-                .await;
                 self.state
                     .remove_upload(&record.upload_id)
                     .map_err(map_coord_error)?;
-                Err(map_coord_error(error))
+                return Err(error);
             }
-        }
+        };
+        self.state
+            .remove_upload(&record.upload_id)
+            .map_err(map_coord_error)?;
+        Ok(xml_response(
+            StatusCode::OK,
+            format!(
+                "<CompleteMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key>\
+                 <ETag>\"{}\"</ETag></CompleteMultipartUploadResult>",
+                xml_escape(&record.bucket),
+                xml_escape(&record.key),
+                xml_escape(&metadata.etag)
+            ),
+        ))
     }
 
     /// Abort one multipart upload.

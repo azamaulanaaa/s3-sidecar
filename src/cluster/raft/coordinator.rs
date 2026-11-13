@@ -110,7 +110,7 @@ impl RaftCoordinator {
             .json(&entry)
             .send()
             .await
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+            .map_err(|_| CoordError::Unavailable)?;
         if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             return Err(CoordError::Unavailable);
         }
@@ -154,7 +154,7 @@ impl RaftCoordinator {
             .json(&serde_json::json!({}))
             .send()
             .await
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+            .map_err(|_| CoordError::Unavailable)?;
         if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             return Err(CoordError::Unavailable);
         }
