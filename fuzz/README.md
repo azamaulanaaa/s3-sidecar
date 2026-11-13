@@ -13,11 +13,12 @@ workspace. The root `cargo test` and `cargo clippy` do not build it.
 
 ## Requirements
 
-Install the nightly toolchain and `cargo-fuzz` one time:
+Install the nightly toolchain and the pinned `cargo-fuzz` one time. This
+repository pins `cargo-fuzz` `0.13.2`.
 
 ```bash
 rustup toolchain install nightly
-cargo install cargo-fuzz
+cargo install cargo-fuzz --version 0.13.2 --locked
 ```
 
 ## Run a target

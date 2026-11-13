@@ -44,5 +44,5 @@ description = "Build the load generator example"
 run = "cargo build --release --example loadgen"
 
 [tasks.fuzz]
-description = "Run both fuzz targets for 60 seconds each"
-run = "cd fuzz && cargo +nightly fuzz run sigv4 -- -max_total_time=60 && cargo +nightly fuzz run s3_xml -- -max_total_time=60"
+description = "Install the pinned cargo-fuzz and run both targets for 60 seconds each"
+run = "cargo install cargo-fuzz --version 0.13.2 --locked && cd fuzz && cargo +nightly fuzz run sigv4 -- -max_total_time=60 && cargo +nightly fuzz run s3_xml -- -max_total_time=60"
