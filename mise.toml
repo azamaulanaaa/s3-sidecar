@@ -1,4 +1,5 @@
 [tools]
+cargo-deny = "latest"
 cargo-dist = "latest"
 rust = "stable"
 
@@ -17,6 +18,10 @@ run = "cargo fmt --all"
 [tasks.lint]
 description = "Run Clippy and fail on warnings"
 run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.deny]
+description = "Check dependencies with cargo-deny"
+run = "cargo deny check"
 
 [tasks.dist-plan]
 description = "Print the cargo-dist release plan"
