@@ -53,7 +53,6 @@ fn raft_config(ids: &[&str], node_id: &str, bootstrap: bool, path: &std::path::P
                 node_id: node_id.to_owned(),
                 bootstrap,
                 secret: SecretString::new("token"),
-                addr: format!("http://127.0.0.1:{}", 9000),
                 rpc_timeout: HumanDuration::new(Duration::from_secs(2)),
                 nodes,
                 ..RaftConfig::default()
@@ -481,7 +480,6 @@ async fn single_node_raft_serves_put_get_list_and_delete() {
             raft: RaftConfig {
                 node_id: "a".to_owned(),
                 secret: SecretString::new("token"),
-                addr: url.clone(),
                 rpc_timeout: HumanDuration::new(Duration::from_secs(2)),
                 nodes: vec![RaftNodeConfig {
                     id: "a".to_owned(),
@@ -606,7 +604,6 @@ async fn http_transport_replicates_and_serves_owner_headers() {
                     node_id: ids[index].to_owned(),
                     bootstrap: index == 0,
                     secret: SecretString::new("token"),
-                    addr: urls[index].clone(),
                     rpc_timeout: HumanDuration::new(Duration::from_secs(2)),
                     nodes,
                     ..RaftConfig::default()

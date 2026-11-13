@@ -333,8 +333,6 @@ pub struct RaftConfig {
     pub bootstrap: bool,
     /// Shared token for internal raft requests.
     pub secret: SecretString,
-    /// Base URL that this node advertises.
-    pub addr: String,
     /// Timeout for one internal raft request.
     pub rpc_timeout: HumanDuration,
     /// Addresses of the raft cluster members. The list includes this node.
@@ -348,7 +346,6 @@ impl Default for RaftConfig {
             peers: Vec::new(),
             bootstrap: false,
             secret: SecretString::default(),
-            addr: String::new(),
             rpc_timeout: HumanDuration::new(Duration::from_secs(5)),
             nodes: Vec::new(),
         }
@@ -773,16 +770,6 @@ fn validate_raft_backend(config: &Config) -> Result<(), ConfigError> {
             "consensus.raft.secret is required with the raft consensus backend",
         ));
     }
-    if raft.addr.trim().is_empty() {
-        return Err(ConfigError::invalid(
-            "consensus.raft.addr is required with the raft consensus backend",
-        ));
-    }
-    if !is_http_url(&raft.addr) {
-        return Err(ConfigError::invalid(
-            "consensus.raft.addr must start with http:// or https://",
-        ));
-    }
     let mut ids = HashSet::new();
     for node in &raft.nodes {
         if node.id.trim().is_empty() {
@@ -895,7 +882,8 @@ pub fn show_table(config: &Config, sources: &SourceMap) -> String {
 }
 
 fn is_http_url(value: &str) -> bool {
-    value.starts_with("http://") || value.starts_with("https://")
+    reqwest::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
 }
 
 #[cfg(test)]
@@ -1005,7 +993,6 @@ mod tests {
         let mut config = cluster_base();
         config.consensus.backend = ConsensusBackend::Raft;
         config.consensus.raft.peers.clear();
-        config.consensus.raft.addr = "http://127.0.0.1:9000".to_owned();
         config.consensus.raft.secret = secret::SecretString::new("token");
         config.consensus.raft.nodes = vec![
             RaftNodeConfig {
@@ -1042,6 +1029,14 @@ mod tests {
         config.consensus.raft.secret = secret::SecretString::new("");
         let error = validate(&config).unwrap_err();
         assert!(error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn raft_node_address_must_be_absolute() {
+        let mut config = raft_base();
+        config.consensus.raft.nodes[0].addr = "127.0.0.1:9000".to_owned();
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("addr"));
     }
 
     #[test]

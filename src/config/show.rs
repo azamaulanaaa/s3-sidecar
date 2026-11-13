@@ -216,12 +216,6 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
     push_row(
         &mut rows,
         sources,
-        "consensus.raft.addr",
-        config.consensus.raft.addr.clone(),
-    );
-    push_row(
-        &mut rows,
-        sources,
         "consensus.raft.rpc_timeout",
         config.consensus.raft.rpc_timeout.to_string(),
     );

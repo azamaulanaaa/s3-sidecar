@@ -293,7 +293,6 @@ fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
         "CONSENSUS__RAFT__PEERS" => (EnvKind::Json, vec!["consensus", "raft", "peers"]),
         "CONSENSUS__RAFT__BOOTSTRAP" => (EnvKind::Bool, vec!["consensus", "raft", "bootstrap"]),
         "CONSENSUS__RAFT__SECRET" => (EnvKind::Text, vec!["consensus", "raft", "secret"]),
-        "CONSENSUS__RAFT__ADDR" => (EnvKind::Text, vec!["consensus", "raft", "addr"]),
         "CONSENSUS__RAFT__RPC_TIMEOUT" => (EnvKind::Text, vec!["consensus", "raft", "rpc_timeout"]),
         "CONSENSUS__RAFT__NODES" => (EnvKind::Json, vec!["consensus", "raft", "nodes"]),
         "CLUSTER__STAGING_TTL" => (EnvKind::Text, vec!["cluster", "staging_ttl"]),
