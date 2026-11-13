@@ -460,6 +460,103 @@ fn spawn_sidecar(listener: TcpListener, config: Config) -> (Sidecar, Arc<AppStat
 }
 
 #[tokio::test]
+async fn single_node_raft_serves_put_get_list_and_delete() {
+    let dir = TempDir::new().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (backing_url, _) = spawn_backing().await;
+    let path = dir.path().join("a.redb");
+    let config = Config {
+        mode: Mode::Cluster,
+        backing: EndpointConfig {
+            endpoint: backing_url,
+            bucket: "data".to_owned(),
+            region: "us-east-1".to_owned(),
+            access_key_id: "AKIA".to_owned(),
+            secret_access_key: SecretString::new("secret"),
+            ..EndpointConfig::default()
+        },
+        consensus: ConsensusConfig {
+            backend: ConsensusBackend::Raft,
+            raft: RaftConfig {
+                node_id: "a".to_owned(),
+                secret: SecretString::new("token"),
+                addr: url.clone(),
+                rpc_timeout: HumanDuration::new(Duration::from_secs(2)),
+                nodes: vec![RaftNodeConfig {
+                    id: "a".to_owned(),
+                    addr: url.clone(),
+                }],
+                ..RaftConfig::default()
+            },
+        },
+        cluster: ClusterConfig {
+            metadata_path: path.display().to_string(),
+            ..ClusterConfig::default()
+        },
+        clients: vec![client_config()],
+        buckets: vec![BucketConfig {
+            name: "media".to_owned(),
+            ..BucketConfig::default()
+        }],
+        ..Config::default()
+    };
+    let (sidecar, state) = spawn_sidecar(listener, config);
+    state.start().await.unwrap();
+    state
+        .cluster()
+        .unwrap()
+        .wait_ready(Duration::from_secs(15))
+        .await
+        .unwrap();
+
+    let client = reqwest::Client::new();
+    let object_url = format!("{}/media/single.txt", sidecar.url);
+    let response = signed_request(&client, Method::PUT, &object_url, Some(b"single".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = signed_request(&client, Method::GET, &object_url, None)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.bytes().await.unwrap(),
+        Bytes::from_static(b"single")
+    );
+
+    let list_url = format!("{}/media?list-type=2", sidecar.url);
+    let response = signed_request(&client, Method::GET, &list_url, None)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("<Key>single.txt</Key>")
+    );
+
+    let response = signed_request(&client, Method::DELETE, &object_url, None)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = signed_request(&client, Method::GET, &object_url, None)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    sidecar.task.abort();
+    let _ = sidecar.task.await;
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn http_transport_replicates_and_serves_owner_headers() {
     let dir = TempDir::new().unwrap();
