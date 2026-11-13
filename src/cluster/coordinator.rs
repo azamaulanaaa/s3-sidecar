@@ -182,6 +182,18 @@ pub trait Coordinator: Send + Sync {
 
     /// Return an applied index that is safe to read from.
     fn read_index(&self) -> BoxFuture<'_, Result<u64, CoordError>>;
+
+    /// Refresh one key or bucket prefix from the authority before a read.
+    ///
+    /// Backends that apply locally do nothing. Consul uses a consistent read.
+    fn refresh_read<'a>(
+        &'a self,
+        bucket: &'a str,
+        key: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), CoordError>> {
+        let _ = (bucket, key);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// A single-node coordinator. It starts at term 1 and is always the leader.

@@ -1,6 +1,7 @@
 //! Single-node cluster mode: staged writes, metadata reads, and garbage
 //! collection.
 
+pub mod consul;
 pub mod coordinator;
 pub mod raft;
 pub mod state;
@@ -23,6 +24,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tracing::warn;
 
+use self::consul::api::{ConsulApi, HttpConsul};
+use self::consul::coordinator::ConsulCoordinator;
 use self::coordinator::{CommitRequest, CoordError, Coordinator, Entry, RejectReason, SingleNode};
 use self::raft::RaftNode;
 use self::raft::coordinator::RaftCoordinator;
@@ -62,6 +65,7 @@ pub struct Cluster {
     coord: Arc<dyn Coordinator>,
     single: Option<Arc<SingleNode>>,
     raft: Option<Arc<RaftCoordinator>>,
+    consul: Option<Arc<ConsulCoordinator>>,
     client: S3Client,
     credential: Arc<ClientCredential>,
     node_id: String,
@@ -73,16 +77,27 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// Returns an error when the backend is not implemented or the metadata
-    /// file cannot be opened.
+    /// Returns an error when the backend is not supported or the metadata file
+    /// cannot be opened.
     pub fn new(config: Arc<Config>, metrics: Arc<Metrics>) -> Result<Option<Arc<Self>>, S3Error> {
+        Self::new_with_consul_api(config, metrics, None)
+    }
+
+    /// Build cluster mode state with an explicit Consul API.
+    ///
+    /// A `None` API uses the HTTP client. Tests pass an in-memory API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend is not supported or the metadata file
+    /// cannot be opened.
+    pub fn new_with_consul_api(
+        config: Arc<Config>,
+        metrics: Arc<Metrics>,
+        consul_api: Option<Arc<dyn ConsulApi>>,
+    ) -> Result<Option<Arc<Self>>, S3Error> {
         if config.mode != Mode::Cluster {
             return Ok(None);
-        }
-        if config.consensus.backend == ConsensusBackend::Consul {
-            return Err(S3Error::not_implemented(
-                "the consul consensus backend is not implemented in this build",
-            ));
         }
         for bucket in &config.buckets {
             if matches!(
@@ -104,19 +119,50 @@ impl Cluster {
                 |error| S3Error::internal().with_header("x-s3-sidecar-error", &error.to_string()),
             )?,
         );
-        let node_id = config.consensus.raft.node_id.clone();
-        let (coord, single, raft): (Arc<dyn Coordinator>, _, _) = if config.consensus.backend
-            == ConsensusBackend::Raft
-        {
-            let coordinator = Arc::new(RaftCoordinator::new(
-                Arc::clone(&state),
-                Arc::clone(&metrics),
-                node_id.clone(),
-            ));
-            (coordinator.clone(), None, Some(coordinator))
-        } else {
-            let coordinator = Arc::new(SingleNode::new(Arc::clone(&state), Arc::clone(&metrics)));
-            (coordinator.clone(), Some(coordinator), None)
+        let mut single = None;
+        let mut raft = None;
+        let mut consul = None;
+        let coord: Arc<dyn Coordinator> = match config.consensus.backend {
+            ConsensusBackend::Raft => {
+                let coordinator = Arc::new(RaftCoordinator::new(
+                    Arc::clone(&state),
+                    Arc::clone(&metrics),
+                    config.consensus.raft.node_id.clone(),
+                ));
+                raft = Some(Arc::clone(&coordinator));
+                coordinator
+            }
+            ConsensusBackend::Consul => {
+                let api = match consul_api {
+                    Some(api) => api,
+                    None => {
+                        Arc::new(HttpConsul::new(&config.consensus.consul).map_err(|error| {
+                            S3Error::internal()
+                                .with_header("x-s3-sidecar-error", &error.to_string())
+                        })?)
+                    }
+                };
+                let coordinator = Arc::new(ConsulCoordinator::new(
+                    Arc::clone(&state),
+                    Arc::clone(&metrics),
+                    config.consensus.consul.clone(),
+                    api,
+                ));
+                consul = Some(Arc::clone(&coordinator));
+                coordinator
+            }
+            ConsensusBackend::Single => {
+                let coordinator =
+                    Arc::new(SingleNode::new(Arc::clone(&state), Arc::clone(&metrics)));
+                single = Some(Arc::clone(&coordinator));
+                coordinator
+            }
+        };
+        let node_id = match config.consensus.backend {
+            ConsensusBackend::Consul => config.consensus.consul.node_id.clone(),
+            ConsensusBackend::Raft | ConsensusBackend::Single => {
+                config.consensus.raft.node_id.clone()
+            }
         };
         let client = S3Client::new(&config.backing)?;
         let credential = Arc::new(ClientCredential::new(
@@ -131,6 +177,7 @@ impl Cluster {
             coord,
             single,
             raft,
+            consul,
             client,
             credential,
             node_id,
@@ -153,6 +200,10 @@ impl Cluster {
             .await
             .map_err(map_coord_error)?;
             coordinator.attach(node).map_err(map_coord_error)?;
+            let _ = self.wait_ready(std::time::Duration::from_secs(5)).await;
+        }
+        if let Some(coordinator) = &self.consul {
+            coordinator.start().await;
             let _ = self.wait_ready(std::time::Duration::from_secs(5)).await;
         }
         self.seed_buckets().await?;
@@ -195,9 +246,18 @@ impl Cluster {
             .and_then(|coordinator| coordinator.node())
     }
 
+    /// Return the Consul coordinator, when Consul mode is active.
+    #[must_use]
+    pub fn consul(&self) -> Option<&Arc<ConsulCoordinator>> {
+        self.consul.as_ref()
+    }
+
     /// Return true when cluster mode can serve reads and writes.
     #[must_use]
     pub fn is_ready(&self) -> bool {
+        if let Some(coordinator) = &self.consul {
+            return coordinator.is_ready();
+        }
         match &self.raft {
             Some(coordinator) => coordinator.node().is_some_and(|node| node.is_ready()),
             None => true,
@@ -207,6 +267,9 @@ impl Cluster {
     /// Return the readiness reason.
     #[must_use]
     pub fn not_ready_reason(&self) -> Option<&'static str> {
+        if let Some(coordinator) = &self.consul {
+            return coordinator.not_ready_reason();
+        }
         self.raft
             .as_ref()
             .and_then(|coordinator| coordinator.node().and_then(|node| node.not_ready_reason()))
@@ -254,7 +317,11 @@ impl Cluster {
                     .await
                 {
                     Ok(_) => {}
-                    Err(CoordError::Unavailable) if self.raft.is_some() => pending = true,
+                    Err(CoordError::Unavailable)
+                        if self.raft.is_some() || self.consul.is_some() =>
+                    {
+                        pending = true;
+                    }
                     Err(error) => return Err(map_coord_error(error)),
                 }
             }
@@ -274,7 +341,9 @@ impl Cluster {
 
     /// Refresh the applied index, term, and tombstone gauges.
     pub fn refresh_metrics(&self) {
-        if let Some(coordinator) = &self.raft {
+        if let Some(coordinator) = &self.consul {
+            coordinator.refresh_metrics();
+        } else if let Some(coordinator) = &self.raft {
             coordinator.refresh_metrics();
         } else if let Some(single) = &self.single {
             single.refresh_metrics();
@@ -528,6 +597,10 @@ impl Cluster {
         let config = self.bucket_config(bucket)?;
         if config.read == ReadMode::Leader {
             self.coord.read_index().await.map_err(map_coord_error)?;
+            self.coord
+                .refresh_read(bucket, Some(key))
+                .await
+                .map_err(map_coord_error)?;
         }
         let Some(metadata) = self
             .state
@@ -616,12 +689,19 @@ impl Cluster {
     /// # Errors
     ///
     /// Returns an error for an invalid token or a metadata read failure.
-    pub fn list_objects(&self, bucket: &str, query: &str) -> Result<Response, S3Error> {
+    pub async fn list_objects(&self, bucket: &str, query: &str) -> Result<Response, S3Error> {
         let pairs = query_pairs(query);
         if query_value(&pairs, "list-type") != Some("2") {
             return Err(S3Error::not_implemented(
                 "Only ListObjectsV2 is supported in cluster mode.",
             ));
+        }
+        if self.bucket_config(bucket)?.read == ReadMode::Leader {
+            self.coord.read_index().await.map_err(map_coord_error)?;
+            self.coord
+                .refresh_read(bucket, None)
+                .await
+                .map_err(map_coord_error)?;
         }
         let prefix = query_value(&pairs, "prefix").unwrap_or_default();
         let delimiter = query_value(&pairs, "delimiter").filter(|value| !value.is_empty());
@@ -1035,6 +1115,12 @@ impl Cluster {
                     .map_err(map_coord_error)?;
                 report.tombstones_removed += 1;
             }
+        }
+        if let Some(coordinator) = &self.consul {
+            coordinator
+                .expire_tombstones(self.config.cluster.orphan_ttl.as_duration())
+                .await
+                .map_err(map_coord_error)?;
         }
         let referenced = self.state.referenced_blobs().map_err(map_coord_error)?;
         for object in self.list_backing_objects().await? {

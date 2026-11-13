@@ -64,6 +64,16 @@ pub struct Metrics {
     pub raft_elections: AtomicU64,
     /// Current raft leader name.
     pub raft_leader_id: Mutex<String>,
+    /// Successful Consul session renewals.
+    pub consul_session_renewals: AtomicU64,
+    /// Consul sessions that ended or failed to renew.
+    pub consul_session_losses: AtomicU64,
+    /// Consul leadership acquisitions.
+    pub consul_leader_changes: AtomicU64,
+    /// One when the first Consul reconcile completed.
+    pub consul_materialized: AtomicU64,
+    /// Current Consul leader name.
+    pub consul_leader_id: Mutex<String>,
 }
 
 impl Metrics {
@@ -159,14 +169,12 @@ impl Metrics {
 
     /// Set the raft leader name.
     pub fn set_raft_leader(&self, leader: Option<&str>) {
-        let mut value = self
-            .raft_leader_id
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        value.clear();
-        if let Some(leader) = leader {
-            value.push_str(leader);
-        }
+        set_leader(&self.raft_leader_id, leader);
+    }
+
+    /// Set the Consul leader name.
+    pub fn set_consul_leader(&self, leader: Option<&str>) {
+        set_leader(&self.consul_leader_id, leader);
     }
 
     /// Set the coordinator gauges.
@@ -175,6 +183,14 @@ impl Metrics {
             .store(applied_index, Ordering::Relaxed);
         self.cluster_term.store(term, Ordering::Relaxed);
         self.cluster_tombstones.store(tombstones, Ordering::Relaxed);
+    }
+}
+
+fn set_leader(target: &Mutex<String>, leader: Option<&str>) {
+    let mut value = target.lock().unwrap_or_else(PoisonError::into_inner);
+    value.clear();
+    if let Some(leader) = leader {
+        value.push_str(leader);
     }
 }
 
@@ -380,6 +396,44 @@ pub fn render(metrics: &Metrics, pending: u64, sync_lag_seconds: u64) -> String 
         "Observed raft leader elections.",
         metrics.raft_elections.load(Ordering::Relaxed),
     );
+    push_counter(
+        &mut output,
+        "s3_sidecar_consul_session_renewals_total",
+        "Successful Consul session renewals.",
+        metrics.consul_session_renewals.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_consul_session_losses_total",
+        "Consul sessions that ended or failed to renew.",
+        metrics.consul_session_losses.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_consul_leader_changes_total",
+        "Consul leadership acquisitions.",
+        metrics.consul_leader_changes.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_consul_materialized",
+        "One when the first Consul reconcile completed.",
+        metrics.consul_materialized.load(Ordering::Relaxed),
+    );
+    let consul_leader = metrics
+        .consul_leader_id
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    output.push_str(
+        "# HELP s3_sidecar_consul_leader Current Consul leader. One means the named node.\n",
+    );
+    output.push_str("# TYPE s3_sidecar_consul_leader gauge\n");
+    let _ = writeln!(
+        output,
+        "s3_sidecar_consul_leader{{id=\"{}\"}} 1",
+        escape_label(&consul_leader)
+    );
+    drop(consul_leader);
     let leader = metrics
         .raft_leader_id
         .lock()

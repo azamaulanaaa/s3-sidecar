@@ -184,7 +184,7 @@ pub enum ApplyOutcome {
 }
 
 /// One applied entry and its index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Applied {
     /// Applied log index.
     pub index: u64,
@@ -912,6 +912,99 @@ impl MetadataStore {
                 .map_err(|error| CoordError::Storage(error.to_string()))?;
             table
                 .remove(encoded.as_slice())
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))
+    }
+
+    /// Store one metadata row from a remote coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn materialize_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+        metadata: &Metadata,
+    ) -> Result<(), CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let encoded = encode_metadata_key(bucket, key);
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        write_metadata(&write, &encoded, metadata)?;
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))
+    }
+
+    /// Remove one metadata row that the remote coordinator no longer holds.
+    ///
+    /// A local `Pending` row is kept. It belongs to an in-flight multipart
+    /// upload on this node.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn remove_materialized_metadata(&self, bucket: &str, key: &str) -> Result<(), CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let encoded = encode_metadata_key(bucket, key);
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        if read_metadata_in_write(&write, &encoded)?
+            .is_some_and(|metadata| metadata.state != ObjectState::Pending)
+        {
+            let mut table = write
+                .open_table(METADATA)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            table
+                .remove(encoded.as_slice())
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))
+    }
+
+    /// Store one bucket config from a remote coordinator.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn materialize_bucket_config(
+        &self,
+        bucket: &str,
+        config: &BucketConfigRecord,
+    ) -> Result<(), CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let key = encode_component(bucket);
+        let value =
+            serde_json::to_vec(config).map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(BUCKET_CONFIG)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            table
+                .insert(key.as_slice(), value.as_slice())
                 .map_err(|error| CoordError::Storage(error.to_string()))?;
         }
         write

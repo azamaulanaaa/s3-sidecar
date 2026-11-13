@@ -23,6 +23,7 @@ use crate::auth::verify::authenticate;
 use crate::auth::{AuthContext, ClientCredential, CredentialStore, PayloadKind, now};
 use crate::cache::Cache;
 use crate::cache::meta::{CacheMetadata, EntryState};
+use crate::cluster::consul::ConsulApi;
 use crate::cluster::{Cluster, WriteBody};
 use crate::config::{CacheMode, Config, Mode, WritePolicy};
 use crate::errors::S3Error;
@@ -49,6 +50,20 @@ impl AppState {
     ///
     /// Returns an error when an endpoint URL or the cache index is not valid.
     pub fn new(config: Config) -> Result<Self, S3Error> {
+        Self::new_with_consul_api(config, None)
+    }
+
+    /// Build the shared state with an explicit Consul API.
+    ///
+    /// A `None` API uses the HTTP client. Tests pass an in-memory API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an endpoint URL or the cache index is not valid.
+    pub fn new_with_consul_api(
+        config: Config,
+        consul_api: Option<Arc<dyn ConsulApi>>,
+    ) -> Result<Self, S3Error> {
         let config = Arc::new(config);
         let endpoint = if config.mode == Mode::Cluster {
             &config.backing
@@ -69,7 +84,8 @@ impl AppState {
             Ordering::Relaxed,
         );
         let cache = Cache::new(Arc::clone(&config), Arc::clone(&metrics))?;
-        let cluster = Cluster::new(Arc::clone(&config), Arc::clone(&metrics))?;
+        let cluster =
+            Cluster::new_with_consul_api(Arc::clone(&config), Arc::clone(&metrics), consul_api)?;
         Ok(Self {
             config,
             credentials,
@@ -160,6 +176,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/_raft/read_index",
             post(crate::cluster::raft::http::read_index),
+        )
+        .route(
+            "/_coord/propose",
+            post(crate::cluster::consul::http::propose),
         )
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024));
     Router::new()
@@ -454,7 +474,7 @@ async fn forward_cluster(
 
     if key.is_empty() {
         if method == Method::GET && query_param(query, "list-type").as_deref() == Some("2") {
-            return cluster.list_objects(&bucket, query);
+            return cluster.list_objects(&bucket, query).await;
         }
         return Err(S3Error::not_implemented(
             "This bucket operation is not supported in cluster mode.",
