@@ -105,8 +105,10 @@ impl fmt::Display for OnCacheError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsensusBackend {
-    /// Use the built-in raft implementation.
+    /// Use one local node with no network agreement.
     #[default]
+    Single,
+    /// Use the built-in raft implementation.
     Raft,
     /// Use Consul for coordination.
     Consul,
@@ -115,6 +117,7 @@ pub enum ConsensusBackend {
 impl fmt::Display for ConsensusBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Single => f.write_str("single"),
             Self::Raft => f.write_str("raft"),
             Self::Consul => f.write_str("consul"),
         }
@@ -326,6 +329,31 @@ pub struct ConsensusConfig {
     pub raft: RaftConfig,
 }
 
+/// Garbage collection and metadata settings for cluster mode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClusterConfig {
+    /// Age at which a staged blob with no commit is an orphan.
+    pub staging_ttl: HumanDuration,
+    /// Age at which a tombstone and its blob are removed.
+    pub orphan_ttl: HumanDuration,
+    /// Interval between garbage collection passes.
+    pub gc_interval: HumanDuration,
+    /// Path of the `redb` metadata file.
+    pub metadata_path: String,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            staging_ttl: HumanDuration::new(Duration::from_hours(1)),
+            orphan_ttl: HumanDuration::new(Duration::from_hours(24)),
+            gc_interval: HumanDuration::new(Duration::from_secs(60)),
+            metadata_path: "./s3-sidecar-meta.redb".to_owned(),
+        }
+    }
+}
+
 /// One client credential and its bucket allow-list.
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -391,6 +419,8 @@ pub struct Config {
     pub backing: EndpointConfig,
     /// Coordination settings.
     pub consensus: ConsensusConfig,
+    /// Cluster garbage collection and metadata settings.
+    pub cluster: ClusterConfig,
     /// Client credentials.
     pub clients: Vec<ClientConfig>,
     /// Per-bucket settings.
@@ -598,6 +628,16 @@ fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
     if config.mode != Mode::Cluster {
         return Ok(());
     }
+    if config.consensus.backend != ConsensusBackend::Single {
+        return Err(ConfigError::invalid(
+            "consensus backend is not implemented in this build",
+        ));
+    }
+    if config.cache.mode != CacheMode::Off {
+        return Err(ConfigError::invalid(
+            "cache.mode must be \"off\" when mode is \"cluster\"",
+        ));
+    }
     if config.consensus.raft.peers.is_empty() {
         return Err(ConfigError::invalid(
             "consensus.raft.peers must not be empty in cluster mode",
@@ -607,6 +647,55 @@ fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError::invalid(
             "consensus.raft.node_id is required in cluster mode",
         ));
+    }
+    if config.consensus.raft.peers.len() != 1 {
+        return Err(ConfigError::invalid(
+            "the single consensus backend requires exactly one peer",
+        ));
+    }
+    if !config
+        .consensus
+        .raft
+        .peers
+        .iter()
+        .any(|peer| peer == &config.consensus.raft.node_id)
+    {
+        return Err(ConfigError::invalid(
+            "consensus.raft.peers must contain consensus.raft.node_id",
+        ));
+    }
+    if config.backing.endpoint.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "backing.endpoint is required in cluster mode",
+        ));
+    }
+    if config.cluster.metadata_path.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "cluster.metadata_path must not be empty in cluster mode",
+        ));
+    }
+    if config.cluster.staging_ttl.as_duration() == Duration::ZERO {
+        return Err(ConfigError::invalid(
+            "cluster.staging_ttl must be greater than 0",
+        ));
+    }
+    if config.cluster.orphan_ttl.as_duration() == Duration::ZERO {
+        return Err(ConfigError::invalid(
+            "cluster.orphan_ttl must be greater than 0",
+        ));
+    }
+    if config.cluster.gc_interval.as_duration() == Duration::ZERO {
+        return Err(ConfigError::invalid(
+            "cluster.gc_interval must be greater than 0",
+        ));
+    }
+    for bucket in &config.buckets {
+        if matches!(bucket.write_ack, Some(WriteAck::Quorum | WriteAck::All)) {
+            return Err(ConfigError::invalid(format!(
+                "bucket \"{}\" write_ack is not implemented in this build; use \"leader\"",
+                bucket.name
+            )));
+        }
     }
     Ok(())
 }
@@ -774,6 +863,66 @@ mod tests {
         config.consensus.raft.node_id = "a".to_owned();
         let error = validate(&config).unwrap_err();
         assert!(error.to_string().contains("peers"));
+    }
+
+    fn cluster_base() -> Config {
+        let mut config = base();
+        config.mode = Mode::Cluster;
+        config.consensus.backend = ConsensusBackend::Single;
+        config.consensus.raft.node_id = "a".to_owned();
+        config.consensus.raft.peers = vec!["a".to_owned()];
+        config.backing.endpoint = "http://127.0.0.1:9002".to_owned();
+        config
+    }
+
+    #[test]
+    fn raft_and_consul_are_not_implemented() {
+        let mut config = cluster_base();
+        config.consensus.backend = ConsensusBackend::Raft;
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("not implemented"));
+        config.consensus.backend = ConsensusBackend::Consul;
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("not implemented"));
+    }
+
+    #[test]
+    fn cluster_mode_rejects_a_cache_mode() {
+        let mut config = cluster_base();
+        config.cache.mode = CacheMode::Write;
+        config.cache.endpoint = "http://127.0.0.1:9003".to_owned();
+        config.cache.bucket = "cache".to_owned();
+        config.cache.max_bytes = Some(0);
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("cache.mode"));
+    }
+
+    #[test]
+    fn cluster_peers_must_contain_the_node() {
+        let mut config = cluster_base();
+        config.consensus.raft.peers = vec!["b".to_owned()];
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("must contain"));
+    }
+
+    #[test]
+    fn single_backend_requires_one_peer() {
+        let mut config = cluster_base();
+        config.consensus.raft.peers = vec!["a".to_owned(), "b".to_owned()];
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("exactly one peer"));
+    }
+
+    #[test]
+    fn quorum_write_ack_is_rejected() {
+        let mut config = cluster_base();
+        config.buckets.push(BucketConfig {
+            name: "media".to_owned(),
+            write_ack: Some(WriteAck::Quorum),
+            ..BucketConfig::default()
+        });
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("not implemented"));
     }
 
     #[test]

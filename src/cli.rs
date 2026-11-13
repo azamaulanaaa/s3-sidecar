@@ -181,6 +181,18 @@ pub struct ConfigFlags {
     /// Raft peers as a JSON array.
     #[arg(long = "consensus-raft-peers", value_name = "JSON")]
     pub consensus_raft_peers: Option<String>,
+    /// Age at which a staged blob with no commit is an orphan.
+    #[arg(long = "cluster-staging-ttl", value_name = "DURATION")]
+    pub cluster_staging_ttl: Option<String>,
+    /// Age at which a tombstone and its blob are removed.
+    #[arg(long = "cluster-orphan-ttl", value_name = "DURATION")]
+    pub cluster_orphan_ttl: Option<String>,
+    /// Interval between cluster garbage collection passes.
+    #[arg(long = "cluster-gc-interval", value_name = "DURATION")]
+    pub cluster_gc_interval: Option<String>,
+    /// Path of the `redb` cluster metadata file.
+    #[arg(long = "cluster-metadata-path", value_name = "PATH")]
+    pub cluster_metadata_path: Option<String>,
     /// Buckets as a JSON array.
     #[arg(long = "buckets-json", value_name = "JSON")]
     pub buckets_json: Option<String>,
@@ -467,6 +479,34 @@ impl ConfigFlags {
         if let Some(value) = &self.consensus_raft_peers {
             let parsed = parse_json_array("--consensus-raft-peers", value)?;
             set(&mut object, &["consensus", "raft", "peers"], parsed);
+        }
+        if let Some(value) = &self.cluster_staging_ttl {
+            set(
+                &mut object,
+                &["cluster", "staging_ttl"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.cluster_orphan_ttl {
+            set(
+                &mut object,
+                &["cluster", "orphan_ttl"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.cluster_gc_interval {
+            set(
+                &mut object,
+                &["cluster", "gc_interval"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.cluster_metadata_path {
+            set(
+                &mut object,
+                &["cluster", "metadata_path"],
+                Value::String(value.clone()),
+            );
         }
 
         if let Some(value) = &self.buckets_json {

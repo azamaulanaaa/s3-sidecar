@@ -1,7 +1,9 @@
 # Example configuration for s3-sidecar.
 #
 # Cache mode forwards reads to the cache S3 endpoint and can accept writes
-# before origin receives them. Cluster mode is rejected by this build.
+# before origin receives them. Cluster mode with consensus.backend = "single"
+# serves the object API from one node. The raft and consul backends are not in
+# this build.
 
 mode = "cache"                 # cache | cluster
 
@@ -52,11 +54,18 @@ low_watermark = 0.8
 
 [consensus]
 # Cluster mode only.
-backend = "raft"               # raft | consul
+backend = "single"             # single | raft | consul
 
 [consensus.raft]
 # node_id = "a"
-# peers = ["a", "b", "c"]
+# peers = ["a"]
+
+[cluster]
+# Cluster mode only.
+# staging_ttl = "1h"           # Age at which an uncommitted blob is an orphan.
+# orphan_ttl = "24h"           # Age at which a tombstone and its blob are removed.
+# gc_interval = "60s"
+# metadata_path = "./s3-sidecar-meta.redb"
 
 [[clients]]
 access_key_id = "minioadmin"

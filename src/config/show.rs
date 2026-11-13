@@ -195,6 +195,30 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         "consensus.raft.peers",
         serde_json::to_string(&config.consensus.raft.peers).unwrap_or_else(|_| "[]".to_owned()),
     );
+    push_row(
+        &mut rows,
+        sources,
+        "cluster.staging_ttl",
+        config.cluster.staging_ttl.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cluster.orphan_ttl",
+        config.cluster.orphan_ttl.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cluster.gc_interval",
+        config.cluster.gc_interval.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cluster.metadata_path",
+        config.cluster.metadata_path.clone(),
+    );
 
     if config.clients.is_empty() {
         push_row(&mut rows, sources, "clients", "[]".to_owned());
