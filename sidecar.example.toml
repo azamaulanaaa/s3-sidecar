@@ -97,6 +97,7 @@ backend = "single"             # single | raft | consul
 # secret = "replace-me"
 # read_repair = true           # Store a peer blob locally while serving it.
 # replicate_workers = 4        # Concurrent replication workers.
+# replicate_timeout = "10s"    # Abort one synchronous peer copy after this time.
 # reconcile_interval = "5m"    # Replica reconciliation interval.
 # [[cluster.nodes]]            # The full node directory. Required for replication.
 # id = "a"
@@ -119,6 +120,11 @@ ttl = "1h"
 # cache_mode = "read_write"
 # cache_write_policy = "write_back"
 # write_ack = "leader"         # leader | quorum | all
+#                              # leader: acknowledge after the commit and
+#                              #   replicate asynchronously. A write can be lost
+#                              #   if the owner dies before replication.
+#                              # quorum: copy to min_replicas - 1 peers first.
+#                              # all: copy to every intended replica first.
 # read = "local_then_peer"     # local | local_then_peer | leader
 # replicas = 3
 # min_replicas = 2

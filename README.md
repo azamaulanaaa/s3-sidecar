@@ -24,9 +24,10 @@ single-node foundation of M2 (coordination):
 - `s3-sidecar check --show-config` with redacted secrets and field sources.
 
 Raft and Consul replicate metadata. Each node also copies blobs to its intended
-replicas through the internal `/_blob/` endpoints. `write_ack = quorum|all` is
-still a later milestone. `read = local_then_peer` serves a local blob or fetches
-it from a replica.
+replicas through the internal `/_blob/` endpoints. `write_ack` selects when the
+client receives `200`: after the leader commit, after a quorum of replicas, or
+after all replicas. `read = local_then_peer` serves a local blob or fetches it
+from a replica.
 
 ## Build and test
 
@@ -363,6 +364,7 @@ metadata_path = "./s3-sidecar-meta.redb"
 secret = "replace-me"
 read_repair = true
 replicate_workers = 4
+replicate_timeout = "10s"
 reconcile_interval = "5m"
 
 [[cluster.nodes]]
@@ -464,15 +466,16 @@ applied at least one entry.
 
 #### Raft limits
 
-- `write_ack = quorum|all` is M3b work. It is a validation error in this build.
+- `write_ack = "leader"` acknowledges after metadata commit. The owner can
+  acknowledge a write that is lost if it dies before replication.
 - Multipart upload records and pending rows are node-local.
 - Tombstone removal is local. Visibility is unchanged because tombstones are
   hidden.
 - The snapshot threshold is fixed at 64 log entries.
 - A forwarded proposal has no idempotency key. A commit-then-timeout retry can
   return an error while the write is visible.
-- Metadata replicates through raft. Blobs replicate asynchronously to the
-  committed replica set.
+- Metadata replicates through raft. Blobs replicate synchronously or
+  asynchronously according to `write_ack`.
 
 ### Consul mode
 
@@ -554,14 +557,15 @@ Consul metrics include `s3_sidecar_consul_leader`,
 
 #### Consul limits
 
-- `write_ack = quorum|all` is M3b work. It is a validation error in this build.
+- `write_ack = "leader"` acknowledges after metadata commit. The owner can
+  acknowledge a write that is lost if it dies before replication.
 - Multipart upload records and pending rows are node-local.
 - The watcher reconciles the full metadata prefix. Large namespaces pay one
   full scan per change.
 - A forwarded proposal has no idempotency key. A commit-then-timeout retry can
   return an error while the write is visible.
-- Metadata replicates through Consul. Blobs replicate asynchronously to the
-  committed replica set.
+- Metadata replicates through Consul. Blobs replicate synchronously or
+  asynchronously according to `write_ack`.
 - Consul ACL policy is not created by the sidecar. Grant KV write access under
   `s3-sidecar/` and session create, renew, and destroy access.
 
@@ -578,23 +582,42 @@ state machine. Keep this file on durable local storage.
 ### Write path
 
 A PUT streams the body to `objects/<uuid>`, computes the MD5 ETag and SHA-256
-checksum, then proposes a `Commit` entry. The client receives `200` only after
-the state machine applies the entry. A rejected proposal deletes the staged
-blob. A single PUT does not create a `Pending` metadata row. `Pending` is
-reserved for in-flight multipart uploads. The upload record is the durable
-staging reference.
+checksum, then applies the bucket `write_ack` policy. The client receives `200`
+only after the policy is satisfied and the state machine applies the entry. A
+rejected proposal deletes the staged blob and any peer copy. A single PUT does
+not create a `Pending` metadata row. `Pending` is reserved for in-flight
+multipart uploads. The upload record is the durable staging reference.
 
 The sidecar honors `If-None-Match: *` and `If-Match`. A failed condition returns
 `412 PreconditionFailed`, and no staged blob remains.
 
-`write_ack` accepts only `leader` in this build. `quorum` and `all` are
-validation errors. `read = "leader"` calls `read_index` before the metadata
-lookup. `read = "local_then_peer"` does not call `read_index`.
+`write_ack` has three values:
 
-The commit stores the intended replica set. The owner is always in the set. The
-other members are chosen from `cluster.nodes` by a hash of `bucket/key`. The
-same key always selects the same peers. If `replicas` is larger than the node
-count, the set contains every node.
+| Value | Acknowledge after | Trade-off |
+|---|---|---|
+| `leader` | The leader commits metadata. Blobs replicate asynchronously. | Fast. The owner can acknowledge a write that is lost if it dies before replication. |
+| `quorum` | The owner and at least `min_replicas - 1` peers hold the blob, then the leader commits. | Balanced. The write survives a minority peer failure. |
+| `all` | The owner and every intended replica hold the blob, then the leader commits. | Strongest. Any intended peer failure returns `503`. |
+
+The owner counts toward `replicas` and `min_replicas`. Quorum needs
+`min_replicas - 1` peer acknowledgements. The sidecar validates
+`1 <= min_replicas <= replicas <= cluster.nodes.len()` at startup. It copies
+blobs before the metadata commit. On a quorum or all failure, it deletes the
+staged blob on the owner and on the peers that accepted it, then returns `503
+ServiceUnavailable`. A metadata commit failure after the peer copies also
+deletes every staged blob and returns the commit error.
+
+The commit stores the actual replica set: the owner plus the peers that
+acknowledged. For `quorum` and `all`, the asynchronous queue holds only the
+intended replicas that do not have the blob. Each synchronous peer copy is
+aborted after `cluster.replicate_timeout`.
+
+`read = "leader"` calls `read_index` before the metadata lookup.
+`read = "local_then_peer"` does not call `read_index`.
+
+The replica set starts with the owner. The other members are chosen from
+`cluster.nodes` by a hash of `bucket/key`. The same key always selects the same
+peers.
 
 ### Read and list path
 
@@ -645,14 +668,19 @@ These routes bypass S3 client authentication. Each request must send
 returns `401`. A delete of a referenced blob returns `409`. The routes stream
 bodies and do not buffer a whole object.
 
-The sidecar returns `200` after the metadata commit, then queues one durable
-replication job in `redb`. A job holds the blob id, the target nodes, the
-completed nodes, the attempt count, the next attempt time, and the bucket and
-key. `cluster.replicate_workers` workers read due jobs. Each worker streams the
-blob from the local backing S3 endpoint to each target. It saves progress after
-each target. A restart resumes the remaining work. A transient failure uses
-exponential backoff with jitter. A permanent failure removes that target from
-the job.
+With `write_ack = "leader"`, the sidecar returns `200` after the metadata
+commit, then queues one durable replication job in `redb`. A job holds the blob
+id, the target nodes, the completed nodes, the attempt count, the next attempt
+time, and the bucket and key. `cluster.replicate_workers` workers read due jobs.
+Each worker streams the blob from the local backing S3 endpoint to each target.
+It saves progress after each target. A restart resumes the remaining work. A
+transient failure uses exponential backoff with jitter. A permanent failure
+removes that target from the job.
+
+With `write_ack = "quorum"` or `"all"`, the sidecar copies the blob to the
+required peers before the commit. It queues only the remaining intended peers
+for asynchronous replication. The commit metadata lists the owner and the peers
+that acknowledged.
 
 After a delete commits, the sidecar queues delete jobs for the old replica set
 and the owner. A receiving node deletes the blob only when its local metadata
@@ -668,10 +696,12 @@ replica has the blob, the entry stays in place for the next cycle. The sidecar
 does not remove a node from the intended set.
 
 Replication metrics include queue depth, oldest job age, success count, and
-failure count by status or transport class. Reconciliation metrics include the
-number of checked, present, and missing replica targets, owner blobs repaired,
-and owner blobs that no replica could supply. Read metrics include peer fetches
-and read repairs.
+failure count by status or transport class. Synchronous replication metrics
+include latency, copy attempts, replica acknowledgements, and replica
+acknowledgement failures. Write metrics include per-policy counts and quorum
+success and failure counts. Reconciliation metrics include the number of checked,
+present, and missing replica targets, owner blobs repaired, and owner blobs that
+no replica could supply. Read metrics include peer fetches and read repairs.
 
 ### Multipart, delete, and garbage collection
 
@@ -702,10 +732,9 @@ index, term, and read-index calls.
 - Path-style bucket addressing only.
 - One origin endpoint and one cache endpoint.
 - Cluster mode supports `consensus.backend = "single"`, `"raft"`, and
-  `"consul"`. Quorum acknowledgements (`write_ack = "quorum"|"all"`) are not
-  implemented. Cluster mode requires `backing.bucket`.
-- Blob replication is asynchronous. With `write_ack = "leader"`, an
-  acknowledged write can be lost if the owner fails before replication. A read
+  `"consul"`. Cluster mode requires `backing.bucket`.
+- Blob replication with `write_ack = "leader"` is asynchronous. The owner can
+  acknowledge a write that is lost if the owner dies before replication. A read
   on a node that lacks a replica fetches from the intended replicas, then the
   owner. If no replica has the blob, the read returns `404` with
   `x-s3-sidecar-owner`.
@@ -766,8 +795,15 @@ leader reads, bucket config seeding, GC, and startup validation.
 `tests/replication.rs` runs a three-node raft cluster and a two-node single
 backend. It covers replica placement, blob copy, local and peer reads, read
 repair on and off, a read with no replica, delete propagation, restart resume,
-the blob transport token, the `409` reference check, `Range`, and the
-replication queue.
+the blob transport token, the `409` reference check, `Range`, the replication
+queue, quorum writes after raft leader loss, and a write without a metadata
+quorum.
+
+`tests/consistency.rs` runs Consul clusters with an in-memory authority. It
+covers the write acknowledgement matrix: quorum with one peer down, quorum and
+all with too few peers, a commit rejection after peer replication, a leader
+write read from a replica, a stale replica after a delete, restart after a
+failed quorum write, and the write policy metrics.
 
 `scripts/e2e-rustfs.sh` runs a real origin and the AWS CLI. It needs `rustfs`
 and the AWS CLI v2. The MinIO client `mc` is optional.
