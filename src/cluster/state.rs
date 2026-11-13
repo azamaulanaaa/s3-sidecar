@@ -1,28 +1,40 @@
-//! Metadata state machine for cluster mode.
+//! Deterministic metadata store for cluster mode.
 //!
-//! The state machine stores object metadata, bucket consistency settings, and
-//! in-flight multipart uploads in one `redb` database. Blob bytes never enter
-//! this database. A metadata key encodes `(bucket, key)` with an order that
-//! matches the raw byte order. A prefix scan therefore returns keys in
-//! lexicographic order. The encoding escapes `0x00` bytes, so control
-//! characters and long keys are safe.
+//! The store holds object metadata, bucket consistency settings, in-flight
+//! multipart uploads, the raft log, and raft bookkeeping in one `redb`
+//! database. Blob bytes never enter this database. A metadata key encodes
+//! `(bucket, key)` with an order that matches the raw byte order. A prefix scan
+//! therefore returns keys in lexicographic order. The encoding escapes `0x00`
+//! bytes, so control characters and long keys are safe.
+//!
+//! Every applied log entry writes its metadata and the applied log index in one
+//! transaction. Apply is deterministic: the entry carries the commit time, and
+//! the store assigns `version = log index`.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
-use super::coordinator::{CommitRequest, CoordError};
+use super::coordinator::{CommitRequest, CoordError, Entry, RejectReason};
+use super::raft::{LogIdOf, StoredMembershipOf};
 use crate::config::{BucketConfig, ReadMode, WriteAck};
 
 const METADATA: TableDefinition<&[u8], &[u8]> = TableDefinition::new("metadata");
 const BUCKET_CONFIG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("bucket_config");
 const UPLOADS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("uploads");
 const SYSTEM: TableDefinition<&str, u64> = TableDefinition::new("system");
+const RAFT_LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
+const RAFT_META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
+const SNAPSHOT: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot");
+
 const APPLIED_KEY: &str = "applied";
+const LAST_APPLIED_KEY: &str = "last_applied";
+const MEMBERSHIP_KEY: &str = "membership";
+const SNAPSHOT_KEY: &str = "latest";
 
 /// Lifecycle state of one object key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,7 +55,7 @@ pub enum ObjectState {
 pub struct Metadata {
     /// Lifecycle state.
     pub state: ObjectState,
-    /// Monotonic version for this key.
+    /// Version for this key. The store assigns the raft log index.
     pub version: u64,
     /// Backing blob identifier.
     pub blob: String,
@@ -145,7 +157,7 @@ pub struct UploadRecord {
 }
 
 /// Result of one applied entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ApplyResult {
     /// A commit became visible.
     Commit(Metadata),
@@ -155,6 +167,20 @@ pub enum ApplyResult {
     Delete(Metadata),
     /// A bucket config was stored.
     BucketConfig(BucketConfigRecord),
+    /// A log entry carried no application data.
+    Blank,
+}
+
+/// Outcome of one applied log entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
+pub enum ApplyOutcome {
+    /// The entry changed the state.
+    Applied(ApplyResult),
+    /// The state machine rejected the entry.
+    Rejected(RejectReason),
+    /// The entry was already applied.
+    Duplicate,
 }
 
 /// One applied entry and its index.
@@ -169,13 +195,35 @@ pub struct Applied {
 }
 
 /// A durable metadata state machine.
-pub struct StateMachine {
-    db: Database,
+pub struct MetadataStore {
+    db: Arc<Database>,
     applied: AtomicU64,
     write_lock: Mutex<()>,
 }
 
-impl StateMachine {
+#[derive(Serialize, Deserialize)]
+struct ObjectRecord {
+    bucket: String,
+    key: String,
+    metadata: Metadata,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BucketRecord {
+    bucket: String,
+    config: BucketConfigRecord,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StateExport {
+    objects: Vec<ObjectRecord>,
+    buckets: Vec<BucketRecord>,
+    uploads: Vec<UploadRecord>,
+    last_applied: Option<LogIdOf>,
+    membership: Option<StoredMembershipOf>,
+}
+
+impl MetadataStore {
     /// Open or create the metadata database.
     ///
     /// # Errors
@@ -209,6 +257,21 @@ impl StateMachine {
                     .map_err(|error| CoordError::Storage(error.to_string()))?;
             }
             {
+                write
+                    .open_table(RAFT_LOG)
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+            }
+            {
+                write
+                    .open_table(RAFT_META)
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+            }
+            {
+                write
+                    .open_table(SNAPSHOT)
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+            }
+            {
                 let mut system = write
                     .open_table(SYSTEM)
                     .map_err(|error| CoordError::Storage(error.to_string()))?;
@@ -239,10 +302,16 @@ impl StateMachine {
                 .map_or(0, |value| value.value())
         };
         Ok(Self {
-            db,
+            db: Arc::new(db),
             applied: AtomicU64::new(applied),
             write_lock: Mutex::new(()),
         })
+    }
+
+    /// Return the shared database handle.
+    #[must_use]
+    pub fn database(&self) -> Arc<Database> {
+        Arc::clone(&self.db)
     }
 
     /// Return the last applied index.
@@ -251,46 +320,198 @@ impl StateMachine {
         self.applied.load(Ordering::Acquire)
     }
 
-    /// Apply one commit entry.
+    /// Return the last applied log id.
     ///
     /// # Errors
     ///
-    /// Returns a rejection or a storage error.
-    pub fn apply_commit(&self, term: u64, request: &CommitRequest) -> Result<Applied, CoordError> {
+    /// Returns an error when the value cannot be read.
+    pub fn last_applied_log(&self) -> Result<Option<LogIdOf>, CoordError> {
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let table = read
+            .open_table(RAFT_META)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = table
+            .get(LAST_APPLIED_KEY)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let log_id = serde_json::from_slice(value.value())
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        Ok(Some(log_id))
+    }
+
+    /// Return the last applied membership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value cannot be read.
+    pub fn stored_membership(&self) -> Result<StoredMembershipOf, CoordError> {
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let table = read
+            .open_table(RAFT_META)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = table
+            .get(MEMBERSHIP_KEY)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let Some(value) = value else {
+            return Ok(StoredMembershipOf::default());
+        };
+        let membership = serde_json::from_slice(value.value())
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        Ok(membership)
+    }
+
+    /// Apply one log entry.
+    ///
+    /// The metadata write and the applied log id are one transaction. The
+    /// version is the log index, so replay produces the same metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn apply_entry(&self, log_id: &LogIdOf, entry: &Entry) -> Result<ApplyOutcome, CoordError> {
         let _guard = self
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let key = encode_metadata_key(&request.bucket, &request.key);
-        let current = self.read_metadata_locked(&key)?;
-        let previous_version = current.as_ref().map_or(0, |metadata| metadata.version);
-        if request.base_version != previous_version {
-            return Err(CoordError::Rejected(
-                super::coordinator::RejectReason::Conflict,
-            ));
+        if self
+            .last_applied_log()?
+            .is_some_and(|applied| log_id.index <= applied.index)
+        {
+            return Ok(ApplyOutcome::Duplicate);
         }
-        let committed = current
-            .as_ref()
-            .is_some_and(|metadata| metadata.state == ObjectState::Committed);
-        if request.if_none_match && committed {
-            return Err(CoordError::Rejected(
-                super::coordinator::RejectReason::PreconditionFailed,
-            ));
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let outcome = match entry {
+            Entry::Commit { request, .. } => self.write_commit(&write, log_id, request)?,
+            Entry::Abort { bucket, key, .. } => {
+                self.write_abort(&write, bucket, key)?;
+                ApplyOutcome::Applied(ApplyResult::Abort)
+            }
+            Entry::Delete {
+                bucket,
+                key,
+                owner,
+                deleted_at,
+                ..
+            } => self.write_delete(&write, log_id, bucket, key, owner, *deleted_at)?,
+            Entry::BucketConfig {
+                bucket, request, ..
+            } => self.write_bucket_config(&write, bucket, *request)?,
+        };
+        self.write_applied(&write, log_id)?;
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        self.applied.store(log_id.index, Ordering::Release);
+        Ok(outcome)
+    }
+
+    /// Apply one membership entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn apply_membership(
+        &self,
+        log_id: &LogIdOf,
+        membership: &StoredMembershipOf,
+    ) -> Result<ApplyOutcome, CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self
+            .last_applied_log()?
+            .is_some_and(|applied| log_id.index <= applied.index)
+        {
+            return Ok(ApplyOutcome::Duplicate);
+        }
+        let value = serde_json::to_vec(membership)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(RAFT_META)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            table
+                .insert(MEMBERSHIP_KEY, value.as_slice())
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+        }
+        self.write_applied(&write, log_id)?;
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        self.applied.store(log_id.index, Ordering::Release);
+        Ok(ApplyOutcome::Applied(ApplyResult::Blank))
+    }
+
+    /// Apply one blank entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn apply_blank(&self, log_id: &LogIdOf) -> Result<ApplyOutcome, CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self
+            .last_applied_log()?
+            .is_some_and(|applied| log_id.index <= applied.index)
+        {
+            return Ok(ApplyOutcome::Duplicate);
+        }
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        self.write_applied(&write, log_id)?;
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        self.applied.store(log_id.index, Ordering::Release);
+        Ok(ApplyOutcome::Applied(ApplyResult::Blank))
+    }
+
+    #[allow(clippy::unused_self)]
+    fn write_commit(
+        &self,
+        write: &redb::WriteTransaction,
+        log_id: &LogIdOf,
+        request: &CommitRequest,
+    ) -> Result<ApplyOutcome, CoordError> {
+        let key = encode_metadata_key(&request.bucket, &request.key);
+        let current = read_metadata_in_write(write, &key)?;
+        if request.if_none_match && current.as_ref().is_some_and(Metadata::is_committed) {
+            return Ok(ApplyOutcome::Rejected(RejectReason::PreconditionFailed));
         }
         if let Some(expected) = &request.if_match {
             let matches = current.as_ref().is_some_and(|metadata| {
-                metadata.state == ObjectState::Committed && etag_matches(&metadata.etag, expected)
+                metadata.is_committed() && etag_matches(&metadata.etag, expected)
             });
             if !matches {
-                return Err(CoordError::Rejected(
-                    super::coordinator::RejectReason::PreconditionFailed,
-                ));
+                return Ok(ApplyOutcome::Rejected(RejectReason::PreconditionFailed));
             }
         }
-        let now = unix_now();
+        let created_at = current
+            .as_ref()
+            .map_or(request.committed_at, |metadata| metadata.created_at);
         let metadata = Metadata {
             state: ObjectState::Committed,
-            version: previous_version.saturating_add(1),
+            version: log_id.index,
             blob: request.blob.clone(),
             size: request.size,
             checksum: request.checksum.clone(),
@@ -299,44 +520,32 @@ impl StateMachine {
             user_metadata: request.user_metadata.clone(),
             owner: request.owner.clone(),
             replicas: request.replicas.clone(),
-            created_at: now,
-            committed_at: Some(now),
+            created_at,
+            committed_at: Some(request.committed_at),
             deleted_at: None,
             cache_control: request.cache_control.clone(),
             content_encoding: request.content_encoding.clone(),
             content_disposition: request.content_disposition.clone(),
         };
-        let index = self.write_metadata_and_index(&key, &metadata)?;
-        Ok(Applied {
-            index,
-            term,
-            result: ApplyResult::Commit(metadata),
-        })
+        write_metadata(write, &key, &metadata)?;
+        Ok(ApplyOutcome::Applied(ApplyResult::Commit(metadata)))
     }
 
-    /// Apply one delete entry. A missing key becomes an empty tombstone.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error.
-    pub fn apply_delete(
+    #[allow(clippy::unused_self, clippy::too_many_arguments)]
+    fn write_delete(
         &self,
-        term: u64,
+        write: &redb::WriteTransaction,
+        log_id: &LogIdOf,
         bucket: &str,
         key: &str,
         owner: &str,
-    ) -> Result<Applied, CoordError> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        deleted_at: i64,
+    ) -> Result<ApplyOutcome, CoordError> {
         let encoded = encode_metadata_key(bucket, key);
-        let current = self.read_metadata_locked(&encoded)?;
-        let previous_version = current.as_ref().map_or(0, |metadata| metadata.version);
-        let now = unix_now();
+        let current = read_metadata_in_write(write, &encoded)?;
         let metadata = Metadata {
             state: ObjectState::Tombstone,
-            version: previous_version.saturating_add(1),
+            version: log_id.index,
             blob: current
                 .as_ref()
                 .map_or_else(String::new, |metadata| metadata.blob.clone()),
@@ -347,177 +556,84 @@ impl StateMachine {
             user_metadata: BTreeMap::new(),
             owner: owner.to_owned(),
             replicas: Vec::new(),
-            created_at: current.as_ref().map_or(now, |metadata| metadata.created_at),
+            created_at: current
+                .as_ref()
+                .map_or(deleted_at, |metadata| metadata.created_at),
             committed_at: None,
-            deleted_at: Some(now),
+            deleted_at: Some(deleted_at),
             cache_control: None,
             content_encoding: None,
             content_disposition: None,
         };
-        let index = self.write_metadata_and_index(&encoded, &metadata)?;
-        Ok(Applied {
-            index,
-            term,
-            result: ApplyResult::Delete(metadata),
-        })
+        write_metadata(write, &encoded, &metadata)?;
+        Ok(ApplyOutcome::Applied(ApplyResult::Delete(metadata)))
     }
 
-    /// Apply one abort entry. It removes a pending row only.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error.
-    pub fn apply_abort(&self, term: u64, bucket: &str, key: &str) -> Result<Applied, CoordError> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let encoded = encode_metadata_key(bucket, key);
-        let current = self.read_metadata_locked(&encoded)?;
-        if current
-            .as_ref()
-            .is_some_and(|metadata| metadata.state == ObjectState::Pending)
-        {
-            let write = self
-                .db
-                .begin_write()
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            {
-                let mut table = write
-                    .open_table(METADATA)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
-                table
-                    .remove(encoded.as_slice())
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
-            }
-            let index = self.next_index();
-            {
-                let mut system = write
-                    .open_table(SYSTEM)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
-                system
-                    .insert(APPLIED_KEY, index)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
-            }
-            write
-                .commit()
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            self.applied.store(index, Ordering::Release);
-            return Ok(Applied {
-                index,
-                term,
-                result: ApplyResult::Abort,
-            });
-        }
-        Ok(Applied {
-            index: self.applied_index(),
-            term,
-            result: ApplyResult::Abort,
-        })
-    }
-
-    /// Store one bucket config record.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error.
-    pub fn apply_bucket_config(
+    #[allow(clippy::unused_self)]
+    fn write_abort(
         &self,
-        term: u64,
+        write: &redb::WriteTransaction,
         bucket: &str,
-        config: BucketConfigRecord,
-    ) -> Result<Applied, CoordError> {
-        let _guard = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let key = encode_component(bucket);
-        let value =
-            serde_json::to_vec(&config).map_err(|error| CoordError::Storage(error.to_string()))?;
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        {
-            let mut table = write
-                .open_table(BUCKET_CONFIG)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            table
-                .insert(key.as_slice(), value.as_slice())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-        }
-        let index = self.next_index();
-        {
-            let mut system = write
-                .open_table(SYSTEM)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            system
-                .insert(APPLIED_KEY, index)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-        }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        self.applied.store(index, Ordering::Release);
-        Ok(Applied {
-            index,
-            term,
-            result: ApplyResult::BucketConfig(config),
-        })
-    }
-
-    fn next_index(&self) -> u64 {
-        self.applied.load(Ordering::Acquire).saturating_add(1)
-    }
-
-    fn write_metadata_and_index(&self, key: &[u8], metadata: &Metadata) -> Result<u64, CoordError> {
-        let value =
-            serde_json::to_vec(metadata).map_err(|error| CoordError::Storage(error.to_string()))?;
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        key: &str,
+    ) -> Result<(), CoordError> {
+        let encoded = encode_metadata_key(bucket, key);
+        if read_metadata_in_write(write, &encoded)?
+            .is_some_and(|metadata| metadata.state == ObjectState::Pending)
         {
             let mut table = write
                 .open_table(METADATA)
                 .map_err(|error| CoordError::Storage(error.to_string()))?;
             table
-                .insert(key, value.as_slice())
+                .remove(encoded.as_slice())
                 .map_err(|error| CoordError::Storage(error.to_string()))?;
         }
-        let index = self.next_index();
+        Ok(())
+    }
+
+    #[allow(clippy::unused_self)]
+    fn write_bucket_config(
+        &self,
+        write: &redb::WriteTransaction,
+        bucket: &str,
+        config: BucketConfigRecord,
+    ) -> Result<ApplyOutcome, CoordError> {
+        let key = encode_component(bucket);
+        let value =
+            serde_json::to_vec(&config).map_err(|error| CoordError::Storage(error.to_string()))?;
+        let mut table = write
+            .open_table(BUCKET_CONFIG)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        table
+            .insert(key.as_slice(), value.as_slice())
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        Ok(ApplyOutcome::Applied(ApplyResult::BucketConfig(config)))
+    }
+
+    #[allow(clippy::unused_self)]
+    fn write_applied(
+        &self,
+        write: &redb::WriteTransaction,
+        log_id: &LogIdOf,
+    ) -> Result<(), CoordError> {
+        let value =
+            serde_json::to_vec(log_id).map_err(|error| CoordError::Storage(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(RAFT_META)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            table
+                .insert(LAST_APPLIED_KEY, value.as_slice())
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+        }
         {
             let mut system = write
                 .open_table(SYSTEM)
                 .map_err(|error| CoordError::Storage(error.to_string()))?;
             system
-                .insert(APPLIED_KEY, index)
+                .insert(APPLIED_KEY, log_id.index)
                 .map_err(|error| CoordError::Storage(error.to_string()))?;
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        self.applied.store(index, Ordering::Release);
-        Ok(index)
-    }
-
-    fn read_metadata_locked(&self, key: &[u8]) -> Result<Option<Metadata>, CoordError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(METADATA)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let value = table
-            .get(key)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let Some(value) = value else {
-            return Ok(None);
-        };
-        let metadata = serde_json::from_slice(value.value())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        Ok(Some(metadata))
+        Ok(())
     }
 
     /// Return one metadata row.
@@ -527,7 +643,22 @@ impl StateMachine {
     /// Returns a storage error.
     pub fn get_metadata(&self, bucket: &str, key: &str) -> Result<Option<Metadata>, CoordError> {
         let encoded = encode_metadata_key(bucket, key);
-        self.read_metadata_locked(&encoded)
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let table = read
+            .open_table(METADATA)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = table
+            .get(encoded.as_slice())
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let metadata = serde_json::from_slice(value.value())
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        Ok(Some(metadata))
     }
 
     /// Return all metadata rows in one bucket, ordered by key.
@@ -621,6 +752,10 @@ impl StateMachine {
     ///
     /// Returns a storage error.
     pub fn put_upload(&self, record: &UploadRecord) -> Result<(), CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let value =
             serde_json::to_vec(record).map_err(|error| CoordError::Storage(error.to_string()))?;
         let write = self
@@ -670,6 +805,10 @@ impl StateMachine {
     ///
     /// Returns a storage error.
     pub fn remove_upload(&self, upload_id: &str) -> Result<(), CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let write = self
             .db
             .begin_write()
@@ -782,9 +921,6 @@ impl StateMachine {
 
     /// Add a pending row for an in-flight multipart upload.
     ///
-    /// A single PUT never calls this method. The row exists only when no other
-    /// metadata row holds the key.
-    ///
     /// # Errors
     ///
     /// Returns a storage error.
@@ -800,7 +936,11 @@ impl StateMachine {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let encoded = encode_metadata_key(bucket, key);
-        if self.read_metadata_locked(&encoded)?.is_some() {
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        if read_metadata_in_write(&write, &encoded)?.is_some() {
             return Ok(());
         }
         let now = unix_now();
@@ -822,7 +962,10 @@ impl StateMachine {
             content_encoding: None,
             content_disposition: None,
         };
-        self.write_metadata_only(&encoded, &metadata)
+        write_metadata(&write, &encoded, &metadata)?;
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))
     }
 
     /// Remove a pending row for one key.
@@ -836,18 +979,159 @@ impl StateMachine {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let encoded = encode_metadata_key(bucket, key);
-        if !self
-            .read_metadata_locked(&encoded)?
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        if read_metadata_in_write(&write, &encoded)?
             .is_some_and(|metadata| metadata.state == ObjectState::Pending)
         {
-            return Ok(());
+            let mut table = write
+                .open_table(METADATA)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            table
+                .remove(encoded.as_slice())
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
         }
-        self.remove_metadata_locked(&encoded)
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))
     }
 
-    fn write_metadata_only(&self, key: &[u8], metadata: &Metadata) -> Result<(), CoordError> {
-        let value =
-            serde_json::to_vec(metadata).map_err(|error| CoordError::Storage(error.to_string()))?;
+    /// Export the applied state as JSON bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn export_state(&self) -> Result<Vec<u8>, CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let mut objects = Vec::new();
+        {
+            let table = read
+                .open_table(METADATA)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let range = table
+                .range::<&[u8]>(..)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            for item in range {
+                let (key, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
+                let Some((bucket, object_key)) = decode_metadata_key(key.value()) else {
+                    continue;
+                };
+                let metadata = serde_json::from_slice(value.value())
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                objects.push(ObjectRecord {
+                    bucket,
+                    key: object_key,
+                    metadata,
+                });
+            }
+        }
+        let mut buckets = Vec::new();
+        {
+            let table = read
+                .open_table(BUCKET_CONFIG)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let range = table
+                .range::<&[u8]>(..)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            for item in range {
+                let (key, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
+                let bucket = decode_component(key.value());
+                let config = serde_json::from_slice(value.value())
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                buckets.push(BucketRecord { bucket, config });
+            }
+        }
+        let uploads = {
+            let table = read
+                .open_table(UPLOADS)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let range = table
+                .range::<&[u8]>(..)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut output = Vec::new();
+            for item in range {
+                let (_, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
+                let record = serde_json::from_slice(value.value())
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                output.push(record);
+            }
+            output
+        };
+        let last_applied = {
+            let table = read
+                .open_table(RAFT_META)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let value = table
+                .get(LAST_APPLIED_KEY)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            value
+                .map(|value| {
+                    serde_json::from_slice(value.value())
+                        .map_err(|error| CoordError::Storage(error.to_string()))
+                })
+                .transpose()?
+        };
+        let membership = {
+            let table = read
+                .open_table(RAFT_META)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let value = table
+                .get(MEMBERSHIP_KEY)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            value
+                .map(|value| {
+                    serde_json::from_slice(value.value())
+                        .map_err(|error| CoordError::Storage(error.to_string()))
+                })
+                .transpose()?
+        };
+        let export = StateExport {
+            objects,
+            buckets,
+            uploads,
+            last_applied,
+            membership,
+        };
+        serde_json::to_vec(&export).map_err(|error| CoordError::Storage(error.to_string()))
+    }
+
+    /// Replace the applied state from snapshot JSON bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the snapshot cannot be decoded.
+    pub fn install_state(&self, bytes: &[u8]) -> Result<(), CoordError> {
+        self.install_state_record(bytes, None)
+    }
+
+    /// Replace the applied state and store one snapshot record.
+    ///
+    /// The state tables and the snapshot record change in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the snapshot cannot be decoded.
+    pub fn install_snapshot(&self, bytes: &[u8], record: &[u8]) -> Result<(), CoordError> {
+        self.install_state_record(bytes, Some(record))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn install_state_record(&self, bytes: &[u8], record: Option<&[u8]>) -> Result<(), CoordError> {
+        let export: StateExport = serde_json::from_slice(bytes)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let write = self
             .db
             .begin_write()
@@ -857,7 +1141,128 @@ impl StateMachine {
                 .open_table(METADATA)
                 .map_err(|error| CoordError::Storage(error.to_string()))?;
             table
-                .insert(key, value.as_slice())
+                .retain(|_, _| false)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            for object in &export.objects {
+                let key = encode_metadata_key(&object.bucket, &object.key);
+                let value = serde_json::to_vec(&object.metadata)
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                table
+                    .insert(key.as_slice(), value.as_slice())
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+            }
+        }
+        {
+            let mut table = write
+                .open_table(BUCKET_CONFIG)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            table
+                .retain(|_, _| false)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            for bucket in &export.buckets {
+                let key = encode_component(&bucket.bucket);
+                let value = serde_json::to_vec(&bucket.config)
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                table
+                    .insert(key.as_slice(), value.as_slice())
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+            }
+        }
+        {
+            let mut table = write
+                .open_table(UPLOADS)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            table
+                .retain(|_, _| false)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            for upload in &export.uploads {
+                let value = serde_json::to_vec(upload)
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                table
+                    .insert(upload.upload_id.as_bytes(), value.as_slice())
+                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+            }
+        }
+        {
+            let mut table = write
+                .open_table(RAFT_META)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            match &export.last_applied {
+                Some(log_id) => {
+                    let value = serde_json::to_vec(log_id)
+                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                    table
+                        .insert(LAST_APPLIED_KEY, value.as_slice())
+                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                }
+                None => {
+                    table
+                        .remove(LAST_APPLIED_KEY)
+                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                }
+            }
+            match &export.membership {
+                Some(membership) => {
+                    let value = serde_json::to_vec(membership)
+                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                    table
+                        .insert(MEMBERSHIP_KEY, value.as_slice())
+                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                }
+                None => {
+                    table
+                        .remove(MEMBERSHIP_KEY)
+                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                }
+            }
+        }
+        {
+            let mut system = write
+                .open_table(SYSTEM)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let index = export
+                .last_applied
+                .as_ref()
+                .map_or(0, |log_id| log_id.index);
+            system
+                .insert(APPLIED_KEY, index)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+        }
+        if let Some(record) = record {
+            let mut table = write
+                .open_table(SNAPSHOT)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            table
+                .insert(SNAPSHOT_KEY, record)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let index = export
+            .last_applied
+            .as_ref()
+            .map_or(0, |log_id| log_id.index);
+        self.applied.store(index, Ordering::Release);
+        Ok(())
+    }
+
+    /// Store one snapshot record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn put_snapshot(&self, bytes: &[u8]) -> Result<(), CoordError> {
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        {
+            let mut table = write
+                .open_table(SNAPSHOT)
+                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            table
+                .insert(SNAPSHOT_KEY, bytes)
                 .map_err(|error| CoordError::Storage(error.to_string()))?;
         }
         write
@@ -865,24 +1270,60 @@ impl StateMachine {
             .map_err(|error| CoordError::Storage(error.to_string()))
     }
 
-    fn remove_metadata_locked(&self, key: &[u8]) -> Result<(), CoordError> {
-        let write = self
+    /// Return the latest snapshot record.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error.
+    pub fn snapshot(&self) -> Result<Option<Vec<u8>>, CoordError> {
+        let read = self
             .db
-            .begin_write()
+            .begin_read()
             .map_err(|error| CoordError::Storage(error.to_string()))?;
-        {
-            let mut table = write
-                .open_table(METADATA)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            table
-                .remove(key)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-        }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        let table = read
+            .open_table(SNAPSHOT)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = table
+            .get(SNAPSHOT_KEY)
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        Ok(value.map(|value| value.value().to_vec()))
     }
 }
+
+fn read_metadata_in_write(
+    write: &redb::WriteTransaction,
+    key: &[u8],
+) -> Result<Option<Metadata>, CoordError> {
+    let table = write
+        .open_table(METADATA)
+        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    let value = table
+        .get(key)
+        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let metadata = serde_json::from_slice(value.value())
+        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    Ok(Some(metadata))
+}
+
+fn write_metadata(
+    write: &redb::WriteTransaction,
+    key: &[u8],
+    metadata: &Metadata,
+) -> Result<(), CoordError> {
+    let value =
+        serde_json::to_vec(metadata).map_err(|error| CoordError::Storage(error.to_string()))?;
+    let mut table = write
+        .open_table(METADATA)
+        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    table
+        .insert(key, value.as_slice())
+        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    Ok(())
+}
+
 /// Encode one metadata key.
 #[must_use]
 pub fn encode_metadata_key(bucket: &str, key: &str) -> Vec<u8> {
@@ -972,9 +1413,38 @@ pub fn unix_now() -> i64 {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use crate::cluster::raft::CommittedLeaderIdOf;
+    use openraft::LogId;
+    use openraft::vote::RaftLeaderId;
     use tempfile::tempdir;
 
     use super::*;
+
+    fn log_id(term: u64, index: u64) -> LogIdOf {
+        LogId::new(CommittedLeaderIdOf::new(term, "a".to_owned()), index)
+    }
+
+    fn request(key: &str) -> CommitRequest {
+        CommitRequest {
+            bucket: "media".to_owned(),
+            key: key.to_owned(),
+            base_version: 0,
+            blob: format!("blob-{key}"),
+            size: 1,
+            checksum: "checksum".to_owned(),
+            content_type: None,
+            etag: "etag".to_owned(),
+            user_metadata: BTreeMap::new(),
+            owner: "a".to_owned(),
+            replicas: vec!["a".to_owned()],
+            if_none_match: false,
+            if_match: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+            committed_at: 10,
+        }
+    }
 
     #[test]
     fn key_encoding_preserves_byte_order() {
@@ -997,34 +1467,35 @@ mod tests {
     #[test]
     fn bucket_scan_is_ordered_and_scoped() {
         let dir = tempdir().unwrap();
-        let state = StateMachine::open(&dir.path().join("meta.redb")).unwrap();
+        let state = MetadataStore::open(&dir.path().join("meta.redb")).unwrap();
         let config = BucketConfigRecord {
             write_ack: WriteAck::Leader,
             read: ReadMode::Local,
             replicas: 1,
             min_replicas: 1,
         };
-        state.apply_bucket_config(1, "media", config).unwrap();
+        let mut index = 1;
+        state
+            .apply_entry(
+                &log_id(1, index),
+                &Entry::BucketConfig {
+                    term: 1,
+                    bucket: "media".to_owned(),
+                    request: config,
+                },
+            )
+            .unwrap();
         for key in ["b", "a", "c"] {
-            let request = CommitRequest {
-                bucket: "media".to_owned(),
-                key: key.to_owned(),
-                base_version: 0,
-                blob: format!("blob-{key}"),
-                size: 1,
-                checksum: "checksum".to_owned(),
-                content_type: None,
-                etag: "etag".to_owned(),
-                user_metadata: BTreeMap::new(),
-                owner: "a".to_owned(),
-                replicas: vec!["a".to_owned()],
-                if_none_match: false,
-                if_match: None,
-                cache_control: None,
-                content_encoding: None,
-                content_disposition: None,
-            };
-            state.apply_commit(1, &request).unwrap();
+            index += 1;
+            state
+                .apply_entry(
+                    &log_id(1, index),
+                    &Entry::Commit {
+                        term: 1,
+                        request: Box::new(request(key)),
+                    },
+                )
+                .unwrap();
         }
         let keys: Vec<String> = state
             .scan_bucket("media")
@@ -1036,38 +1507,111 @@ mod tests {
     }
 
     #[test]
-    fn version_increases_at_commit() {
+    fn version_is_the_log_index() {
         let dir = tempdir().unwrap();
-        let state = StateMachine::open(&dir.path().join("meta.redb")).unwrap();
-        let mut request = CommitRequest {
-            bucket: "media".to_owned(),
-            key: "a".to_owned(),
-            base_version: 0,
-            blob: "one".to_owned(),
-            size: 1,
-            checksum: "checksum".to_owned(),
-            content_type: None,
-            etag: "etag".to_owned(),
-            user_metadata: BTreeMap::new(),
-            owner: "a".to_owned(),
-            replicas: vec!["a".to_owned()],
-            if_none_match: false,
-            if_match: None,
-            cache_control: None,
-            content_encoding: None,
-            content_disposition: None,
-        };
-        let first = state.apply_commit(1, &request).unwrap();
-        let ApplyResult::Commit(first_metadata) = first.result else {
+        let state = MetadataStore::open(&dir.path().join("meta.redb")).unwrap();
+        let first = state
+            .apply_entry(
+                &log_id(1, 4),
+                &Entry::Commit {
+                    term: 1,
+                    request: Box::new(request("a")),
+                },
+            )
+            .unwrap();
+        let ApplyOutcome::Applied(ApplyResult::Commit(first_metadata)) = first else {
             panic!("expected a commit");
         };
-        assert_eq!(first_metadata.version, 1);
-        request.base_version = 1;
-        request.blob = "two".to_owned();
-        let second = state.apply_commit(1, &request).unwrap();
-        let ApplyResult::Commit(second_metadata) = second.result else {
+        assert_eq!(first_metadata.version, 4);
+        let second = state
+            .apply_entry(
+                &log_id(1, 9),
+                &Entry::Commit {
+                    term: 1,
+                    request: Box::new(request("a")),
+                },
+            )
+            .unwrap();
+        let ApplyOutcome::Applied(ApplyResult::Commit(second_metadata)) = second else {
             panic!("expected a commit");
         };
-        assert_eq!(second_metadata.version, 2);
+        assert_eq!(second_metadata.version, 9);
+    }
+
+    #[test]
+    fn replay_does_not_change_the_state() {
+        let dir = tempdir().unwrap();
+        let state = MetadataStore::open(&dir.path().join("meta.redb")).unwrap();
+        let first = Entry::Commit {
+            term: 1,
+            request: Box::new(request("a")),
+        };
+        state.apply_entry(&log_id(1, 1), &first).unwrap();
+        let second = Entry::Commit {
+            term: 1,
+            request: Box::new(request("a")),
+        };
+        state.apply_entry(&log_id(1, 2), &second).unwrap();
+        let before = state.get_metadata("media", "a").unwrap().unwrap();
+        let replay = state.apply_entry(&log_id(1, 1), &first).unwrap();
+        assert!(matches!(replay, ApplyOutcome::Duplicate));
+        let after = state.get_metadata("media", "a").unwrap().unwrap();
+        assert_eq!(before.version, after.version);
+        assert_eq!(before.blob, after.blob);
+    }
+
+    #[test]
+    fn conditional_rejection_is_deterministic() {
+        let dir = tempdir().unwrap();
+        let state = MetadataStore::open(&dir.path().join("meta.redb")).unwrap();
+        state
+            .apply_entry(
+                &log_id(1, 1),
+                &Entry::Commit {
+                    term: 1,
+                    request: Box::new(request("a")),
+                },
+            )
+            .unwrap();
+        let mut conditional = request("a");
+        conditional.if_none_match = true;
+        let outcome = state
+            .apply_entry(
+                &log_id(1, 2),
+                &Entry::Commit {
+                    term: 1,
+                    request: Box::new(conditional),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ApplyOutcome::Rejected(RejectReason::PreconditionFailed)
+        ));
+        let metadata = state.get_metadata("media", "a").unwrap().unwrap();
+        assert_eq!(metadata.version, 1);
+    }
+
+    #[test]
+    fn snapshot_round_trip_replaces_the_state() {
+        let source_dir = tempdir().unwrap();
+        let source = MetadataStore::open(&source_dir.path().join("meta.redb")).unwrap();
+        source
+            .apply_entry(
+                &log_id(1, 3),
+                &Entry::Commit {
+                    term: 1,
+                    request: Box::new(request("a")),
+                },
+            )
+            .unwrap();
+        let bytes = source.export_state().unwrap();
+        let target_dir = tempdir().unwrap();
+        let target = MetadataStore::open(&target_dir.path().join("meta.redb")).unwrap();
+        target.install_state(&bytes).unwrap();
+        assert_eq!(target.applied_index(), 3);
+        let metadata = target.get_metadata("media", "a").unwrap().unwrap();
+        assert_eq!(metadata.blob, "blob-a");
+        assert_eq!(metadata.version, 3);
     }
 }
