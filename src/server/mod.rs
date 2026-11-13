@@ -994,13 +994,13 @@ async fn write_delete(
             .await
             .map_err(|error| cache_error(&error))?;
         let mut response = Response::new(Body::empty());
-        *response.status_mut() = StatusCode::OK;
+        *response.status_mut() = StatusCode::NO_CONTENT;
         return Ok(response);
     }
     match cache.stage_delete(bucket, key).await {
         Ok(()) => {
             let mut response = Response::new(Body::empty());
-            *response.status_mut() = StatusCode::OK;
+            *response.status_mut() = StatusCode::NO_CONTENT;
             Ok(response)
         }
         Err(error) => {
@@ -1362,7 +1362,12 @@ async fn forward_response(
 ) -> Result<Response, S3Error> {
     let status = response.status();
     if status.is_success() || status == StatusCode::NOT_MODIFIED {
-        return Ok(success_response(method, response));
+        let mut output = success_response(method, response);
+        if method == Method::DELETE && output.status().is_success() {
+            *output.status_mut() = StatusCode::NO_CONTENT;
+            *output.body_mut() = Body::empty();
+        }
+        return Ok(output);
     }
 
     let headers = response.headers().clone();

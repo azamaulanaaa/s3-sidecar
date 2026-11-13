@@ -945,7 +945,7 @@ async fn delete_of_pending_write_makes_no_origin_call() {
     .send()
     .await
     .unwrap();
-    assert_eq!(delete.status(), StatusCode::OK);
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert_eq!(origin.put_count(), 0);
     assert_eq!(origin.delete_count(), 0);
