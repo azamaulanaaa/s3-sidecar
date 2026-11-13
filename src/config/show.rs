@@ -204,6 +204,36 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
     push_row(
         &mut rows,
         sources,
+        "consensus.raft.bootstrap",
+        config.consensus.raft.bootstrap.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "consensus.raft.secret",
+        config.consensus.raft.secret.redacted().to_owned(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "consensus.raft.addr",
+        config.consensus.raft.addr.clone(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "consensus.raft.rpc_timeout",
+        config.consensus.raft.rpc_timeout.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "consensus.raft.nodes",
+        serde_json::to_string(&config.consensus.raft.nodes).unwrap_or_else(|_| "[]".to_owned()),
+    );
+    push_row(
+        &mut rows,
+        sources,
         "cluster.staging_ttl",
         config.cluster.staging_ttl.to_string(),
     );

@@ -311,14 +311,59 @@ impl Default for CacheConfig {
     }
 }
 
+/// Address of one raft cluster member.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RaftNodeConfig {
+    /// Node name.
+    pub id: String,
+    /// Base URL of the node, for example `http://10.0.0.2:9000`.
+    pub addr: String,
+}
+
 /// Raft settings.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RaftConfig {
     /// Node name.
     pub node_id: String,
-    /// Cluster member names. The list includes this node.
+    /// Cluster member names for the single backend. The list includes this node.
     pub peers: Vec<String>,
+    /// Start the cluster from this node with the configured nodes.
+    pub bootstrap: bool,
+    /// Shared token for internal raft requests.
+    pub secret: SecretString,
+    /// Base URL that this node advertises.
+    pub addr: String,
+    /// Timeout for one internal raft request.
+    pub rpc_timeout: HumanDuration,
+    /// Addresses of the raft cluster members. The list includes this node.
+    pub nodes: Vec<RaftNodeConfig>,
+}
+
+impl Default for RaftConfig {
+    fn default() -> Self {
+        Self {
+            node_id: String::new(),
+            peers: Vec::new(),
+            bootstrap: false,
+            secret: SecretString::default(),
+            addr: String::new(),
+            rpc_timeout: HumanDuration::new(Duration::from_secs(5)),
+            nodes: Vec::new(),
+        }
+    }
+}
+
+impl RaftConfig {
+    /// Return the address of one member.
+    #[must_use]
+    pub fn node_addr(&self, id: &str) -> Option<&str> {
+        self.nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| node.addr.as_str())
+    }
 }
 
 /// Coordination settings.
@@ -630,19 +675,9 @@ fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
     if config.mode != Mode::Cluster {
         return Ok(());
     }
-    if config.consensus.backend != ConsensusBackend::Single {
-        return Err(ConfigError::invalid(
-            "consensus backend is not implemented in this build",
-        ));
-    }
     if config.cache.mode != CacheMode::Off {
         return Err(ConfigError::invalid(
             "cache.mode must be \"off\" when mode is \"cluster\"",
-        ));
-    }
-    if config.consensus.raft.peers.is_empty() {
-        return Err(ConfigError::invalid(
-            "consensus.raft.peers must not be empty in cluster mode",
         ));
     }
     if config.consensus.raft.node_id.trim().is_empty() {
@@ -650,21 +685,10 @@ fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
             "consensus.raft.node_id is required in cluster mode",
         ));
     }
-    if config.consensus.raft.peers.len() != 1 {
-        return Err(ConfigError::invalid(
-            "the single consensus backend requires exactly one peer",
-        ));
-    }
-    if !config
-        .consensus
-        .raft
-        .peers
-        .iter()
-        .any(|peer| peer == &config.consensus.raft.node_id)
-    {
-        return Err(ConfigError::invalid(
-            "consensus.raft.peers must contain consensus.raft.node_id",
-        ));
+    match config.consensus.backend {
+        ConsensusBackend::Single => validate_single_backend(config)?,
+        ConsensusBackend::Raft => validate_raft_backend(config)?,
+        ConsensusBackend::Consul => {}
     }
     if config.backing.endpoint.trim().is_empty() {
         return Err(ConfigError::invalid(
@@ -703,6 +727,92 @@ fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
                 bucket.name
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_single_backend(config: &Config) -> Result<(), ConfigError> {
+    let raft = &config.consensus.raft;
+    if !raft.nodes.is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.raft.nodes is not valid with the single consensus backend; use peers",
+        ));
+    }
+    if raft.peers.is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.raft.peers must not be empty in cluster mode",
+        ));
+    }
+    if raft.peers.len() != 1 {
+        return Err(ConfigError::invalid(
+            "the single consensus backend requires exactly one peer",
+        ));
+    }
+    if !raft.peers.iter().any(|peer| peer == &raft.node_id) {
+        return Err(ConfigError::invalid(
+            "consensus.raft.peers must contain consensus.raft.node_id",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_raft_backend(config: &Config) -> Result<(), ConfigError> {
+    let raft = &config.consensus.raft;
+    if !raft.peers.is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.raft.peers is not valid with the raft consensus backend; use nodes",
+        ));
+    }
+    if raft.nodes.is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.raft.nodes must not be empty with the raft consensus backend",
+        ));
+    }
+    if raft.secret.expose_secret().is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.raft.secret is required with the raft consensus backend",
+        ));
+    }
+    if raft.addr.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.raft.addr is required with the raft consensus backend",
+        ));
+    }
+    if !is_http_url(&raft.addr) {
+        return Err(ConfigError::invalid(
+            "consensus.raft.addr must start with http:// or https://",
+        ));
+    }
+    let mut ids = HashSet::new();
+    for node in &raft.nodes {
+        if node.id.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "each consensus.raft.nodes entry requires an id",
+            ));
+        }
+        if !ids.insert(node.id.clone()) {
+            return Err(ConfigError::invalid(format!(
+                "raft node \"{}\" is configured more than one time",
+                node.id
+            )));
+        }
+        if node.addr.trim().is_empty() {
+            return Err(ConfigError::invalid(format!(
+                "raft node \"{}\" requires an addr",
+                node.id
+            )));
+        }
+        if !is_http_url(&node.addr) {
+            return Err(ConfigError::invalid(format!(
+                "raft node \"{}\" addr must start with http:// or https://",
+                node.id
+            )));
+        }
+    }
+    if !ids.contains(&raft.node_id) {
+        return Err(ConfigError::invalid(
+            "consensus.raft.nodes must contain consensus.raft.node_id",
+        ));
     }
     Ok(())
 }
@@ -891,15 +1001,83 @@ mod tests {
         assert!(error.to_string().contains("backing.bucket"));
     }
 
-    #[test]
-    fn raft_and_consul_are_not_implemented() {
+    fn raft_base() -> Config {
         let mut config = cluster_base();
         config.consensus.backend = ConsensusBackend::Raft;
+        config.consensus.raft.peers.clear();
+        config.consensus.raft.addr = "http://127.0.0.1:9000".to_owned();
+        config.consensus.raft.secret = secret::SecretString::new("token");
+        config.consensus.raft.nodes = vec![
+            RaftNodeConfig {
+                id: "a".to_owned(),
+                addr: "http://127.0.0.1:9000".to_owned(),
+            },
+            RaftNodeConfig {
+                id: "b".to_owned(),
+                addr: "http://127.0.0.1:9100".to_owned(),
+            },
+        ];
+        config
+    }
+
+    #[test]
+    fn raft_backend_requires_nodes() {
+        let mut config = raft_base();
+        config.consensus.raft.nodes.clear();
         let error = validate(&config).unwrap_err();
-        assert!(error.to_string().contains("not implemented"));
+        assert!(error.to_string().contains("nodes"));
+    }
+
+    #[test]
+    fn raft_backend_requires_the_local_node() {
+        let mut config = raft_base();
+        config.consensus.raft.nodes.retain(|node| node.id != "a");
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("node_id"));
+    }
+
+    #[test]
+    fn raft_backend_requires_a_secret() {
+        let mut config = raft_base();
+        config.consensus.raft.secret = secret::SecretString::new("");
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn raft_backend_rejects_peers() {
+        let mut config = raft_base();
+        config.consensus.raft.peers = vec!["a".to_owned()];
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("peers"));
+    }
+
+    #[test]
+    fn single_backend_rejects_nodes() {
+        let mut config = cluster_base();
+        config.consensus.raft.nodes = vec![RaftNodeConfig {
+            id: "a".to_owned(),
+            addr: "http://127.0.0.1:9000".to_owned(),
+        }];
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("nodes"));
+    }
+
+    #[test]
+    fn consul_backend_loads() {
+        let mut config = cluster_base();
         config.consensus.backend = ConsensusBackend::Consul;
-        let error = validate(&config).unwrap_err();
-        assert!(error.to_string().contains("not implemented"));
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn raft_secret_is_redacted() {
+        let mut config = raft_base();
+        config.consensus.raft.secret = secret::SecretString::new("raft-secret-value");
+        let table = show_table(&config, &SourceMap::new());
+        assert!(!table.contains("raft-secret-value"));
+        assert!(table.contains("consensus.raft.secret"));
+        assert!(table.contains("****"));
     }
 
     #[test]

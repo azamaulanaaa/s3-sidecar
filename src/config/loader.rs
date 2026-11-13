@@ -291,6 +291,11 @@ fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
         "CONSENSUS__BACKEND" => (EnvKind::Text, vec!["consensus", "backend"]),
         "CONSENSUS__RAFT__NODE_ID" => (EnvKind::Text, vec!["consensus", "raft", "node_id"]),
         "CONSENSUS__RAFT__PEERS" => (EnvKind::Json, vec!["consensus", "raft", "peers"]),
+        "CONSENSUS__RAFT__BOOTSTRAP" => (EnvKind::Bool, vec!["consensus", "raft", "bootstrap"]),
+        "CONSENSUS__RAFT__SECRET" => (EnvKind::Text, vec!["consensus", "raft", "secret"]),
+        "CONSENSUS__RAFT__ADDR" => (EnvKind::Text, vec!["consensus", "raft", "addr"]),
+        "CONSENSUS__RAFT__RPC_TIMEOUT" => (EnvKind::Text, vec!["consensus", "raft", "rpc_timeout"]),
+        "CONSENSUS__RAFT__NODES" => (EnvKind::Json, vec!["consensus", "raft", "nodes"]),
         "CLUSTER__STAGING_TTL" => (EnvKind::Text, vec!["cluster", "staging_ttl"]),
         "CLUSTER__ORPHAN_TTL" => (EnvKind::Text, vec!["cluster", "orphan_ttl"]),
         "CLUSTER__GC_INTERVAL" => (EnvKind::Text, vec!["cluster", "gc_interval"]),
@@ -307,6 +312,7 @@ fn secret_env_key(key: &str) -> Option<SecretEnv> {
         "ORIGIN__SECRET_ACCESS_KEY_FILE" => vec!["origin", "secret_access_key"],
         "CACHE__SECRET_ACCESS_KEY_FILE" => vec!["cache", "secret_access_key"],
         "BACKING__SECRET_ACCESS_KEY_FILE" => vec!["backing", "secret_access_key"],
+        "CONSENSUS__RAFT__SECRET_FILE" => vec!["consensus", "raft", "secret"],
         _ => return None,
     };
     Some(SecretEnv { path })
