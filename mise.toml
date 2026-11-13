@@ -26,3 +26,11 @@ run = "cargo deny check"
 [tasks.dist-plan]
 description = "Print the cargo-dist release plan"
 run = "dist plan"
+
+[tasks.ci]
+description = "Run the local CI checks that the pre-push hook runs"
+run = ".githooks/ci-check.sh push"
+
+[tasks.hooks]
+description = "Install the Git hooks for this clone"
+run = "git config core.hooksPath .githooks"
