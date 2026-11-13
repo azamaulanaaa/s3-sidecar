@@ -184,6 +184,12 @@ pub struct ConfigFlags {
     /// Raft peers as a JSON array.
     #[arg(long = "consensus-raft-peers", value_name = "JSON")]
     pub consensus_raft_peers: Option<String>,
+    /// File that contains the raft internal token.
+    #[arg(long = "consensus-raft-secret-file", value_name = "PATH")]
+    pub consensus_raft_secret_file: Option<PathBuf>,
+    /// Read the raft internal token from stdin.
+    #[arg(long = "consensus-raft-secret-stdin")]
+    pub consensus_raft_secret_stdin: bool,
     /// Age at which a staged blob with no commit is an orphan.
     #[arg(long = "cluster-staging-ttl", value_name = "DURATION")]
     pub cluster_staging_ttl: Option<String>,
@@ -218,6 +224,7 @@ impl ConfigFlags {
             (self.origin_secret_access_key_stdin, StdinTarget::Origin),
             (self.cache_secret_access_key_stdin, StdinTarget::Cache),
             (self.backing_secret_access_key_stdin, StdinTarget::Backing),
+            (self.consensus_raft_secret_stdin, StdinTarget::Raft),
         ];
         let mut selected = targets
             .into_iter()
@@ -490,6 +497,14 @@ impl ConfigFlags {
             let parsed = parse_json_array("--consensus-raft-peers", value)?;
             set(&mut object, &["consensus", "raft", "peers"], parsed);
         }
+        if let Some(path) = &self.consensus_raft_secret_file {
+            let secret = read_secret_file(path)?;
+            set(
+                &mut object,
+                &["consensus", "raft", "secret"],
+                Value::String(secret.expose_secret().to_owned()),
+            );
+        }
         if let Some(value) = &self.cluster_staging_ttl {
             set(
                 &mut object,
@@ -543,14 +558,15 @@ impl ConfigFlags {
             let secret = stdin_secret.ok_or_else(|| {
                 ConfigError::invalid("a stdin secret flag is set but stdin was not read")
             })?;
-            let path = match target {
-                StdinTarget::Origin => ["origin", "secret_access_key"],
-                StdinTarget::Cache => ["cache", "secret_access_key"],
-                StdinTarget::Backing => ["backing", "secret_access_key"],
+            let path: &[&str] = match target {
+                StdinTarget::Origin => &["origin", "secret_access_key"],
+                StdinTarget::Cache => &["cache", "secret_access_key"],
+                StdinTarget::Backing => &["backing", "secret_access_key"],
+                StdinTarget::Raft => &["consensus", "raft", "secret"],
             };
             set(
                 &mut object,
-                &path,
+                path,
                 Value::String(secret.expose_secret().to_owned()),
             );
         }
@@ -568,6 +584,8 @@ pub enum StdinTarget {
     Cache,
     /// Backing endpoint.
     Backing,
+    /// Raft internal token.
+    Raft,
 }
 
 fn parse_json_array(name: &str, value: &str) -> Result<Value, ConfigError> {
@@ -623,6 +641,31 @@ impl std::fmt::Display for StdinTarget {
             Self::Origin => f.write_str("origin"),
             Self::Cache => f.write_str("cache"),
             Self::Backing => f.write_str("backing"),
+            Self::Raft => f.write_str("raft"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::ConfigFlags;
+
+    #[test]
+    fn raft_secret_file_flag_sets_the_token() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raft-token");
+        fs::write(&path, "file-token\n").unwrap();
+        let flags = ConfigFlags {
+            consensus_raft_secret_file: Some(path),
+            ..ConfigFlags::default()
+        };
+        let layer = flags.to_layer(None).unwrap();
+        assert_eq!(layer["consensus"]["raft"]["secret"], "file-token");
     }
 }

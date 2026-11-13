@@ -526,6 +526,35 @@ name = "filebucket"
     }
 
     #[test]
+    fn raft_secret_file_environment_variable_is_read() {
+        let dir = tempdir().unwrap();
+        let secret_path = dir.path().join("raft-secret");
+        std::fs::write(&secret_path, "raft-file-secret\n").unwrap();
+        let file = r#"
+mode = "cluster"
+[backing]
+endpoint = "http://127.0.0.1:9002"
+bucket = "data"
+[consensus]
+backend = "raft"
+[consensus.raft]
+node_id = "a"
+[[consensus.raft.nodes]]
+id = "a"
+addr = "http://127.0.0.1:9000"
+"#;
+        let env = vec![(
+            "S3_SIDECAR_CONSENSUS__RAFT__SECRET_FILE".to_owned(),
+            secret_path.display().to_string(),
+        )];
+        let loaded = load_with(dir.path(), Some(file), env, json!({})).unwrap();
+        assert_eq!(
+            loaded.config.consensus.raft.secret.expose_secret(),
+            "raft-file-secret"
+        );
+    }
+
+    #[test]
     fn explicit_missing_config_file_is_an_error() {
         let dir = tempdir().unwrap();
         let error = load(&LoadOptions {
