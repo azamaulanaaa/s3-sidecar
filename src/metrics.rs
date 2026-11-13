@@ -1,6 +1,7 @@
 //! Per-function counters and a Prometheus text rendering.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 /// Counters for the cache data path.
 #[derive(Debug, Default)]
@@ -51,6 +52,18 @@ pub struct Metrics {
     pub cluster_term: AtomicU64,
     /// Calls to `read_index`.
     pub cluster_read_index_calls: AtomicU64,
+    /// Current raft term.
+    pub raft_term: AtomicU64,
+    /// Last raft log index.
+    pub raft_last_log_index: AtomicU64,
+    /// Last applied raft log index.
+    pub raft_last_applied: AtomicU64,
+    /// Last snapshot log index.
+    pub raft_snapshot_index: AtomicU64,
+    /// Observed raft leader elections.
+    pub raft_elections: AtomicU64,
+    /// Current raft leader name.
+    pub raft_leader_id: Mutex<String>,
 }
 
 impl Metrics {
@@ -142,6 +155,18 @@ impl Metrics {
     pub fn read_index_called(&self) {
         self.cluster_read_index_calls
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the raft leader name.
+    pub fn set_raft_leader(&self, leader: Option<&str>) {
+        let mut value = self
+            .raft_leader_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        value.clear();
+        if let Some(leader) = leader {
+            value.push_str(leader);
+        }
     }
 
     /// Set the coordinator gauges.
@@ -325,7 +350,57 @@ pub fn render(metrics: &Metrics, pending: u64, sync_lag_seconds: u64) -> String 
         "Calls to the coordinator read index.",
         metrics.cluster_read_index_calls.load(Ordering::Relaxed),
     );
+    push_counter(
+        &mut output,
+        "s3_sidecar_raft_term",
+        "Current raft term.",
+        metrics.raft_term.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_raft_last_log_index",
+        "Last raft log index.",
+        metrics.raft_last_log_index.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_raft_last_applied",
+        "Last applied raft log index.",
+        metrics.raft_last_applied.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_raft_snapshot_index",
+        "Last snapshot raft log index.",
+        metrics.raft_snapshot_index.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_raft_elections_total",
+        "Observed raft leader elections.",
+        metrics.raft_elections.load(Ordering::Relaxed),
+    );
+    let leader = metrics
+        .raft_leader_id
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     output
+        .push_str("# HELP s3_sidecar_raft_leader Current raft leader. One means the named node.\n");
+    output.push_str("# TYPE s3_sidecar_raft_leader gauge\n");
+    let _ = writeln!(
+        output,
+        "s3_sidecar_raft_leader{{id=\"{}\"}} 1",
+        escape_label(&leader)
+    );
+    drop(leader);
+    output
+}
+
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn push_counter(output: &mut String, name: &str, help: &str, value: u64) {
