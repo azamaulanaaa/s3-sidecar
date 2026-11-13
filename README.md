@@ -113,6 +113,86 @@ mc alias set sidecar http://127.0.0.1:9002 minioadmin minioadmin
 mc ls sidecar/media
 ```
 
+### TLS listener
+
+Add `[server.tls]` to serve HTTPS with a PEM certificate chain and private key:
+
+```toml
+[server]
+bind = "0.0.0.0:9000"
+
+[server.tls]
+cert_file = "/etc/s3-sidecar/tls/cert.pem"
+key_file = "/etc/s3-sidecar/tls/key.pem"
+```
+
+The sidecar reads and parses both files at startup. A missing, unreadable, or
+invalid file stops startup with an error. Plain HTTP remains the default when
+the section is absent. Client certificate authentication is not implemented.
+
+```bash
+aws --endpoint-url https://127.0.0.1:9000 s3 ls s3://media/
+```
+
+### Graceful shutdown
+
+`SIGTERM` and `SIGINT` start a graceful shutdown. The sidecar stops accepting
+new connections, lets in-flight requests finish, stops the cache and cluster
+workers, destroys the Consul session, shuts down the raft node, and commits the
+`redb` files. Draining is bounded by `server.shutdown_timeout` (default `30s`).
+A timeout exits with a non-zero status. A fatal listener error also exits
+non-zero; a normal drain exits zero.
+
+### Limits and timeouts
+
+```toml
+[server]
+max_body_bytes = 5368709120     # 5 GiB
+request_timeout = "5m"
+idle_timeout = "60s"
+max_connections = 1024
+shutdown_timeout = "30s"
+
+[upstream]
+connect_timeout = "10s"
+request_timeout = "5m"
+retry_attempts = 2
+```
+
+- A body larger than `server.max_body_bytes` returns `413 EntityTooLarge` in S3
+  XML. The `Content-Length` header is checked first. A chunked body is also
+  counted while it streams.
+- `server.request_timeout` applies to non-streaming control requests. It does
+  not cut off a long upload or download. `server.idle_timeout` bounds the gap
+  between stream chunks instead.
+- `server.max_connections` bounds concurrent S3 requests. A request above the
+  bound returns `503 SlowDown` with `Retry-After: 1`.
+- `upstream.request_timeout` bounds the wait for upstream response headers.
+- An upstream timeout returns `504 RequestTimeout` in S3 XML.
+- A client disconnect cancels the request task and the matching upstream
+  request.
+
+### Retry policy and request identifiers
+
+The sidecar retries `GET`, `HEAD`, `DELETE`, and list requests on a connection
+error, a `429`, or a `5xx`. It retries `upstream.retry_attempts` times after the
+first attempt. It uses exponential backoff with jitter and honors a numeric
+`Retry-After` header.
+
+A request with a body is never retried after the body starts streaming, so a
+`PUT` or `POST` body reaches the origin at most one time. Do not retry a
+non-idempotent request at the client unless the operation is safe to repeat.
+
+Every response has `x-s3-sidecar-request-id`. The sidecar also uses this value
+in its request log. A client value is propagated upstream; otherwise the
+sidecar generates one. The identifier stays the same across internal retries.
+
+A `503` with `Retry-After: 1` means no leader or no metadata quorum is
+available. Clients should retry those responses. Forwarded cluster proposals
+have no idempotency key, so a client retry can create a second proposal. A
+commit followed by a lost response can therefore repeat an operation that is
+not naturally idempotent.
+
 ## Configuration
 
 Precedence from highest to lowest:
@@ -756,7 +836,11 @@ index, term, and read-index calls.
   leader and does not form a cluster alone.
 - Multipart and CopyObject pass through to origin. The sidecar does not cache
   multipart parts.
-- No TLS listener. Put the sidecar behind a TLS terminator.
+- The TLS listener serves one certificate. Client certificate authentication and
+  automatic certificate reload are not implemented.
+- The sidecar retries only idempotent requests. It never replays a request body.
+  A non-idempotent client retry can repeat a cluster proposal because forwarded
+  proposals have no idempotency key.
 - The sidecar decodes `aws-chunked` bodies. The HTTP client cannot send trailer
   checksums, so the sidecar drops `x-amz-checksum-algorithm` on
   `CreateMultipartUpload` and removes trailer checksum headers. The object
@@ -781,6 +865,11 @@ index, term, and read-index calls.
 `tests/proxy.rs` runs the full proxy path against an in-process fake origin.
 It covers streaming, ranges, list, multipart, copy, presigned URLs, invalid
 credentials, and the bucket allow-list.
+
+`tests/runtime.rs` covers the TLS handshake with a self-signed certificate,
+TLS startup rejection, graceful drain and shutdown timeout, `413` from a
+`Content-Length` and from a chunked body, `504` from an upstream timeout, GET
+retry after `503`, no retry for a streamed PUT body, and request identifiers.
 
 `tests/cache.rs` runs cache mode against an in-process fake origin and fake
 cache. It covers repeat reads, TTL revalidation, pending read-your-write,
@@ -822,11 +911,12 @@ runs the ignored test in `tests/e2e_rustfs.rs`.
 ## Dependency policy
 
 `deny.toml` allows the permissive licenses in the HTTP and TLS tree:
-ISC, BSD-3-Clause, Unicode-3.0, and CDLA-Permissive-2.0. It also skips three
-transitive duplicate versions (`base64`, `syn`, and `windows-sys`) with a
-reason for each. The project does not use the AWS SDK, so no AWS crate
-exceptions are needed. The cache LRU index uses `redb`, which is MIT or
-Apache-2.0 and adds no duplicate versions.
+ISC, BSD-3-Clause, Unicode-3.0, and CDLA-Permissive-2.0. It also skips each
+transitive duplicate version with a reason. The TLS listener uses
+`axum-server` with the rustls ring provider, which reuses the `rustls`,
+`tokio-rustls`, and `rustls-pki-types` versions from `reqwest`. The project
+does not use the AWS SDK, so no AWS crate exceptions are needed. The cache LRU
+index uses `redb`, which is MIT or Apache-2.0 and adds no duplicate versions.
 
 ## License
 
