@@ -7,10 +7,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{OriginalUri, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, TryStreamExt};
 use tokio::net::TcpListener;
@@ -149,10 +149,24 @@ impl AppState {
 
 /// Build the HTTP router.
 pub fn router(state: Arc<AppState>) -> Router {
+    let raft = Router::new()
+        .route("/_raft/vote", post(crate::cluster::raft::http::vote))
+        .route("/_raft/append", post(crate::cluster::raft::http::append))
+        .route(
+            "/_raft/snapshot",
+            post(crate::cluster::raft::http::snapshot),
+        )
+        .route("/_raft/propose", post(crate::cluster::raft::http::propose))
+        .route(
+            "/_raft/read_index",
+            post(crate::cluster::raft::http::read_index),
+        )
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024));
     Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/metrics", get(metrics_endpoint))
+        .merge(raft)
         .fallback(handle_s3)
         .with_state(state)
 }
@@ -164,10 +178,17 @@ pub async fn health() -> impl IntoResponse {
 
 /// Return the readiness response.
 pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(reason) = state
+        .cluster
+        .as_ref()
+        .and_then(|cluster| cluster.not_ready_reason())
+    {
+        return (StatusCode::SERVICE_UNAVAILABLE, reason.to_owned());
+    }
     if state.is_ready() {
-        (StatusCode::OK, "ready")
+        (StatusCode::OK, "ready".to_owned())
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready".to_owned())
     }
 }
 

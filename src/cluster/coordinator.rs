@@ -1,13 +1,20 @@
-//! Coordinator trait and the single-node backend.
+//! Coordinator trait, the single-node backend, and the shared entry types.
 
 use std::collections::BTreeMap;
-use std::future::Future;
+use std::fmt;
 use std::sync::Arc;
 
-use super::state::{Applied, BucketConfigRecord, StateMachine};
+use futures_util::future::BoxFuture;
+use openraft::LogId;
+use openraft::vote::RaftLeaderId;
+
+use super::raft::CommittedLeaderIdOf;
+
+use super::raft::LogIdOf;
+use super::state::{Applied, ApplyOutcome, BucketConfigRecord, MetadataStore};
 
 /// Reason that the state machine rejected an entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RejectReason {
     /// A conditional request failed.
     PreconditionFailed,
@@ -15,8 +22,8 @@ pub enum RejectReason {
     Conflict,
 }
 
-impl std::fmt::Display for RejectReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PreconditionFailed => f.write_str("a request condition failed"),
             Self::Conflict => f.write_str("the key version changed"),
@@ -38,7 +45,10 @@ pub enum CoordError {
     /// The state machine rejected the entry.
     #[error("the state machine rejected the entry: {0}")]
     Rejected(RejectReason),
-    /// The metadata store failed.
+    /// The cluster has no leader.
+    #[error("the cluster has no leader")]
+    Unavailable,
+    /// The metadata store or raft backend failed.
     #[error("the metadata store failed: {0}")]
     Storage(String),
     /// The backend is not part of this build.
@@ -47,7 +57,7 @@ pub enum CoordError {
 }
 
 /// A commit proposal.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CommitRequest {
     /// Bucket name.
     pub bucket: String,
@@ -81,10 +91,12 @@ pub struct CommitRequest {
     pub content_encoding: Option<String>,
     /// Content-Disposition value.
     pub content_disposition: Option<String>,
+    /// Commit time in Unix seconds. The state machine applies this value.
+    pub committed_at: i64,
 }
 
 /// One log entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Entry {
     /// Make a staged blob visible.
     Commit {
@@ -112,6 +124,8 @@ pub enum Entry {
         key: String,
         /// Node that accepted the delete.
         owner: String,
+        /// Delete time in Unix seconds.
+        deleted_at: i64,
     },
     /// Store bucket consistency settings.
     BucketConfig {
@@ -137,6 +151,21 @@ impl Entry {
     }
 }
 
+impl fmt::Display for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Commit { request, .. } => write!(
+                f,
+                "Commit({}/{}, blob={})",
+                request.bucket, request.key, request.blob
+            ),
+            Self::Abort { bucket, key, .. } => write!(f, "Abort({bucket}/{key})"),
+            Self::Delete { bucket, key, .. } => write!(f, "Delete({bucket}/{key})"),
+            Self::BucketConfig { bucket, .. } => write!(f, "BucketConfig({bucket})"),
+        }
+    }
+}
+
 /// The metadata authority for cluster mode.
 pub trait Coordinator: Send + Sync {
     /// Return the current term.
@@ -149,23 +178,23 @@ pub trait Coordinator: Send + Sync {
     fn applied_index(&self) -> u64;
 
     /// Apply or replicate one entry.
-    fn propose(&self, entry: Entry) -> impl Future<Output = Result<Applied, CoordError>> + Send;
+    fn propose(&self, entry: Entry) -> BoxFuture<'_, Result<Applied, CoordError>>;
 
     /// Return an applied index that is safe to read from.
-    fn read_index(&self) -> impl Future<Output = Result<u64, CoordError>> + Send;
+    fn read_index(&self) -> BoxFuture<'_, Result<u64, CoordError>>;
 }
 
 /// A single-node coordinator. It starts at term 1 and is always the leader.
 pub struct SingleNode {
     term: u64,
-    state: Arc<StateMachine>,
+    state: Arc<MetadataStore>,
     metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl SingleNode {
     /// Build a single-node coordinator.
     #[must_use]
-    pub fn new(state: Arc<StateMachine>, metrics: Arc<crate::metrics::Metrics>) -> Self {
+    pub fn new(state: Arc<MetadataStore>, metrics: Arc<crate::metrics::Metrics>) -> Self {
         Self {
             term: 1,
             state,
@@ -175,7 +204,7 @@ impl SingleNode {
 
     /// Return the metadata state machine.
     #[must_use]
-    pub fn state(&self) -> &Arc<StateMachine> {
+    pub fn state(&self) -> &Arc<MetadataStore> {
         &self.state
     }
 
@@ -185,6 +214,10 @@ impl SingleNode {
         self.metrics
             .set_cluster_state(self.state.applied_index(), self.term, tombstones);
     }
+}
+
+fn local_log_id(term: u64, index: u64) -> LogIdOf {
+    LogId::new(CommittedLeaderIdOf::new(term, "local".to_owned()), index)
 }
 
 impl Coordinator for SingleNode {
@@ -200,38 +233,36 @@ impl Coordinator for SingleNode {
         self.state.applied_index()
     }
 
-    fn propose(&self, entry: Entry) -> impl Future<Output = Result<Applied, CoordError>> + Send {
-        let term = entry.term();
-        let state = Arc::clone(&self.state);
-        async move {
-            if term != 1 {
+    fn propose(&self, entry: Entry) -> BoxFuture<'_, Result<Applied, CoordError>> {
+        Box::pin(async move {
+            let term = entry.term();
+            if term != self.term {
                 return Err(CoordError::StaleTerm {
-                    expected: 1,
+                    expected: self.term,
                     actual: term,
                 });
             }
-            let applied = match entry {
-                Entry::Commit { term, request } => state.apply_commit(term, &request)?,
-                Entry::Abort { term, bucket, key } => state.apply_abort(term, &bucket, &key)?,
-                Entry::Delete {
+            let index = self.state.applied_index().saturating_add(1);
+            let outcome = self.state.apply_entry(&local_log_id(term, index), &entry)?;
+            match outcome {
+                ApplyOutcome::Applied(result) => Ok(Applied {
+                    index,
                     term,
-                    bucket,
-                    key,
-                    owner,
-                } => state.apply_delete(term, &bucket, &key, &owner)?,
-                Entry::BucketConfig {
+                    result,
+                }),
+                ApplyOutcome::Rejected(reason) => Err(CoordError::Rejected(reason)),
+                ApplyOutcome::Duplicate => Ok(Applied {
+                    index: self.state.applied_index(),
                     term,
-                    bucket,
-                    request,
-                } => state.apply_bucket_config(term, &bucket, request)?,
-            };
-            Ok(applied)
-        }
+                    result: super::state::ApplyResult::Blank,
+                }),
+            }
+        })
     }
 
-    fn read_index(&self) -> impl Future<Output = Result<u64, CoordError>> + Send {
+    fn read_index(&self) -> BoxFuture<'_, Result<u64, CoordError>> {
         self.metrics.read_index_called();
         let index = self.state.applied_index();
-        async move { Ok(index) }
+        Box::pin(async move { Ok(index) })
     }
 }

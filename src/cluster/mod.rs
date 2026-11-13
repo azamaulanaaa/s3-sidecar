@@ -2,6 +2,7 @@
 //! collection.
 
 pub mod coordinator;
+pub mod raft;
 pub mod state;
 
 use std::collections::BTreeMap;
@@ -23,7 +24,9 @@ use time::format_description::well_known::Rfc3339;
 use tracing::warn;
 
 use self::coordinator::{CommitRequest, CoordError, Coordinator, Entry, RejectReason, SingleNode};
-use self::state::{ApplyResult, BucketConfigRecord, Metadata, StateMachine};
+use self::raft::RaftNode;
+use self::raft::coordinator::RaftCoordinator;
+use self::state::{ApplyResult, BucketConfigRecord, Metadata, MetadataStore};
 use crate::auth::ClientCredential;
 use crate::auth::body::{BodyFailure, BodyStream, failure};
 use crate::config::{Config, ConsensusBackend, Mode, ReadMode};
@@ -55,8 +58,10 @@ pub struct GcReport {
 /// Cluster mode state.
 pub struct Cluster {
     config: Arc<Config>,
-    state: Arc<StateMachine>,
-    coord: Arc<SingleNode>,
+    state: Arc<MetadataStore>,
+    coord: Arc<dyn Coordinator>,
+    single: Option<Arc<SingleNode>>,
+    raft: Option<Arc<RaftCoordinator>>,
     client: S3Client,
     credential: Arc<ClientCredential>,
     node_id: String,
@@ -74,9 +79,9 @@ impl Cluster {
         if config.mode != Mode::Cluster {
             return Ok(None);
         }
-        if config.consensus.backend != ConsensusBackend::Single {
+        if config.consensus.backend == ConsensusBackend::Consul {
             return Err(S3Error::not_implemented(
-                "consensus backend is not implemented in this build",
+                "the consul consensus backend is not implemented in this build",
             ));
         }
         for bucket in &config.buckets {
@@ -95,11 +100,24 @@ impl Cluster {
             }
         }
         let state = Arc::new(
-            StateMachine::open(Path::new(config.cluster.metadata_path.as_str())).map_err(
+            MetadataStore::open(Path::new(config.cluster.metadata_path.as_str())).map_err(
                 |error| S3Error::internal().with_header("x-s3-sidecar-error", &error.to_string()),
             )?,
         );
-        let coord = Arc::new(SingleNode::new(Arc::clone(&state), Arc::clone(&metrics)));
+        let node_id = config.consensus.raft.node_id.clone();
+        let (coord, single, raft): (Arc<dyn Coordinator>, _, _) = if config.consensus.backend
+            == ConsensusBackend::Raft
+        {
+            let coordinator = Arc::new(RaftCoordinator::new(
+                Arc::clone(&state),
+                Arc::clone(&metrics),
+                node_id.clone(),
+            ));
+            (coordinator.clone(), None, Some(coordinator))
+        } else {
+            let coordinator = Arc::new(SingleNode::new(Arc::clone(&state), Arc::clone(&metrics)));
+            (coordinator.clone(), Some(coordinator), None)
+        };
         let client = S3Client::new(&config.backing)?;
         let credential = Arc::new(ClientCredential::new(
             config.backing.access_key_id.clone(),
@@ -107,11 +125,12 @@ impl Cluster {
             config.backing.session_token.clone(),
             Vec::new(),
         ));
-        let node_id = config.consensus.raft.node_id.clone();
         Ok(Some(Arc::new(Self {
             config,
             state,
             coord,
+            single,
+            raft,
             client,
             credential,
             node_id,
@@ -125,24 +144,18 @@ impl Cluster {
     ///
     /// Returns an error when a bucket config cannot be stored.
     pub async fn start(self: &Arc<Self>) -> Result<(), S3Error> {
-        for bucket in &self.config.buckets {
-            if self
-                .state
-                .bucket_config(&bucket.name)
-                .map_err(map_coord_error)?
-                .is_none()
-            {
-                let request = BucketConfigRecord::from_config(bucket);
-                self.coord
-                    .propose(Entry::BucketConfig {
-                        term: self.coord.term(),
-                        bucket: bucket.name.clone(),
-                        request,
-                    })
-                    .await
-                    .map_err(map_coord_error)?;
-            }
+        if let Some(coordinator) = &self.raft {
+            let node = RaftNode::start(
+                Arc::clone(&self.state),
+                &self.config,
+                Arc::clone(&self.metrics),
+            )
+            .await
+            .map_err(map_coord_error)?;
+            coordinator.attach(node).map_err(map_coord_error)?;
+            let _ = self.wait_ready(std::time::Duration::from_secs(5)).await;
         }
+        self.seed_buckets().await?;
         self.refresh_metrics();
         let interval = self.config.cluster.gc_interval.as_duration();
         let weak = Arc::downgrade(self);
@@ -164,14 +177,95 @@ impl Cluster {
 
     /// Return the coordinator.
     #[must_use]
-    pub fn coordinator(&self) -> &Arc<SingleNode> {
+    pub fn coordinator(&self) -> &Arc<dyn Coordinator> {
         &self.coord
     }
 
     /// Return the metadata state machine.
     #[must_use]
-    pub fn state(&self) -> &Arc<StateMachine> {
+    pub fn state(&self) -> &Arc<MetadataStore> {
         &self.state
+    }
+
+    /// Return the running raft node, when raft mode is active.
+    #[must_use]
+    pub fn raft_node(&self) -> Option<&Arc<RaftNode>> {
+        self.raft
+            .as_ref()
+            .and_then(|coordinator| coordinator.node())
+    }
+
+    /// Return true when cluster mode can serve reads and writes.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        match &self.raft {
+            Some(coordinator) => coordinator.node().is_some_and(|node| node.is_ready()),
+            None => true,
+        }
+    }
+
+    /// Return the readiness reason.
+    #[must_use]
+    pub fn not_ready_reason(&self) -> Option<&'static str> {
+        self.raft
+            .as_ref()
+            .and_then(|coordinator| coordinator.node().and_then(|node| node.not_ready_reason()))
+    }
+
+    /// Wait until the cluster has a leader and this node applied one entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a service error when the wait times out.
+    pub async fn wait_ready(&self, timeout: std::time::Duration) -> Result<(), S3Error> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.is_ready() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(S3Error::service_unavailable());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn seed_buckets(&self) -> Result<(), S3Error> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut pending = false;
+            for bucket in &self.config.buckets {
+                if self
+                    .state
+                    .bucket_config(&bucket.name)
+                    .map_err(map_coord_error)?
+                    .is_some()
+                {
+                    continue;
+                }
+                let request = BucketConfigRecord::from_config(bucket);
+                match self
+                    .coord
+                    .propose(Entry::BucketConfig {
+                        term: self.coord.term(),
+                        bucket: bucket.name.clone(),
+                        request,
+                    })
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(CoordError::Unavailable) if self.raft.is_some() => pending = true,
+                    Err(error) => return Err(map_coord_error(error)),
+                }
+            }
+            if !pending {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     fn blob_bucket(&self) -> &str {
@@ -180,7 +274,11 @@ impl Cluster {
 
     /// Refresh the applied index, term, and tombstone gauges.
     pub fn refresh_metrics(&self) {
-        self.coord.refresh_metrics();
+        if let Some(coordinator) = &self.raft {
+            coordinator.refresh_metrics();
+        } else if let Some(single) = &self.single {
+            single.refresh_metrics();
+        }
     }
 
     /// Apply one object write.
@@ -233,6 +331,7 @@ impl Cluster {
             cache_control: header_string(headers, header::CACHE_CONTROL),
             content_encoding: header_string(headers, header::CONTENT_ENCODING),
             content_disposition: header_string(headers, header::CONTENT_DISPOSITION),
+            committed_at: state::unix_now(),
         };
         let started = Instant::now();
         let applied = self
@@ -379,6 +478,7 @@ impl Cluster {
             cache_control,
             content_encoding,
             content_disposition,
+            committed_at: state::unix_now(),
         };
         let started = Instant::now();
         let applied = self
@@ -493,6 +593,7 @@ impl Cluster {
                 bucket: bucket.to_owned(),
                 key: key.to_owned(),
                 owner: self.node_id.clone(),
+                deleted_at: state::unix_now(),
             })
             .await
             .map_err(map_coord_error)?;
@@ -771,6 +872,7 @@ impl Cluster {
             cache_control: record.cache_control.clone(),
             content_encoding: record.content_encoding.clone(),
             content_disposition: record.content_disposition.clone(),
+            committed_at: state::unix_now(),
         };
         let started = Instant::now();
         let applied = self
@@ -1469,7 +1571,7 @@ fn map_coord_error(error: CoordError) -> S3Error {
             "Conflict",
             "The object changed during the write.",
         ),
-        CoordError::StaleTerm { .. } => S3Error::service_unavailable(),
+        CoordError::StaleTerm { .. } | CoordError::Unavailable => S3Error::service_unavailable(),
         CoordError::Storage(message) => {
             warn!(error = %message, "cluster metadata operation failed");
             S3Error::internal()

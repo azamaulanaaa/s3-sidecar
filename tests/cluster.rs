@@ -495,6 +495,7 @@ fn cluster_config(
             raft: RaftConfig {
                 node_id: node_id.to_owned(),
                 peers: vec![node_id.to_owned()],
+                ..RaftConfig::default()
             },
         },
         cluster: ClusterConfig {
