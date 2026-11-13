@@ -138,6 +138,48 @@ impl S3Error {
         )
     }
 
+    /// No leader or metadata quorum is available. The client can retry.
+    #[must_use]
+    pub fn no_leader() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "No leader or metadata quorum is available. Retry the request.",
+        )
+        .with_header("Retry-After", "1")
+    }
+
+    /// The request is too large.
+    #[must_use]
+    pub fn entity_too_large() -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "EntityTooLarge",
+            "The request body is larger than the configured limit.",
+        )
+    }
+
+    /// The upstream did not respond in time.
+    #[must_use]
+    pub fn request_timeout() -> Self {
+        Self::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "RequestTimeout",
+            "The upstream did not respond in time.",
+        )
+    }
+
+    /// Too many concurrent requests are active.
+    #[must_use]
+    pub fn slow_down() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SlowDown",
+            "Too many requests are active. Retry the request.",
+        )
+        .with_header("Retry-After", "1")
+    }
+
     /// An internal error occurred.
     #[must_use]
     pub fn internal() -> Self {
@@ -161,10 +203,16 @@ impl S3Error {
                 ("PreconditionFailed", "A condition in the request failed.")
             }
             StatusCode::RANGE_NOT_SATISFIABLE => ("InvalidRange", "The range is not valid."),
+            StatusCode::PAYLOAD_TOO_LARGE => (
+                "EntityTooLarge",
+                "The request body is larger than the limit.",
+            ),
+            StatusCode::TOO_MANY_REQUESTS => ("SlowDown", "Too many requests are active."),
             StatusCode::NOT_IMPLEMENTED => ("NotImplemented", "The operation is not supported."),
             StatusCode::SERVICE_UNAVAILABLE => {
                 ("ServiceUnavailable", "The service is not available.")
             }
+            StatusCode::GATEWAY_TIMEOUT => ("RequestTimeout", "The upstream did not respond."),
             status if status.is_server_error() => {
                 ("InternalError", "The service reported an internal error.")
             }
@@ -193,7 +241,8 @@ impl S3Error {
             HeaderValue::from_static("application/xml"),
         );
         if let Ok(value) = HeaderValue::from_str(request_id) {
-            headers.insert("x-amz-request-id", value);
+            headers.insert("x-amz-request-id", value.clone());
+            headers.insert("x-s3-sidecar-request-id", value);
         }
         for (name, value) in &self.extra_headers {
             if let (Ok(name), Ok(value)) = (

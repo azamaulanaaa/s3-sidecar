@@ -353,6 +353,21 @@ impl MetadataStore {
         Arc::clone(&self.db)
     }
 
+    /// Commit an empty write so pending state is durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database commit fails.
+    pub fn flush(&self) -> Result<(), CoordError> {
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        write
+            .commit()
+            .map_err(|error| CoordError::Storage(error.to_string()))
+    }
+
     /// Return the last applied index.
     #[must_use]
     pub fn applied_index(&self) -> u64 {

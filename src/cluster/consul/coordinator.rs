@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use super::api::{
@@ -65,6 +66,7 @@ pub struct ConsulCoordinator {
     applied: AtomicU64,
     materialized: AtomicBool,
     started: AtomicBool,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl ConsulCoordinator {
@@ -91,6 +93,7 @@ impl ConsulCoordinator {
             applied: AtomicU64::new(0),
             materialized: AtomicBool::new(false),
             started: AtomicBool::new(false),
+            tasks: Mutex::new(Vec::new()),
         }
     }
 
@@ -105,9 +108,18 @@ impl ConsulCoordinator {
         if let Err(error) = self.ensure_session().await {
             warn!(%error, "consul session create failed; the election loop will retry");
         }
-        spawn_loop(Arc::downgrade(self), election_loop);
-        spawn_loop(Arc::downgrade(self), renewal_loop);
-        spawn_loop(Arc::downgrade(self), watch_loop);
+        let mut tasks = lock(&self.tasks);
+        tasks.push(spawn_loop(Arc::downgrade(self), election_loop));
+        tasks.push(spawn_loop(Arc::downgrade(self), renewal_loop));
+        tasks.push(spawn_loop(Arc::downgrade(self), watch_loop));
+    }
+
+    /// Stop the coordination loops and destroy the Consul session.
+    pub async fn shutdown(&self) {
+        for task in lock(&self.tasks).drain(..) {
+            task.abort();
+        }
+        self.step_down("the sidecar is shutting down").await;
     }
 
     /// Return the shared internal proposal token.
@@ -767,7 +779,7 @@ impl Coordinator for ConsulCoordinator {
     }
 }
 
-fn spawn_loop<F, Fut>(weak: Weak<ConsulCoordinator>, tick: F)
+fn spawn_loop<F, Fut>(weak: Weak<ConsulCoordinator>, tick: F) -> JoinHandle<()>
 where
     F: Fn(Arc<ConsulCoordinator>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -781,7 +793,11 @@ where
             drop(coordinator);
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    });
+    })
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 async fn election_loop(coordinator: Arc<ConsulCoordinator>) {

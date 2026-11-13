@@ -24,6 +24,7 @@ use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode
 use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 use self::consul::api::{ConsulApi, HttpConsul};
@@ -74,6 +75,7 @@ pub struct Cluster {
     node_id: String,
     metrics: Arc<Metrics>,
     reconcile_cursor: AtomicUsize,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Cluster {
@@ -153,7 +155,7 @@ impl Cluster {
                 config.consensus.raft.node_id.clone()
             }
         };
-        let client = S3Client::new(&config.backing)?;
+        let client = S3Client::new_with_upstream(&config.backing, &config.upstream)?;
         let credential = Arc::new(ClientCredential::new(
             config.backing.access_key_id.clone(),
             config.backing.secret_access_key.clone(),
@@ -180,6 +182,7 @@ impl Cluster {
             node_id,
             metrics,
             reconcile_cursor: AtomicUsize::new(0),
+            tasks: Mutex::new(Vec::new()),
         })))
     }
 
@@ -208,7 +211,7 @@ impl Cluster {
         self.refresh_metrics();
         let interval = self.config.cluster.gc_interval.as_duration();
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await;
             loop {
@@ -221,9 +224,10 @@ impl Cluster {
                 }
             }
         });
+        self.track(task);
         for _ in 0..self.config.cluster.replicate_workers.max(1) {
             let weak = Arc::downgrade(self);
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 loop {
                     let Some(cluster) = weak.upgrade() else {
                         break;
@@ -235,10 +239,11 @@ impl Cluster {
                     }
                 }
             });
+            self.track(task);
         }
         let interval = self.config.cluster.reconcile_interval.as_duration();
         let weak = Arc::downgrade(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await;
             loop {
@@ -251,7 +256,33 @@ impl Cluster {
                 }
             }
         });
+        self.track(task);
         Ok(())
+    }
+
+    /// Stop background workers, close coordination sessions, and flush state.
+    pub async fn shutdown(&self) {
+        for task in lock(&self.tasks).drain(..) {
+            task.abort();
+        }
+        if let Some(coordinator) = &self.raft
+            && let Some(node) = coordinator.node()
+            && let Err(error) = node.raft().shutdown().await
+        {
+            warn!(%error, "raft shutdown failed");
+        }
+        if let Some(coordinator) = &self.consul {
+            coordinator.shutdown().await;
+        }
+        if let Err(error) = self.state.flush() {
+            warn!(%error, "metadata flush failed");
+        }
+    }
+
+    fn track(&self, task: JoinHandle<()>) {
+        let mut tasks = lock(&self.tasks);
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
     }
 
     /// Return the coordinator.
@@ -481,7 +512,7 @@ impl Cluster {
                 self.metrics.quorum_failure();
             }
             self.discard_staged_blob(blob, &acked).await;
-            return Err(S3Error::service_unavailable());
+            return Err(S3Error::no_leader());
         }
         if policy != WriteAck::Leader {
             let mut actual = Vec::with_capacity(acked.len().saturating_add(1));
@@ -1747,7 +1778,7 @@ fn map_coord_error(error: CoordError) -> S3Error {
             "Conflict",
             "The object changed during the write.",
         ),
-        CoordError::StaleTerm { .. } | CoordError::Unavailable => S3Error::service_unavailable(),
+        CoordError::StaleTerm { .. } | CoordError::Unavailable => S3Error::no_leader(),
         CoordError::Storage(message) => {
             warn!(error = %message, "cluster metadata operation failed");
             S3Error::internal()
@@ -1762,6 +1793,12 @@ fn storage_error(
 ) -> S3Error {
     match error {
         StorageError::Sign(error) => error,
+        StorageError::Timeout => {
+            body_failure_error(failure_flag).unwrap_or_else(S3Error::request_timeout)
+        }
+        StorageError::Transport(error) if error.is_timeout() => {
+            body_failure_error(failure_flag).unwrap_or_else(S3Error::request_timeout)
+        }
         StorageError::Transport(_) => {
             body_failure_error(failure_flag).unwrap_or_else(S3Error::service_unavailable)
         }
@@ -1775,6 +1812,7 @@ fn body_failure_error(failure_flag: Option<&Arc<std::sync::atomic::AtomicU8>>) -
         Some(BodyFailure::ChunkFormat | BodyFailure::DecodedLength) => {
             Some(S3Error::invalid_request("The request body is not valid."))
         }
+        Some(BodyFailure::TooLarge) => Some(S3Error::entity_too_large()),
         _ => None,
     }
 }
@@ -1888,6 +1926,10 @@ fn duration_seconds(duration: std::time::Duration) -> i64 {
     i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn next_id() -> String {
     use std::sync::atomic::AtomicU64;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1932,6 +1974,13 @@ mod tests {
     fn upload_owner_reads_the_node_hex() {
         let id = format!("{}-{}", hex::encode("node-a").as_str(), "123");
         assert_eq!(upload_owner(&id).as_deref(), Some("node-a"));
+    }
+
+    #[test]
+    fn a_missing_leader_returns_503_with_retry_after() {
+        let response = map_coord_error(CoordError::Unavailable).into_response("request-id");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("Retry-After").unwrap(), "1");
     }
 
     #[test]

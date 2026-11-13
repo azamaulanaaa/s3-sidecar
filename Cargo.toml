@@ -11,6 +11,7 @@ categories = ["command-line-utilities"]
 [dependencies]
 async-stream = "0.3"
 axum = "0.8"
+axum-server = { version = "0.9", features = ["tls-rustls-ring"] }
 base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }

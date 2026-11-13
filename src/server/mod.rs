@@ -1,23 +1,28 @@
 //! HTTP server and S3 request forwarding.
 
+use std::future::IntoFuture;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, OriginalUri, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum_server::tls_rustls::RustlsConfig;
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, TryStreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::auth::body::{BodyFailure, BodyStream, failure, failure_flag, verify_hash};
+use crate::auth::body::{BodyFailure, BodyStream, failure, failure_flag, limit, verify_hash};
 use crate::auth::chunked::{ChunkMode, decode};
 use crate::auth::verify::authenticate;
 use crate::auth::{AuthContext, ClientCredential, CredentialStore, PayloadKind, now};
@@ -25,10 +30,13 @@ use crate::cache::Cache;
 use crate::cache::meta::{CacheMetadata, EntryState};
 use crate::cluster::consul::ConsulApi;
 use crate::cluster::{Cluster, WriteBody};
-use crate::config::{CacheMode, Config, Mode, WritePolicy};
+use crate::config::{CacheMode, Config, Mode, TlsConfig, WritePolicy};
 use crate::errors::S3Error;
 use crate::metrics;
 use crate::storage::{ForwardRequest, S3Client, StorageError};
+
+/// Response header that carries the sidecar request identifier.
+pub const REQUEST_ID_HEADER: &str = "x-s3-sidecar-request-id";
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -40,6 +48,7 @@ pub struct AppState {
     cache: Option<Arc<Cache>>,
     cluster: Option<Arc<Cluster>>,
     metrics: Arc<metrics::Metrics>,
+    slots: Arc<Semaphore>,
     ready: AtomicBool,
 }
 
@@ -70,7 +79,7 @@ impl AppState {
         } else {
             &config.origin
         };
-        let client = S3Client::new(endpoint)?;
+        let client = S3Client::new_with_upstream(endpoint, &config.upstream)?;
         let credentials = CredentialStore::new(&config.clients);
         if credentials.is_empty() {
             warn!("no clients are configured; all S3 requests will be denied");
@@ -86,6 +95,7 @@ impl AppState {
         let cache = Cache::new(Arc::clone(&config), Arc::clone(&metrics))?;
         let cluster =
             Cluster::new_with_consul_api(Arc::clone(&config), Arc::clone(&metrics), consul_api)?;
+        let slots = Arc::new(Semaphore::new(config.server.max_connections.max(1)));
         Ok(Self {
             config,
             credentials,
@@ -93,6 +103,7 @@ impl AppState {
             cache,
             cluster,
             metrics,
+            slots,
             ready: AtomicBool::new(false),
         })
     }
@@ -158,6 +169,22 @@ impl AppState {
         self.ready.store(ready, Ordering::Release);
     }
 
+    /// Return the idle timeout for stream reads.
+    #[must_use]
+    pub fn idle_timeout(&self) -> Duration {
+        self.config.server.idle_timeout.as_duration()
+    }
+
+    /// Stop background workers and flush durable state.
+    pub async fn shutdown(&self) {
+        if let Some(cache) = &self.cache {
+            cache.shutdown();
+        }
+        if let Some(cluster) = &self.cluster {
+            cluster.shutdown().await;
+        }
+    }
+
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
@@ -196,6 +223,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(raft)
         .fallback(handle_s3)
         .with_state(state)
+        .layer(middleware::from_fn(request_id_layer))
+}
+
+async fn request_id_layer(mut request: Request, next: Next) -> Response {
+    let identifier = request_id(request.headers());
+    if let Ok(value) = HeaderValue::from_str(&identifier) {
+        request.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&identifier) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    response
 }
 
 /// Return the liveness response.
@@ -237,13 +277,107 @@ pub async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRe
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text)
 }
 
-/// Start the HTTP server and wait for shutdown.
+/// A handle that triggers graceful shutdown.
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    sender: watch::Sender<bool>,
+}
+
+impl Default for ShutdownHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShutdownHandle {
+    /// Create a handle that is not yet shut down.
+    #[must_use]
+    pub fn new() -> Self {
+        let (sender, _receiver) = watch::channel(false);
+        Self { sender }
+    }
+
+    /// Request shutdown. This is safe to call more than one time.
+    pub fn shutdown(&self) {
+        let _ = self.sender.send(true);
+    }
+
+    /// Return true when shutdown was requested.
+    #[must_use]
+    pub fn is_shutting_down(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    /// Wait until shutdown is requested.
+    pub async fn wait(&self) {
+        let mut receiver = self.sender.subscribe();
+        if *receiver.borrow() {
+            return;
+        }
+        let _ = receiver.changed().await;
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.sender.subscribe()
+    }
+}
+
+/// A running server with a programmatic shutdown handle.
+pub struct Server {
+    local_addr: SocketAddr,
+    shutdown: ShutdownHandle,
+    task: JoinHandle<Result<(), ServeError>>,
+}
+
+impl Server {
+    /// Return the bound address.
+    #[must_use]
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Return a shutdown handle for this server.
+    #[must_use]
+    pub fn handle(&self) -> ShutdownHandle {
+        self.shutdown.clone()
+    }
+
+    /// Request graceful shutdown.
+    pub fn shutdown(&self) {
+        self.shutdown.shutdown();
+    }
+
+    /// Wait for the server to stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that stopped the server, or a shutdown timeout.
+    pub async fn wait(self) -> Result<(), ServeError> {
+        self.task
+            .await
+            .map_err(|error| ServeError::Join(error.to_string()))?
+    }
+}
+
+/// Start the HTTP server and wait for a signal or a shutdown handle.
 ///
 /// # Errors
 ///
 /// Returns an error when the configuration is not supported in this build,
-/// the state cannot be built, or the listener cannot bind.
+/// the TLS files are not valid, the state cannot be built, or the listener
+/// cannot bind.
 pub async fn serve(config: Config, warnings: &[String]) -> Result<(), ServeError> {
+    start(config, warnings).await?.wait().await
+}
+
+/// Start the HTTP server and return a handle before it stops.
+///
+/// # Errors
+///
+/// Returns an error when the configuration is not supported in this build,
+/// the TLS files are not valid, the state cannot be built, or the listener
+/// cannot bind.
+pub async fn start(config: Config, warnings: &[String]) -> Result<Server, ServeError> {
     if config.mode != Mode::Cluster && config.origin.endpoint.trim().is_empty() {
         return Err(ServeError::Config(
             "origin.endpoint is required for serve".to_owned(),
@@ -253,6 +387,7 @@ pub async fn serve(config: Config, warnings: &[String]) -> Result<(), ServeError
         warn!("{warning}");
     }
 
+    let tls = load_tls(config.server.tls.as_ref()).await?;
     let state =
         Arc::new(AppState::new(config.clone()).map_err(|error| ServeError::Config(error.message))?);
     state
@@ -266,39 +401,129 @@ pub async fn serve(config: Config, warnings: &[String]) -> Result<(), ServeError
             address: address.clone(),
             source,
         })?;
-    let local = listener
-        .local_addr()
-        .map_or_else(|_| address.clone(), |value| value.to_string());
-    info!(address = %local, "server started");
-    state.set_ready(true);
-    let result = axum::serve(listener, router(Arc::clone(&state)))
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(ServeError::Run);
-    state.set_ready(false);
-    result
+    let local_addr = listener.local_addr().map_err(|source| ServeError::Bind {
+        address: address.clone(),
+        source,
+    })?;
+    info!(
+        address = %local_addr,
+        tls = tls.is_some(),
+        "server started"
+    );
+
+    let shutdown = ShutdownHandle::new();
+    spawn_signal_watcher(shutdown.clone());
+    let grace = config.server.shutdown_timeout.as_duration();
+    let task_state = Arc::clone(&state);
+    let task_shutdown = shutdown.clone();
+    let task = tokio::spawn(async move {
+        task_state.set_ready(true);
+        let result =
+            run_listener(Arc::clone(&task_state), listener, tls, task_shutdown, grace).await;
+        task_state.set_ready(false);
+        task_state.shutdown().await;
+        result
+    });
+    Ok(Server {
+        local_addr,
+        shutdown,
+        task,
+    })
 }
 
-/// Error from the server.
-#[derive(Debug, thiserror::Error)]
-pub enum ServeError {
-    /// The configuration uses a mode that this build does not implement.
-    #[error("unsupported config: {0}")]
-    Unsupported(String),
-    /// The configuration is not complete.
-    #[error("invalid config: {0}")]
-    Config(String),
-    /// The listener cannot bind.
-    #[error("cannot bind {address}: {source}")]
-    Bind {
-        /// Listen address.
-        address: String,
-        /// I/O error.
-        source: io::Error,
-    },
-    /// The server stopped with an error.
-    #[error("server stopped: {0}")]
-    Run(io::Error),
+async fn load_tls(tls: Option<&TlsConfig>) -> Result<Option<RustlsConfig>, ServeError> {
+    let Some(tls) = tls else {
+        return Ok(None);
+    };
+    let cert = std::fs::read(&tls.cert_file).map_err(|error| {
+        ServeError::Tls(format!(
+            "cannot read server.tls.cert_file {}: {error}",
+            tls.cert_file
+        ))
+    })?;
+    let key = std::fs::read(&tls.key_file).map_err(|error| {
+        ServeError::Tls(format!(
+            "cannot read server.tls.key_file {}: {error}",
+            tls.key_file
+        ))
+    })?;
+    let config = RustlsConfig::from_pem(cert, key)
+        .await
+        .map_err(|error| ServeError::Tls(format!("cannot parse the TLS certificate: {error}")))?;
+    Ok(Some(config))
+}
+
+async fn run_listener(
+    state: Arc<AppState>,
+    listener: TcpListener,
+    tls: Option<RustlsConfig>,
+    shutdown: ShutdownHandle,
+    grace: Duration,
+) -> Result<(), ServeError> {
+    if let Some(tls) = tls {
+        run_tls_listener(state, listener, tls, shutdown, grace).await
+    } else {
+        run_plain_listener(state, listener, shutdown, grace).await
+    }
+}
+
+async fn run_plain_listener(
+    state: Arc<AppState>,
+    listener: TcpListener,
+    shutdown: ShutdownHandle,
+    grace: Duration,
+) -> Result<(), ServeError> {
+    let mut receiver = shutdown.subscribe();
+    let serving = axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move {
+            let _ = receiver.changed().await;
+        })
+        .into_future();
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => result.map_err(ServeError::Run),
+        () = shutdown.wait() => match tokio::time::timeout(grace, &mut serving).await {
+            Ok(result) => result.map_err(ServeError::Run),
+            Err(_) => Err(ServeError::ShutdownTimeout),
+        },
+    }
+}
+
+async fn run_tls_listener(
+    state: Arc<AppState>,
+    listener: TcpListener,
+    tls: RustlsConfig,
+    shutdown: ShutdownHandle,
+    grace: Duration,
+) -> Result<(), ServeError> {
+    let std_listener = listener.into_std().map_err(ServeError::Run)?;
+    let handle = axum_server::Handle::new();
+    let serving = axum_server::from_tcp_rustls(std_listener, tls)
+        .map_err(ServeError::Run)?
+        .handle(handle.clone())
+        .serve(router(state).into_make_service())
+        .into_future();
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => result.map_err(ServeError::Run),
+        () = shutdown.wait() => {
+            handle.graceful_shutdown(None);
+            match tokio::time::timeout(grace, &mut serving).await {
+                Ok(result) => result.map_err(ServeError::Run),
+                Err(_) => Err(ServeError::ShutdownTimeout),
+            }
+        },
+    }
+}
+
+fn spawn_signal_watcher(shutdown: ShutdownHandle) {
+    tokio::spawn(async move {
+        let waiting = shutdown.clone();
+        tokio::select! {
+            () = shutdown_signal() => shutdown.shutdown(),
+            () = waiting.wait() => {},
+        }
+    });
 }
 
 async fn shutdown_signal() {
@@ -321,6 +546,37 @@ async fn shutdown_signal() {
     }
 }
 
+/// Error from the server.
+#[derive(Debug, thiserror::Error)]
+pub enum ServeError {
+    /// The configuration uses a mode that this build does not implement.
+    #[error("unsupported config: {0}")]
+    Unsupported(String),
+    /// The configuration is not complete.
+    #[error("invalid config: {0}")]
+    Config(String),
+    /// The TLS settings are not valid.
+    #[error("invalid TLS settings: {0}")]
+    Tls(String),
+    /// The listener cannot bind.
+    #[error("cannot bind {address}: {source}")]
+    Bind {
+        /// Listen address.
+        address: String,
+        /// I/O error.
+        source: io::Error,
+    },
+    /// The server stopped with an error.
+    #[error("server stopped: {0}")]
+    Run(io::Error),
+    /// In-flight requests did not finish before `server.shutdown_timeout`.
+    #[error("graceful shutdown timed out")]
+    ShutdownTimeout,
+    /// The server task did not finish.
+    #[error("server task failed: {0}")]
+    Join(String),
+}
+
 async fn handle_s3(
     State(state): State<Arc<AppState>>,
     method: Method,
@@ -328,12 +584,20 @@ async fn handle_s3(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let request_id = next_request_id();
+    let request_id = request_id(&headers);
+    let mut headers = headers;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        headers.insert(REQUEST_ID_HEADER, value);
+    }
     let started = Instant::now();
-    let response = match forward(&state, &method, &uri, &headers, body).await {
-        Ok(response) => response,
-        Err(error) => error.into_response(&request_id),
-    };
+    let mut response =
+        match limited_forward(state, method.clone(), uri.clone(), headers, body).await {
+            Ok(response) => response,
+            Err(error) => error.into_response(&request_id),
+        };
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
     info!(
         request_id = %request_id,
         method = %method,
@@ -343,6 +607,84 @@ async fn handle_s3(
         "request"
     );
     response
+}
+
+async fn limited_forward(
+    state: Arc<AppState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, S3Error> {
+    if let Ok(Some(length)) = content_length(&headers)
+        && length > state.config.server.max_body_bytes
+    {
+        return Err(S3Error::entity_too_large());
+    }
+    let permit = Arc::clone(&state.slots)
+        .try_acquire_owned()
+        .map_err(|_| S3Error::slow_down())?;
+    let streaming = is_streaming_request(&method, &headers, &uri);
+    let future = forward(&state, &method, &uri, &headers, body);
+    let response = if streaming {
+        future.await?
+    } else {
+        match tokio::time::timeout(state.config.server.request_timeout.as_duration(), future).await
+        {
+            Ok(result) => result?,
+            Err(_) => return Err(S3Error::request_timeout()),
+        }
+    };
+    Ok(hold_permit(response, permit))
+}
+
+fn hold_permit(response: Response, permit: OwnedSemaphorePermit) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = async_stream::stream! {
+        let _permit = permit;
+        let mut body = body.into_data_stream();
+        while let Some(chunk) = body.next().await {
+            yield chunk;
+        }
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+fn is_streaming_request(method: &Method, headers: &HeaderMap, uri: &Uri) -> bool {
+    if matches!(*method, Method::GET | Method::HEAD) {
+        return !object_key(uri.path()).is_empty();
+    }
+    content_length(headers)
+        .ok()
+        .flatten()
+        .is_some_and(|length| length > 0)
+        || headers.contains_key(header::TRANSFER_ENCODING)
+}
+
+fn idle_stream<S, E>(stream: S, idle: Duration) -> BodyStream
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let stream = async_stream::try_stream! {
+        let mut stream = Box::pin(stream);
+        loop {
+            match tokio::time::timeout(idle, stream.next()).await {
+                Ok(Some(Ok(bytes))) => yield bytes,
+                Ok(Some(Err(error))) => {
+                    Err(io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the stream was idle for too long",
+                    ))?;
+                }
+            }
+        }
+    };
+    Box::pin(stream)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -367,7 +709,8 @@ async fn forward(
     let bucket = bucket_name(uri.path())?;
     let key = object_key(uri.path());
     warn_checksum_dropped(headers, &payload, &bucket, &key);
-    let prepared = prepare_request(body, headers, payload)?;
+    let max_body_bytes = state.config.server.max_body_bytes;
+    let prepared = prepare_request(body, headers, payload, max_body_bytes, state.idle_timeout())?;
     let path_and_query = upstream_path_and_query(uri, is_presigned(uri));
     let query = uri.query().unwrap_or_default();
     let multipart =
@@ -581,7 +924,7 @@ async fn proxy_request(
     };
     let result = state.client.execute(credential, request).await;
     let response = result.map_err(|error| map_storage_error(error, failure_flag.as_ref()))?;
-    forward_response(method, response).await
+    forward_response(method, response, state.idle_timeout()).await
 }
 
 // The read path needs the request context and the cache policy.
@@ -797,11 +1140,11 @@ async fn origin_read(
 
     if response.status() == StatusCode::NOT_FOUND {
         cache.invalidate(bucket, key).await;
-        return forward_response(method, response).await;
+        return forward_response(method, response, state.idle_timeout()).await;
     }
 
     if !response.status().is_success() {
-        return forward_response(method, response).await;
+        return forward_response(method, response, state.idle_timeout()).await;
     }
 
     let size = response
@@ -823,7 +1166,12 @@ async fn origin_read(
                 .fetch_add(meta.size, Ordering::Relaxed);
             let size = meta.size;
             let body = cache.tee_response(response, meta);
-            return Ok(response_from_stream(body, StatusCode::OK, Some(size)));
+            return Ok(response_from_stream(
+                body,
+                StatusCode::OK,
+                Some(size),
+                state.idle_timeout(),
+            ));
         }
     }
 
@@ -833,7 +1181,7 @@ async fn origin_read(
     if method == Method::HEAD && revalidate.is_some() {
         cache.invalidate(bucket, key).await;
     }
-    forward_response(method, response).await
+    forward_response(method, response, state.idle_timeout()).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -864,10 +1212,10 @@ async fn serve_cached(
         StatusCode::OK
     };
     let cache_headers = response.headers().clone();
-    let mut output =
-        Response::new(Body::from_stream(response.bytes_stream().map_err(
-            |error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
-        )));
+    let mut output = Response::new(Body::from_stream(idle_stream(
+        response.bytes_stream(),
+        state.idle_timeout(),
+    )));
     *output.status_mut() = status;
     copy_cache_headers(&cache_headers, output.headers_mut());
     set_meta_headers(meta, output.headers_mut());
@@ -928,8 +1276,13 @@ fn copy_cache_headers(source: &HeaderMap, target: &mut HeaderMap) {
     }
 }
 
-fn response_from_stream(body: BodyStream, status: StatusCode, size: Option<u64>) -> Response {
-    let mut response = Response::new(Body::from_stream(body));
+fn response_from_stream(
+    body: BodyStream,
+    status: StatusCode,
+    size: Option<u64>,
+    idle: Duration,
+) -> Response {
+    let mut response = Response::new(Body::from_stream(idle_stream(body, idle)));
     *response.status_mut() = status;
     if let Some(size) = size
         && let Ok(value) = HeaderValue::from_str(&size.to_string())
@@ -1107,7 +1460,7 @@ async fn write_through_put(
         cache_task.abort();
         let _ = cache_task.await;
         cache.discard_blob(bucket, key).await;
-        return forward_response(&Method::PUT, response).await;
+        return forward_response(&Method::PUT, response, state.idle_timeout()).await;
     }
 
     let etag = response
@@ -1137,7 +1490,7 @@ async fn write_through_put(
     } else {
         cache.discard_blob(bucket, key).await;
     }
-    forward_response(&Method::PUT, response).await
+    forward_response(&Method::PUT, response, state.idle_timeout()).await
 }
 
 fn tee_body(body: BodyStream, sender: mpsc::Sender<Result<Bytes, io::Error>>) -> BodyStream {
@@ -1261,6 +1614,8 @@ fn prepare_request(
     body: Body,
     headers: &HeaderMap,
     payload: PayloadKind,
+    max_body_bytes: u64,
+    idle: Duration,
 ) -> Result<PreparedRequest, S3Error> {
     let original_length = content_length(headers)?;
     let mut output_headers = filter_request_headers(headers);
@@ -1269,12 +1624,24 @@ fn prepare_request(
         PayloadKind::Unsigned => {
             let has_body = original_length.is_some_and(|length| length > 0)
                 || headers.contains_key(header::TRANSFER_ENCODING);
-            let body = has_body.then(|| plain_body(body));
+            if !has_body {
+                return Ok(PreparedRequest {
+                    headers: output_headers,
+                    body: None,
+                    content_length: original_length,
+                    failure: None,
+                });
+            }
+            let flag = failure_flag();
+            let stream = idle_stream(
+                limit(plain_body(body), max_body_bytes, Arc::clone(&flag)),
+                idle,
+            );
             Ok(PreparedRequest {
                 headers: output_headers,
-                body,
+                body: Some(stream),
                 content_length: original_length,
-                failure: None,
+                failure: Some(flag),
             })
         }
         PayloadKind::Hash(expected) => {
@@ -1287,7 +1654,8 @@ fn prepare_request(
                 });
             }
             let flag = failure_flag();
-            let stream = verify_hash(body.into_data_stream(), expected, Arc::clone(&flag));
+            let verified = verify_hash(body.into_data_stream(), expected, Arc::clone(&flag));
+            let stream = idle_stream(limit(verified, max_body_bytes, Arc::clone(&flag)), idle);
             Ok(PreparedRequest {
                 headers: output_headers,
                 body: Some(stream),
@@ -1297,6 +1665,9 @@ fn prepare_request(
         }
         PayloadKind::Streaming(context) => {
             let decoded_length = context.decoded_length;
+            if decoded_length.is_some_and(|length| length > max_body_bytes) {
+                return Err(S3Error::entity_too_large());
+            }
             let trailer = context.trailer;
             strip_aws_chunked(&mut output_headers);
             output_headers.remove("x-amz-decoded-content-length");
@@ -1305,6 +1676,7 @@ fn prepare_request(
                 strip_trailer_checksum_headers(&mut output_headers);
             }
             let (stream, flag) = decode(body.into_data_stream(), ChunkMode::Signed(context));
+            let stream = idle_stream(limit(stream, max_body_bytes, Arc::clone(&flag)), idle);
             Ok(PreparedRequest {
                 headers: output_headers,
                 body: Some(stream),
@@ -1314,11 +1686,15 @@ fn prepare_request(
         }
         PayloadKind::StreamingUnsignedTrailer => {
             let decoded_length = content_length_header(headers, "x-amz-decoded-content-length")?;
+            if decoded_length.is_some_and(|length| length > max_body_bytes) {
+                return Err(S3Error::entity_too_large());
+            }
             strip_aws_chunked(&mut output_headers);
             output_headers.remove("x-amz-decoded-content-length");
             output_headers.remove("x-amz-trailer");
             strip_trailer_checksum_headers(&mut output_headers);
             let (stream, flag) = decode(body.into_data_stream(), ChunkMode::UnsignedTrailer);
+            let stream = idle_stream(limit(stream, max_body_bytes, Arc::clone(&flag)), idle);
             Ok(PreparedRequest {
                 headers: output_headers,
                 body: Some(stream),
@@ -1540,10 +1916,11 @@ fn filter_query(query: &str, presigned: bool) -> String {
 async fn forward_response(
     method: &Method,
     response: reqwest::Response,
+    idle: Duration,
 ) -> Result<Response, S3Error> {
     let status = response.status();
     if status.is_success() || status == StatusCode::NOT_MODIFIED {
-        let mut output = success_response(method, response);
+        let mut output = success_response(method, response, idle);
         if method == Method::DELETE && output.status().is_success() {
             *output.status_mut() = StatusCode::NO_CONTENT;
             *output.body_mut() = Body::empty();
@@ -1568,7 +1945,7 @@ async fn forward_response(
     }
 }
 
-fn success_response(method: &Method, response: reqwest::Response) -> Response {
+fn success_response(method: &Method, response: reqwest::Response, idle: Duration) -> Response {
     let status = response.status();
     let headers = response.headers().clone();
     let body = if method == Method::HEAD
@@ -1576,11 +1953,7 @@ fn success_response(method: &Method, response: reqwest::Response) -> Response {
     {
         Body::empty()
     } else {
-        Body::from_stream(
-            response
-                .bytes_stream()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string())),
-        )
+        Body::from_stream(idle_stream(response.bytes_stream(), idle))
     };
     let mut output = Response::new(body);
     *output.status_mut() = status;
@@ -1633,6 +2006,14 @@ fn map_storage_error(
     let kind = error.kind();
     match error {
         StorageError::Sign(error) => error,
+        StorageError::Timeout => {
+            warn!(kind, "upstream request timed out");
+            body_failure_error(failure_flag).unwrap_or_else(S3Error::request_timeout)
+        }
+        StorageError::Transport(error) if error.is_timeout() => {
+            warn!(kind, "upstream request timed out");
+            body_failure_error(failure_flag).unwrap_or_else(S3Error::request_timeout)
+        }
         StorageError::Transport(_) => {
             warn!(kind, "upstream request failed");
             body_failure_error(failure_flag).unwrap_or_else(S3Error::service_unavailable)
@@ -1647,6 +2028,7 @@ fn body_failure_error(failure_flag: Option<&Arc<std::sync::atomic::AtomicU8>>) -
         Some(BodyFailure::ChunkFormat | BodyFailure::DecodedLength) => {
             Some(S3Error::invalid_request("The request body is not valid."))
         }
+        Some(BodyFailure::TooLarge) => Some(S3Error::entity_too_large()),
         _ => None,
     }
 }
@@ -1671,6 +2053,14 @@ fn query_param(query: &str, name: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn request_id(headers: &HeaderMap) -> String {
+    headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map_or_else(next_request_id, str::to_owned)
 }
 
 fn next_request_id() -> String {

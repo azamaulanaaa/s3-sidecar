@@ -28,6 +28,8 @@ pub enum BodyFailure {
     ChunkFormat = 3,
     /// The decoded length does not match.
     DecodedLength = 4,
+    /// The body is larger than the configured limit.
+    TooLarge = 5,
 }
 
 impl BodyFailure {
@@ -39,6 +41,7 @@ impl BodyFailure {
             2 => Self::ChunkSignature,
             3 => Self::ChunkFormat,
             4 => Self::DecodedLength,
+            5 => Self::TooLarge,
             _ => Self::None,
         }
     }
@@ -52,6 +55,7 @@ impl BodyFailure {
             Self::ChunkSignature => "a chunk signature does not match",
             Self::ChunkFormat => "the chunked body is not valid",
             Self::DecodedLength => "the decoded content length does not match",
+            Self::TooLarge => "the request body is larger than the limit",
         }
     }
 }
@@ -73,6 +77,23 @@ pub fn fail(flag: &AtomicU8, failure: BodyFailure) -> io::Error {
 #[must_use]
 pub fn failure(flag: &AtomicU8) -> BodyFailure {
     BodyFailure::from_code(flag.load(Ordering::Acquire))
+}
+
+/// Stop a body stream when it exceeds a byte limit.
+pub fn limit(inner: BodyStream, max_bytes: u64, failure_flag: Arc<AtomicU8>) -> BodyStream {
+    let stream = async_stream::try_stream! {
+        let mut inner = inner;
+        let mut total = 0_u64;
+        while let Some(chunk) = inner.next().await {
+            let bytes = chunk?;
+            total = total.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+            if total > max_bytes {
+                Err(fail(&failure_flag, BodyFailure::TooLarge))?;
+            }
+            yield bytes;
+        }
+    };
+    Box::pin(stream)
 }
 
 /// Verify a SHA-256 payload hash while the body streams.
