@@ -499,6 +499,7 @@ fn config(
         },
         origin: EndpointConfig {
             endpoint: origin,
+            bucket: String::new(),
             region: "us-east-1".to_owned(),
             access_key_id: "origin".to_owned(),
             secret_access_key: SecretString::new("origin-secret"),

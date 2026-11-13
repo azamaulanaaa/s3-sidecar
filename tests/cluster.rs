@@ -64,7 +64,7 @@ struct BackingHandle {
 impl BackingHandle {
     fn insert(&self, key: &str, body: &[u8], last_modified: &str) {
         self.objects.lock().unwrap().insert(
-            key.to_owned(),
+            format!("objects/{key}"),
             Stored {
                 body: Bytes::copy_from_slice(body),
                 etag: md5_hex(body),
@@ -74,7 +74,10 @@ impl BackingHandle {
     }
 
     fn has(&self, key: &str) -> bool {
-        self.objects.lock().unwrap().contains_key(key)
+        self.objects
+            .lock()
+            .unwrap()
+            .contains_key(&format!("objects/{key}"))
     }
 
     fn keys(&self) -> Vec<String> {
@@ -120,7 +123,7 @@ async fn backing_handler(
     body: Bytes,
 ) -> Response {
     let (bucket, key) = split_path(uri.path());
-    if bucket != "objects" {
+    if bucket != "data" {
         return xml(
             StatusCode::NOT_FOUND,
             "<Error><Code>NoSuchBucket</Code></Error>",
@@ -145,7 +148,7 @@ async fn backing_handler(
         return xml(
             StatusCode::OK,
             &format!(
-                "<ListBucketResult><Name>objects</Name><IsTruncated>false</IsTruncated>\
+                "<ListBucketResult><Name>data</Name><IsTruncated>false</IsTruncated>\
                  <KeyCount>0</KeyCount>{contents}</ListBucketResult>"
             ),
         );
@@ -443,6 +446,7 @@ fn cluster_config(
         mode: Mode::Cluster,
         backing: EndpointConfig {
             endpoint: backing,
+            bucket: "data".to_owned(),
             region: "us-east-1".to_owned(),
             access_key_id: "AKIA".to_owned(),
             secret_access_key: SecretString::new("secret"),

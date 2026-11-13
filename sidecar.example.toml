@@ -47,6 +47,7 @@ low_watermark = 0.8
 
 [backing]
 # Cluster mode only.
+# bucket = "s3-sidecar-data"
 # endpoint = "http://127.0.0.1:9001"
 # region = "us-east-1"
 # access_key_id = "..."

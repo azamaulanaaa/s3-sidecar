@@ -31,9 +31,6 @@ use crate::errors::S3Error;
 use crate::metrics::Metrics;
 use crate::storage::{ForwardRequest, S3Client, StorageError};
 
-/// Backing bucket that holds every immutable blob.
-const BLOB_BUCKET: &str = "objects";
-
 /// A request body for one cluster write.
 pub struct WriteBody {
     /// Decoded body stream.
@@ -177,6 +174,10 @@ impl Cluster {
         &self.state
     }
 
+    fn blob_bucket(&self) -> &str {
+        &self.config.backing.bucket
+    }
+
     /// Refresh the applied index, term, and tombstone gauges.
     pub fn refresh_metrics(&self) {
         self.coord.refresh_metrics();
@@ -253,7 +254,13 @@ impl Cluster {
             }
             Err(error) => {
                 self.metrics.aborted_write();
-                delete_backing_blob(self.client.clone(), Arc::clone(&self.credential), blob).await;
+                delete_backing_blob(
+                    self.client.clone(),
+                    Arc::clone(&self.credential),
+                    self.blob_bucket(),
+                    blob,
+                )
+                .await;
                 Err(map_coord_error(error))
             }
         }
@@ -292,7 +299,7 @@ impl Cluster {
         }
         let request = ForwardRequest {
             method: method.clone(),
-            path_and_query: format!("/{BLOB_BUCKET}/{}", metadata.blob),
+            path_and_query: format!("/{}/objects/{}", self.blob_bucket(), metadata.blob),
             headers: request_headers,
             body: None,
             content_length: None,
@@ -347,8 +354,9 @@ impl Cluster {
         if let Some(blob) = blob {
             let client = self.client.clone();
             let credential = Arc::clone(&self.credential);
+            let bucket = self.config.backing.bucket.clone();
             tokio::spawn(async move {
-                delete_backing_blob(client, credential, blob).await;
+                delete_backing_blob(client, credential, &bucket, blob).await;
             });
         }
         let mut response = Response::new(Body::empty());
@@ -456,7 +464,7 @@ impl Cluster {
                 &self.credential,
                 ForwardRequest {
                     method: Method::POST,
-                    path_and_query: format!("/{BLOB_BUCKET}/{blob}?uploads"),
+                    path_and_query: format!("/{}/objects/{blob}?uploads", self.blob_bucket()),
                     headers: HeaderMap::new(),
                     body: None,
                     content_length: Some(0),
@@ -518,7 +526,8 @@ impl Cluster {
     ) -> Result<Response, S3Error> {
         let record = self.upload_for_node(upload_id)?;
         let path = format!(
-            "/{BLOB_BUCKET}/{}?partNumber={}&uploadId={}",
+            "/{}/objects/{}?partNumber={}&uploadId={}",
+            self.blob_bucket(),
             record.blob,
             encode_query(part_number),
             encode_query(&record.backing_upload_id)
@@ -559,7 +568,8 @@ impl Cluster {
     ) -> Result<Response, S3Error> {
         let record = self.upload_for_node(upload_id)?;
         let path = format!(
-            "/{BLOB_BUCKET}/{}?uploadId={}",
+            "/{}/objects/{}?uploadId={}",
+            self.blob_bucket(),
             record.blob,
             encode_query(&record.backing_upload_id)
         );
@@ -651,6 +661,7 @@ impl Cluster {
                 delete_backing_blob(
                     self.client.clone(),
                     Arc::clone(&self.credential),
+                    self.blob_bucket(),
                     record.blob.clone(),
                 )
                 .await;
@@ -690,7 +701,8 @@ impl Cluster {
         let record = self.upload_for_node(upload_id)?;
         let pairs = query_pairs(query);
         let mut path = format!(
-            "/{BLOB_BUCKET}/{}?uploadId={}",
+            "/{}/objects/{}?uploadId={}",
+            self.blob_bucket(),
             record.blob,
             encode_query(&record.backing_upload_id)
         );
@@ -763,6 +775,7 @@ impl Cluster {
                     delete_backing_blob(
                         self.client.clone(),
                         Arc::clone(&self.credential),
+                        self.blob_bucket(),
                         metadata.blob.clone(),
                     )
                     .await;
@@ -786,6 +799,7 @@ impl Cluster {
                 delete_backing_blob(
                     self.client.clone(),
                     Arc::clone(&self.credential),
+                    self.blob_bucket(),
                     object.key,
                 )
                 .await;
@@ -843,7 +857,7 @@ impl Cluster {
             .map(|body| fingerprint_stream(body, Arc::clone(&fingerprint)));
         let request = ForwardRequest {
             method: Method::PUT,
-            path_and_query: format!("/{BLOB_BUCKET}/{blob}"),
+            path_and_query: format!("/{}/objects/{blob}", self.blob_bucket()),
             headers: HeaderMap::new(),
             body,
             content_length: input.content_length,
@@ -865,7 +879,7 @@ impl Cluster {
     async fn head_blob(&self, blob: &str) -> Option<u64> {
         let request = ForwardRequest {
             method: Method::HEAD,
-            path_and_query: format!("/{BLOB_BUCKET}/{blob}"),
+            path_and_query: format!("/{}/objects/{blob}", self.blob_bucket()),
             headers: HeaderMap::new(),
             body: None,
             content_length: None,
@@ -889,7 +903,8 @@ impl Cluster {
                 ForwardRequest {
                     method: Method::DELETE,
                     path_and_query: format!(
-                        "/{BLOB_BUCKET}/{}?uploadId={}",
+                        "/{}/objects/{}?uploadId={}",
+                        self.blob_bucket(),
                         record.blob,
                         encode_query(&record.backing_upload_id)
                     ),
@@ -911,7 +926,8 @@ impl Cluster {
         let mut output = Vec::new();
         let mut token: Option<String> = None;
         loop {
-            let mut path = format!("/{BLOB_BUCKET}?list-type=2&prefix=");
+            let mut path = format!("/{}?list-type=2&prefix=", self.blob_bucket());
+            path.push_str(&encode_query("objects/"));
             if let Some(token) = &token {
                 path.push('&');
                 path.push_str("continuation-token=");
@@ -939,7 +955,13 @@ impl Cluster {
                 .await
                 .map_err(|_| S3Error::service_unavailable())?;
             let text = String::from_utf8_lossy(&body);
-            output.extend(parse_listing(&text));
+            for mut object in parse_listing(&text) {
+                if let Some(blob) = object.key.strip_prefix("objects/") {
+                    let blob = blob.to_owned();
+                    object.key = blob;
+                    output.push(object);
+                }
+            }
             let truncated = extract_tag(&text, "IsTruncated")
                 .is_some_and(|value| value.eq_ignore_ascii_case("true"));
             if !truncated {
@@ -1301,10 +1323,15 @@ fn body_failure_error(failure_flag: Option<&Arc<std::sync::atomic::AtomicU8>>) -
     }
 }
 
-async fn delete_backing_blob(client: S3Client, credential: Arc<ClientCredential>, blob: String) {
+async fn delete_backing_blob(
+    client: S3Client,
+    credential: Arc<ClientCredential>,
+    bucket: &str,
+    blob: String,
+) {
     let request = ForwardRequest {
         method: Method::DELETE,
-        path_and_query: format!("/{BLOB_BUCKET}/{blob}"),
+        path_and_query: format!("/{bucket}/objects/{blob}"),
         headers: HeaderMap::new(),
         body: None,
         content_length: None,

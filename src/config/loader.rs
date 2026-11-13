@@ -282,6 +282,7 @@ fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
         "CACHE__INDEX_PATH" => (EnvKind::Text, vec!["cache", "index_path"]),
         "CACHE__SERVE_QUARANTINED" => (EnvKind::Bool, vec!["cache", "serve_quarantined"]),
         "BACKING__ENDPOINT" => (EnvKind::Text, vec!["backing", "endpoint"]),
+        "BACKING__BUCKET" => (EnvKind::Text, vec!["backing", "bucket"]),
         "BACKING__REGION" => (EnvKind::Text, vec!["backing", "region"]),
         "BACKING__ACCESS_KEY_ID" => (EnvKind::Text, vec!["backing", "access_key_id"]),
         "BACKING__SECRET_ACCESS_KEY" => (EnvKind::Text, vec!["backing", "secret_access_key"]),

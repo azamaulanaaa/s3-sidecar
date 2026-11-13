@@ -190,6 +190,8 @@ impl Default for ServerConfig {
 pub struct EndpointConfig {
     /// Base URL of the S3 endpoint.
     pub endpoint: String,
+    /// Bucket for cluster backing data. Ignored for the origin endpoint.
+    pub bucket: String,
     /// `SigV4` region.
     pub region: String,
     /// Access key ID.
@@ -669,6 +671,11 @@ fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
             "backing.endpoint is required in cluster mode",
         ));
     }
+    if config.backing.bucket.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "backing.bucket is required in cluster mode",
+        ));
+    }
     if config.cluster.metadata_path.trim().is_empty() {
         return Err(ConfigError::invalid(
             "cluster.metadata_path must not be empty in cluster mode",
@@ -872,7 +879,16 @@ mod tests {
         config.consensus.raft.node_id = "a".to_owned();
         config.consensus.raft.peers = vec!["a".to_owned()];
         config.backing.endpoint = "http://127.0.0.1:9002".to_owned();
+        config.backing.bucket = "data".to_owned();
         config
+    }
+
+    #[test]
+    fn cluster_requires_a_backing_bucket() {
+        let mut config = cluster_base();
+        config.backing.bucket.clear();
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("backing.bucket"));
     }
 
     #[test]

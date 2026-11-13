@@ -157,6 +157,9 @@ pub struct ConfigFlags {
     /// Backing S3 endpoint URL for cluster mode.
     #[arg(long = "backing-endpoint", value_name = "URL")]
     pub backing_endpoint: Option<String>,
+    /// Backing S3 bucket for cluster blobs and uploads.
+    #[arg(long = "backing-bucket", value_name = "BUCKET")]
+    pub backing_bucket: Option<String>,
     /// Backing `SigV4` region.
     #[arg(long = "backing-region", value_name = "REGION")]
     pub backing_region: Option<String>,
@@ -429,6 +432,13 @@ impl ConfigFlags {
             set(
                 &mut object,
                 &["backing", "endpoint"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.backing_bucket {
+            set(
+                &mut object,
+                &["backing", "bucket"],
                 Value::String(value.clone()),
             );
         }

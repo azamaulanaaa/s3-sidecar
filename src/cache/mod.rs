@@ -123,6 +123,7 @@ impl Cache {
         }
         let cache_endpoint = EndpointConfig {
             endpoint: config.cache.endpoint.clone(),
+            bucket: String::new(),
             region: config.cache.region.clone(),
             access_key_id: config.cache.access_key_id.clone(),
             secret_access_key: config.cache.secret_access_key.clone(),

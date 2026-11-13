@@ -176,6 +176,12 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
     );
 
     push_endpoint(&mut rows, sources, "backing", &config.backing);
+    push_row(
+        &mut rows,
+        sources,
+        "backing.bucket",
+        config.backing.bucket.clone(),
+    );
 
     push_row(
         &mut rows,
