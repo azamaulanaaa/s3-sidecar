@@ -1,3 +1,23 @@
 [tools]
 cargo-dist = "latest"
 rust = "stable"
+
+[tasks.build]
+description = "Build the project"
+run = "cargo build"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo test"
+
+[tasks.fmt]
+description = "Format all Rust source files"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Run Clippy and fail on warnings"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.dist-plan]
+description = "Print the cargo-dist release plan"
+run = "dist plan"
