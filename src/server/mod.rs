@@ -225,6 +225,9 @@ async fn forward(
     check_bucket(&auth, uri, headers)?;
 
     let (credential, payload) = auth.into_parts();
+    let bucket = bucket_name(uri.path())?;
+    let key = object_key(uri.path());
+    warn_checksum_dropped(headers, &payload, &bucket, &key);
     let prepared = prepare_request(body, headers, payload)?;
     let path_and_query = upstream_path_and_query(uri, is_presigned(uri));
     let request = ForwardRequest {
@@ -445,6 +448,41 @@ fn strip_aws_chunked(headers: &mut HeaderMap) {
         headers.insert(header::CONTENT_ENCODING, value);
     } else {
         headers.remove(header::CONTENT_ENCODING);
+    }
+}
+
+fn warn_checksum_dropped(headers: &HeaderMap, payload: &PayloadKind, bucket: &str, key: &str) {
+    let algorithm = headers.contains_key("x-amz-checksum-algorithm");
+    let trailer_checksum = match payload {
+        PayloadKind::Streaming(context) => context.trailer && has_checksum_header(headers),
+        PayloadKind::StreamingUnsignedTrailer => has_checksum_header(headers),
+        PayloadKind::Unsigned | PayloadKind::Hash(_) => false,
+    };
+    if algorithm || trailer_checksum {
+        warn!(
+            bucket,
+            key,
+            "multipart checksum headers were removed; the origin will not validate part checksums"
+        );
+    }
+}
+
+fn has_checksum_header(headers: &HeaderMap) -> bool {
+    headers.keys().any(|name| {
+        let name = name.as_str();
+        name.starts_with("x-amz-checksum-")
+            || name == "x-amz-sdk-checksum-algorithm"
+            || name == "x-amz-trailer"
+    })
+}
+
+fn object_key(path: &str) -> String {
+    let trimmed = path.trim_start_matches('/');
+    match trimmed.split_once('/') {
+        Some((_, key)) => percent_encoding::percent_decode_str(key)
+            .decode_utf8_lossy()
+            .into_owned(),
+        None => String::new(),
     }
 }
 
