@@ -20,6 +20,22 @@ To print the cargo-dist release plan, run:
 mise run dist-plan
 ```
 
+## Local CI
+
+Run this command one time for each clone to install the Git hooks:
+
+```bash
+mise run hooks
+```
+
+The `pre-commit` hook runs the formatting check and Clippy.
+The `pre-push` hook runs the formatting check, Clippy, the tests, the docs, the release plan, and all cargo-deny checks.
+To run the full set by hand, run:
+
+```bash
+mise run ci
+```
+
 ## License
 
 Licensed under either of
