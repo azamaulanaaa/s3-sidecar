@@ -75,6 +75,26 @@ impl CacheIndex {
         Ok(index)
     }
 
+    /// Commit an empty write so the index is durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database commit fails.
+    pub fn flush(&self) -> Result<(), CacheError> {
+        let write = self
+            .db
+            .begin_write()
+            .map_err(|error| CacheError::Index(error.to_string()))?;
+        {
+            write
+                .open_table(TABLE)
+                .map_err(|error| CacheError::Index(error.to_string()))?;
+        }
+        write
+            .commit()
+            .map_err(|error| CacheError::Index(error.to_string()))
+    }
+
     /// Return the tracked byte count.
     #[must_use]
     pub fn tracked_bytes(&self) -> u64 {

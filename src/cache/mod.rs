@@ -17,6 +17,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, mpsc};
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use self::index::{CacheIndex, IndexEntry};
@@ -109,6 +110,7 @@ pub struct Cache {
     sync_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
     started: AtomicBool,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Cache {
@@ -130,14 +132,14 @@ impl Cache {
             session_token: config.cache.session_token.clone(),
             force_path_style: config.cache.force_path_style,
         };
-        let client = S3Client::new(&cache_endpoint)?;
+        let client = S3Client::new_with_upstream(&cache_endpoint, &config.upstream)?;
         let credential = Arc::new(ClientCredential::new(
             config.cache.access_key_id.clone(),
             config.cache.secret_access_key.clone(),
             config.cache.session_token.clone(),
             Vec::new(),
         ));
-        let origin = S3Client::new(&config.origin)?;
+        let origin = S3Client::new_with_upstream(&config.origin, &config.upstream)?;
         let origin_credential = Arc::new(ClientCredential::new(
             config.origin.access_key_id.clone(),
             config.origin.secret_access_key.clone(),
@@ -184,6 +186,7 @@ impl Cache {
             }),
             metrics,
             started: AtomicBool::new(false),
+            tasks: Mutex::new(Vec::new()),
         })))
     }
 
@@ -291,6 +294,24 @@ impl Cache {
         self.recover().await?;
         self.spawn_gc();
         Ok(())
+    }
+
+    /// Stop the garbage collector and sync workers, then flush the index.
+    pub fn shutdown(&self) {
+        for task in lock(&self.tasks).drain(..) {
+            task.abort();
+        }
+        if let Some(index) = &self.index
+            && let Err(error) = lock(index).flush()
+        {
+            warn!(%error, "cache index flush failed");
+        }
+    }
+
+    fn track(&self, task: JoinHandle<()>) {
+        let mut tasks = lock(&self.tasks);
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
     }
 
     /// Return the metadata for a pending entry.
@@ -903,9 +924,10 @@ impl Cache {
         }
         drop(jobs);
         let cache = Arc::clone(self);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             cache.sync_key_loop(key).await;
         });
+        self.track(task);
     }
 
     async fn sync_key_loop(self: Arc<Self>, key: CacheKey) {
@@ -1609,7 +1631,7 @@ impl Cache {
     fn spawn_gc(self: &Arc<Self>) {
         let cache = Arc::clone(self);
         let interval = self.config.cache.gc_interval.as_duration();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await;
             loop {
@@ -1619,6 +1641,7 @@ impl Cache {
                 }
             }
         });
+        self.track(task);
     }
 }
 
@@ -1769,7 +1792,7 @@ fn receiver_stream(mut receiver: mpsc::Receiver<Result<Bytes, io::Error>>) -> Bo
 fn storage_error(error: StorageError) -> CacheError {
     match error {
         StorageError::Sign(_) => CacheError::Metadata,
-        StorageError::Transport(_) => CacheError::Unavailable,
+        StorageError::Timeout | StorageError::Transport(_) => CacheError::Unavailable,
     }
 }
 
