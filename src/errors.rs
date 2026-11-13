@@ -15,6 +15,8 @@ pub struct S3Error {
     pub message: String,
     /// Resource path.
     pub resource: Option<String>,
+    /// Extra response headers.
+    pub extra_headers: Vec<(String, String)>,
 }
 
 impl S3Error {
@@ -26,7 +28,15 @@ impl S3Error {
             code: code.to_owned(),
             message: message.to_owned(),
             resource: None,
+            extra_headers: Vec::new(),
         }
+    }
+
+    /// Add one response header to the error.
+    #[must_use]
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.extra_headers.push((name.to_owned(), value.to_owned()));
+        self
     }
 
     /// Attach the request resource.
@@ -184,6 +194,14 @@ impl S3Error {
         );
         if let Ok(value) = HeaderValue::from_str(request_id) {
             headers.insert("x-amz-request-id", value);
+        }
+        for (name, value) in &self.extra_headers {
+            if let (Ok(name), Ok(value)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.insert(name, value);
+            }
         }
         response
     }

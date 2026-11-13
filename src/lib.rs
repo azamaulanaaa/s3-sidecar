@@ -13,6 +13,7 @@
 pub mod auth;
 pub mod cache;
 pub mod cli;
+pub mod cluster;
 pub mod config;
 pub mod errors;
 pub mod metrics;

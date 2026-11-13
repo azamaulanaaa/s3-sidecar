@@ -31,6 +31,26 @@ pub struct Metrics {
     pub cache_max_bytes: AtomicU64,
     /// One when the cache is unlimited.
     pub cache_unlimited: AtomicU64,
+    /// Cluster writes that reached the committed state.
+    pub cluster_committed_writes: AtomicU64,
+    /// Cluster writes that were rejected and removed.
+    pub cluster_aborted_writes: AtomicU64,
+    /// Total commit latency in microseconds.
+    pub cluster_commit_latency_micros: AtomicU64,
+    /// Reads served from local metadata and a local blob.
+    pub cluster_read_local_hits: AtomicU64,
+    /// Reads where the metadata was committed but the blob was missing.
+    pub cluster_missing_blob_reads: AtomicU64,
+    /// Current tombstone count.
+    pub cluster_tombstones: AtomicU64,
+    /// Blobs removed by cluster garbage collection.
+    pub cluster_gc_deletions: AtomicU64,
+    /// Applied metadata index.
+    pub cluster_applied_index: AtomicU64,
+    /// Current coordinator term.
+    pub cluster_term: AtomicU64,
+    /// Calls to `read_index`.
+    pub cluster_read_index_calls: AtomicU64,
 }
 
 impl Metrics {
@@ -82,6 +102,54 @@ impl Metrics {
     /// Set the tracked byte gauge.
     pub fn set_tracked(&self, bytes: u64) {
         self.tracked_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Record one committed cluster write.
+    pub fn committed_write(&self) {
+        self.cluster_committed_writes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one rejected and removed cluster write.
+    pub fn aborted_write(&self) {
+        self.cluster_aborted_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the latency of one commit.
+    pub fn commit_latency(&self, elapsed: std::time::Duration) {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.cluster_commit_latency_micros
+            .fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// Record one local cluster read.
+    pub fn cluster_read_local(&self) {
+        self.cluster_read_local_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one committed read with a missing blob.
+    pub fn missing_blob(&self) {
+        self.cluster_missing_blob_reads
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one garbage collection deletion.
+    pub fn gc_deleted(&self) {
+        self.cluster_gc_deletions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one `read_index` call.
+    pub fn read_index_called(&self) {
+        self.cluster_read_index_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the coordinator gauges.
+    pub fn set_cluster_state(&self, applied_index: u64, term: u64, tombstones: u64) {
+        self.cluster_applied_index
+            .store(applied_index, Ordering::Relaxed);
+        self.cluster_term.store(term, Ordering::Relaxed);
+        self.cluster_tombstones.store(tombstones, Ordering::Relaxed);
     }
 }
 
@@ -194,6 +262,68 @@ pub fn render(metrics: &Metrics, pending: u64, sync_lag_seconds: u64) -> String 
         "s3_sidecar_cache_unlimited",
         "One when the cache has no size limit.",
         metrics.cache_unlimited.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_committed_writes_total",
+        "Cluster writes that reached the committed state.",
+        metrics.cluster_committed_writes.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_aborted_writes_total",
+        "Cluster writes that were rejected and removed.",
+        metrics.cluster_aborted_writes.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_commit_latency_micros_total",
+        "Total cluster commit latency in microseconds.",
+        metrics
+            .cluster_commit_latency_micros
+            .load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_read_local_hits_total",
+        "Reads served from local metadata and a local blob.",
+        metrics.cluster_read_local_hits.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_missing_blob_reads_total",
+        "Reads where the blob was missing.",
+        metrics.cluster_missing_blob_reads.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_tombstones",
+        "Current cluster tombstone count.",
+        metrics.cluster_tombstones.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_gc_deletions_total",
+        "Blobs removed by cluster garbage collection.",
+        metrics.cluster_gc_deletions.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_applied_index",
+        "Applied metadata index.",
+        metrics.cluster_applied_index.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_term",
+        "Current coordinator term.",
+        metrics.cluster_term.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_read_index_calls_total",
+        "Calls to the coordinator read index.",
+        metrics.cluster_read_index_calls.load(Ordering::Relaxed),
     );
     output
 }
