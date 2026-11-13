@@ -29,6 +29,13 @@ client receives `200`: after the leader commit, after a quorum of replicas, or
 after all replicas. `read = local_then_peer` serves a local blob or fetches it
 from a replica.
 
+## Operations
+
+Read [docs/operations.md](docs/operations.md) for deployment topologies, the
+consistency matrix, the metrics reference, sizing, security, backup, and
+upgrade. Read [docs/runbook.md](docs/runbook.md) for the symptom, check, and
+action for common failures.
+
 ## Build and test
 
 This project uses [mise](https://mise.jdx.dev/) to manage tools and tasks.
@@ -39,7 +46,12 @@ mise run build
 mise run test
 mise run fmt
 mise run lint
+mise run bench
+mise run loadgen
+mise run fuzz
 ```
+
+`mise run bench` and `mise run fuzz` need the extra tools in the sections below.
 
 The full local gates are:
 
@@ -806,6 +818,78 @@ It does not delete a blob that metadata still references.
 Cluster metrics include committed writes, aborted writes, commit latency,
 local read hits, missing-blob reads, tombstone count, GC deletions, applied
 index, term, and read-index calls.
+
+## Benchmarks
+
+`examples/loadgen.rs` is a small load generator. It signs requests with the
+crate `SigV4` code and reports count, errors, throughput, p50, p95, and p99
+latency. It is an example, so the release artifacts do not include it.
+
+```bash
+cargo run --release --example loadgen -- \
+  --endpoint http://127.0.0.1:9000 \
+  --bucket media \
+  --key bench/object \
+  --requests 1000 \
+  --concurrency 16 \
+  --size 4096 \
+  --mode mixed \
+  --access-key minioadmin \
+  --secret-key minioadmin \
+  --region us-east-1
+```
+
+`--mode` takes `put`, `get`, or `mixed`. For `get`, seed the same key prefix
+first. The request index is appended to `--key`.
+
+`scripts/bench.sh` builds the release binary and runs the repeatable scenarios.
+It starts a local origin S3 and a local cache S3, then runs:
+
+- `proxy-put` and `proxy-get` with `cache.mode = "off"`.
+- `cache-miss` then `cache-hit` with `cache.mode = "read_write"`.
+- `cluster-leader` on a single-node cluster with `write_ack = "leader"`.
+- `cluster-quorum` on a three-node raft cluster with `write_ack = "quorum"`.
+
+Run it with rustfs or MinIO:
+
+```bash
+RUSTFS_BIN=/path/to/rustfs mise run bench
+MINIO_BIN=/path/to/minio mise run bench
+```
+
+The script needs `curl` and the AWS CLI or `mc` to create the test buckets.
+Set `BENCH_REQUESTS` to change the request count. Set `BENCH_RESULTS` to change
+the output directory.
+
+The script writes the measured output to `bench-results/`. Git ignores that
+directory. Each file names one scenario. The fields are:
+
+| Field | Meaning |
+|---|---|
+| `completed` | Requests that returned a response. |
+| `errors` | Requests with a transport error or a non-2xx status. |
+| `duration_seconds` | Wall time for the run. |
+| `throughput_ops_per_second` | Successful requests divided by wall time. |
+| `p50_ms`, `p95_ms`, `p99_ms` | Latency percentiles in milliseconds. |
+
+The repository does not store benchmark numbers. Compare two runs on the same
+host with the same S3 binary and the same request count.
+
+## Fuzzing
+
+The `fuzz/` crate holds `cargo-fuzz` targets for the `SigV4` parser and the S3
+XML parsers. The crate is isolated from the root workspace.
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz
+mise run fuzz
+```
+
+The task runs both targets for 60 seconds each. See
+[`fuzz/README.md`](fuzz/README.md) for the individual commands and the steps to
+reproduce a finding. A panic is a finding. The fuzz run is a scheduled workflow
+and is not part of the pull request gate.
 
 ## Limitations
 

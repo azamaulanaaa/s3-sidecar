@@ -237,7 +237,7 @@ entry.
 
 - The process does not exit after `SIGTERM` or `SIGINT`.
 - The exit status is non-zero.
-- The log says `shutdown` and `timeout`.
+- The log contains `graceful shutdown timed out`.
 
 **Check**
 
