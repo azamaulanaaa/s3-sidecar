@@ -71,6 +71,10 @@ pub struct Metrics {
     pub cluster_reconcile_present: AtomicU64,
     /// Replica targets missing during reconciliation.
     pub cluster_reconcile_missing: AtomicU64,
+    /// Owner blobs restored by reconciliation.
+    pub cluster_owner_blobs_repaired: AtomicU64,
+    /// Owner blobs that no replica could supply.
+    pub cluster_owner_blobs_unrecoverable: AtomicU64,
     /// Current raft term.
     pub raft_term: AtomicU64,
     /// Last raft log index.
@@ -227,6 +231,18 @@ impl Metrics {
             .store(present, Ordering::Relaxed);
         self.cluster_reconcile_missing
             .store(missing, Ordering::Relaxed);
+    }
+
+    /// Record one owner blob restored by reconciliation.
+    pub fn owner_blob_repaired(&self) {
+        self.cluster_owner_blobs_repaired
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one owner blob that no replica could supply.
+    pub fn owner_blob_unrecoverable(&self) {
+        self.cluster_owner_blobs_unrecoverable
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Set the raft leader name.
@@ -479,6 +495,20 @@ pub fn render(metrics: &Metrics, pending: u64, sync_lag_seconds: u64) -> String 
         "s3_sidecar_cluster_reconcile_missing_total",
         "Replica targets missing during reconciliation.",
         metrics.cluster_reconcile_missing.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_owner_blobs_repaired_total",
+        "Owner blobs restored by reconciliation.",
+        metrics.cluster_owner_blobs_repaired.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_owner_blobs_unrecoverable_total",
+        "Owner blobs that no replica could supply.",
+        metrics
+            .cluster_owner_blobs_unrecoverable
+            .load(Ordering::Relaxed),
     );
     {
         let failures = metrics

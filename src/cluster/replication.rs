@@ -22,6 +22,7 @@ use crate::storage::{ForwardRequest, StorageError};
 
 const CLAIM_LEASE_SECONDS: i64 = 5;
 const RECONCILE_BATCH: usize = 256;
+const OWNER_REPAIR_BATCH: usize = 16;
 const MAX_RETRY_SECONDS: u64 = 60;
 
 /// Return the owner and its deterministic peer replica set.
@@ -282,6 +283,71 @@ impl Cluster {
             .is_ok_and(|response| response.status().is_success())
     }
 
+    /// Restore a missing owner blob from one reachable replica.
+    async fn repair_owner_blob(&self, metadata: &Metadata) -> bool {
+        for node in &metadata.replicas {
+            if node == &self.node_id {
+                continue;
+            }
+            let Some(address) = self.config.cluster.node_addr(node).map(str::to_owned) else {
+                continue;
+            };
+            if !self.peer_head(&address, &metadata.blob).await {
+                continue;
+            }
+            if self.copy_peer_blob(&address, metadata).await {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn copy_peer_blob(&self, address: &str, metadata: &Metadata) -> bool {
+        let url = format!("{}/_blob/{}", address.trim_end_matches('/'), metadata.blob);
+        let response = match self
+            .http
+            .get(url)
+            .header(
+                CLUSTER_TOKEN_HEADER,
+                self.config.cluster.secret.expose_secret(),
+            )
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => response,
+            Ok(_) => return false,
+            Err(error) => {
+                warn!(%error, "owner blob repair fetch failed");
+                return false;
+            }
+        };
+        let length = response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(metadata.size);
+        let stream: crate::auth::body::BodyStream = Box::pin(
+            response
+                .bytes_stream()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        );
+        let request = ForwardRequest {
+            method: Method::PUT,
+            path_and_query: format!("/{}/objects/{}", self.blob_bucket(), metadata.blob),
+            headers: HeaderMap::new(),
+            body: Some(stream),
+            content_length: Some(length),
+        };
+        match self.client.execute(&self.credential, request).await {
+            Ok(response) => response.status().is_success(),
+            Err(error) => {
+                warn!(%error, "owner blob repair write failed");
+                false
+            }
+        }
+    }
+
     /// Fetch one blob from the replica set, then from the owner.
     ///
     /// The caller already tried the local backing store.
@@ -418,6 +484,7 @@ impl Cluster {
         let mut checked = 0_u64;
         let mut present = 0_u64;
         let mut missing = 0_u64;
+        let mut repairs = 0_usize;
         for (bucket, key, metadata) in &committed[start..end] {
             let intended = if metadata.replicas.is_empty() {
                 vec![metadata.owner.clone()]
@@ -438,22 +505,35 @@ impl Cluster {
                     continue;
                 }
                 missing = missing.saturating_add(1);
-                if target != self.node_id {
-                    let now = unix_now();
-                    let job = ReplicationJob {
-                        uuid: metadata.blob.clone(),
-                        op: ReplicationOp::Put,
-                        targets: vec![target],
-                        done: Vec::new(),
-                        attempts: 0,
-                        next_at: now,
-                        created_at: now,
-                        bucket: bucket.clone(),
-                        key: key.clone(),
-                    };
-                    if let Err(error) = self.state.enqueue_replication_job(&job) {
-                        warn!(%error, "cannot queue reconciliation replication");
+                if target == self.node_id {
+                    if metadata.owner == self.node_id
+                        && repairs < OWNER_REPAIR_BATCH
+                        && self.repair_owner_blob(metadata).await
+                    {
+                        repairs = repairs.saturating_add(1);
+                        self.metrics.owner_blob_repaired();
+                        present = present.saturating_add(1);
+                        missing = missing.saturating_sub(1);
+                    } else if metadata.owner == self.node_id && repairs < OWNER_REPAIR_BATCH {
+                        repairs = repairs.saturating_add(1);
+                        self.metrics.owner_blob_unrecoverable();
                     }
+                    continue;
+                }
+                let now = unix_now();
+                let job = ReplicationJob {
+                    uuid: metadata.blob.clone(),
+                    op: ReplicationOp::Put,
+                    targets: vec![target],
+                    done: Vec::new(),
+                    attempts: 0,
+                    next_at: now,
+                    created_at: now,
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                };
+                if let Err(error) = self.state.enqueue_replication_job(&job) {
+                    warn!(%error, "cannot queue reconciliation replication");
                 }
             }
         }
