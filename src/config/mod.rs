@@ -1,0 +1,726 @@
+//! Layered configuration loading and validation.
+
+pub mod duration;
+pub mod loader;
+pub mod secret;
+pub mod show;
+
+use std::collections::HashSet;
+use std::fmt;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+use self::duration::HumanDuration;
+use self::loader::SourceMap;
+use self::secret::SecretString;
+
+/// Run mode for the sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Read and write through a cache S3 endpoint.
+    #[default]
+    Cache,
+    /// Join a sidecar cluster.
+    Cluster,
+}
+
+impl fmt::Display for Mode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cache => f.write_str("cache"),
+            Self::Cluster => f.write_str("cluster"),
+        }
+    }
+}
+
+/// Cache behavior for reads and writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheMode {
+    /// Do not cache. All requests go to origin.
+    #[default]
+    Off,
+    /// Cache reads only.
+    Read,
+    /// Buffer writes only.
+    Write,
+    /// Cache reads and buffer writes.
+    ReadWrite,
+}
+
+impl fmt::Display for CacheMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::Read => f.write_str("read"),
+            Self::Write => f.write_str("write"),
+            Self::ReadWrite => f.write_str("read_write"),
+        }
+    }
+}
+
+/// Cache write policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WritePolicy {
+    /// Acknowledge after the cache write. Sync to origin later.
+    #[default]
+    WriteBack,
+    /// Write to origin before the acknowledgement.
+    WriteThrough,
+}
+
+impl fmt::Display for WritePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WriteBack => f.write_str("write_back"),
+            Self::WriteThrough => f.write_str("write_through"),
+        }
+    }
+}
+
+/// Action when the cache is not available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnCacheError {
+    /// Send the request to origin.
+    #[default]
+    Origin,
+    /// Return an error.
+    Fail,
+}
+
+impl fmt::Display for OnCacheError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Origin => f.write_str("origin"),
+            Self::Fail => f.write_str("fail"),
+        }
+    }
+}
+
+/// Coordination backend for cluster mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsensusBackend {
+    /// Use the built-in raft implementation.
+    #[default]
+    Raft,
+    /// Use Consul for coordination.
+    Consul,
+}
+
+impl fmt::Display for ConsensusBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Raft => f.write_str("raft"),
+            Self::Consul => f.write_str("consul"),
+        }
+    }
+}
+
+/// Write acknowledgement level for a cluster bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteAck {
+    /// Acknowledge after the leader commits.
+    Leader,
+    /// Acknowledge after a quorum of replicas.
+    Quorum,
+    /// Acknowledge after all replicas.
+    All,
+}
+
+impl fmt::Display for WriteAck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Leader => f.write_str("leader"),
+            Self::Quorum => f.write_str("quorum"),
+            Self::All => f.write_str("all"),
+        }
+    }
+}
+
+/// Read routing mode for a cluster bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadMode {
+    /// Read locally.
+    Local,
+    /// Read locally, then ask a peer.
+    LocalThenPeer,
+    /// Read through the leader.
+    Leader,
+}
+
+impl fmt::Display for ReadMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local => f.write_str("local"),
+            Self::LocalThenPeer => f.write_str("local_then_peer"),
+            Self::Leader => f.write_str("leader"),
+        }
+    }
+}
+
+/// HTTP listener settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ServerConfig {
+    /// Listen address, for example `127.0.0.1:9000`.
+    pub bind: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: "127.0.0.1:9000".to_owned(),
+        }
+    }
+}
+
+/// Connection settings for one S3 endpoint.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EndpointConfig {
+    /// Base URL of the S3 endpoint.
+    pub endpoint: String,
+    /// `SigV4` region.
+    pub region: String,
+    /// Access key ID.
+    pub access_key_id: String,
+    /// Secret access key.
+    pub secret_access_key: SecretString,
+    /// Optional session token.
+    pub session_token: Option<SecretString>,
+    /// Use path-style bucket addresses.
+    pub force_path_style: bool,
+}
+
+impl EndpointConfig {
+    /// Return true when the endpoint has a URL.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        !self.endpoint.trim().is_empty()
+    }
+
+    /// Return the region, or the default region.
+    #[must_use]
+    pub fn region_or_default(&self) -> &str {
+        if self.region.is_empty() {
+            "us-east-1"
+        } else {
+            &self.region
+        }
+    }
+}
+
+/// Cache settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CacheConfig {
+    /// Cache S3 endpoint URL.
+    pub endpoint: String,
+    /// Cache `SigV4` region.
+    pub region: String,
+    /// Cache access key ID.
+    pub access_key_id: String,
+    /// Cache secret access key.
+    pub secret_access_key: SecretString,
+    /// Optional cache session token.
+    pub session_token: Option<SecretString>,
+    /// Use path-style bucket addresses for the cache.
+    pub force_path_style: bool,
+    /// Key prefix for this node.
+    pub prefix: String,
+    /// Cache behavior.
+    pub mode: CacheMode,
+    /// Maximum cache size in bytes. `0` means unlimited.
+    pub max_bytes: Option<u64>,
+    /// Maximum object size that can enter the cache.
+    pub max_object_bytes: u64,
+    /// Cache write policy.
+    pub write_policy: WritePolicy,
+    /// Fallback when the cache is not available.
+    pub on_cache_error: OnCacheError,
+    /// Eviction high watermark, as a fraction.
+    pub high_watermark: f64,
+    /// Eviction low watermark, as a fraction.
+    pub low_watermark: f64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            region: "us-east-1".to_owned(),
+            access_key_id: String::new(),
+            secret_access_key: SecretString::default(),
+            session_token: None,
+            force_path_style: false,
+            prefix: "cache".to_owned(),
+            mode: CacheMode::Off,
+            max_bytes: None,
+            max_object_bytes: 1_073_741_824,
+            write_policy: WritePolicy::default(),
+            on_cache_error: OnCacheError::default(),
+            high_watermark: 0.9,
+            low_watermark: 0.8,
+        }
+    }
+}
+
+/// Raft settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RaftConfig {
+    /// Node name.
+    pub node_id: String,
+    /// Cluster member names. The list includes this node.
+    pub peers: Vec<String>,
+}
+
+/// Coordination settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConsensusConfig {
+    /// Coordination backend.
+    pub backend: ConsensusBackend,
+    /// Raft settings.
+    pub raft: RaftConfig,
+}
+
+/// One client credential and its bucket allow-list.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientConfig {
+    /// Access key ID that the client sends.
+    pub access_key_id: String,
+    /// Secret access key that the client uses to sign.
+    pub secret_access_key: SecretString,
+    /// Optional session token.
+    #[serde(default)]
+    pub session_token: Option<SecretString>,
+    /// Buckets that this client may use. An empty list allows no bucket.
+    #[serde(default)]
+    pub buckets: Vec<String>,
+}
+
+impl fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &self.secret_access_key)
+            .field("session_token", &self.session_token)
+            .field("buckets", &self.buckets)
+            .finish()
+    }
+}
+
+/// Per-bucket settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BucketConfig {
+    /// Bucket name.
+    pub name: String,
+    /// Cache time to live.
+    pub ttl: Option<HumanDuration>,
+    /// Cache behavior for this bucket.
+    pub cache_mode: Option<CacheMode>,
+    /// Cache write policy for this bucket.
+    pub cache_write_policy: Option<WritePolicy>,
+    /// Write acknowledgement level for cluster mode.
+    pub write_ack: Option<WriteAck>,
+    /// Read routing mode for cluster mode.
+    pub read: Option<ReadMode>,
+    /// Replica count for cluster mode.
+    pub replicas: Option<u32>,
+    /// Minimum replica count for cluster mode.
+    pub min_replicas: Option<u32>,
+}
+
+/// Merged configuration.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Config {
+    /// Run mode.
+    pub mode: Mode,
+    /// Listener settings.
+    pub server: ServerConfig,
+    /// Origin S3 endpoint.
+    pub origin: EndpointConfig,
+    /// Cache settings.
+    pub cache: CacheConfig,
+    /// Backing S3 endpoint for cluster mode.
+    pub backing: EndpointConfig,
+    /// Coordination settings.
+    pub consensus: ConsensusConfig,
+    /// Client credentials.
+    pub clients: Vec<ClientConfig>,
+    /// Per-bucket settings.
+    pub buckets: Vec<BucketConfig>,
+}
+
+/// A problem found while loading or validating the configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// The configuration file could not be read.
+    #[error("cannot read config file {path}: {source}")]
+    ReadFile {
+        /// File path.
+        path: std::path::PathBuf,
+        /// I/O error.
+        source: std::io::Error,
+    },
+    /// The configuration file is not valid TOML.
+    #[error("cannot parse config file {path}: {source}")]
+    ParseFile {
+        /// File path.
+        path: std::path::PathBuf,
+        /// Parse error.
+        source: toml::de::Error,
+    },
+    /// A secret file could not be read.
+    #[error("cannot read secret file {path}: {source}")]
+    ReadSecret {
+        /// File path.
+        path: std::path::PathBuf,
+        /// I/O error.
+        source: std::io::Error,
+    },
+    /// Standard input could not be read.
+    #[error("cannot read the secret from stdin: {0}")]
+    ReadStdin(std::io::Error),
+    /// The configuration is not valid.
+    #[error("invalid config: {0}")]
+    Invalid(String),
+    /// An environment variable is not known.
+    #[error("unknown environment variable: {0}. Remove it or correct the name.")]
+    UnknownEnv(String),
+    /// A value has the wrong type or format.
+    #[error("invalid value for {name}: {value}")]
+    InvalidValue {
+        /// Field name.
+        name: String,
+        /// Rejected value.
+        value: String,
+    },
+    /// The merged value could not be deserialized.
+    #[error("invalid config: {0}")]
+    Deserialize(String),
+    /// A flags value is not valid JSON.
+    #[error("invalid JSON for {name}: {source}")]
+    FlagsJson {
+        /// Flag name.
+        name: String,
+        /// Parse error.
+        source: serde_json::Error,
+    },
+    /// A JSON value has the wrong type.
+    #[error("{name} must be a JSON {expected}")]
+    FlagsType {
+        /// Flag name.
+        name: String,
+        /// Expected JSON type.
+        expected: String,
+    },
+}
+
+impl ConfigError {
+    /// Build an invalid-config error from a message.
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
+/// Validate the merged configuration.
+///
+/// Returns warnings for settings that are accepted but have no effect.
+///
+/// # Errors
+///
+/// Returns an error when a setting violates a rule.
+pub fn validate(config: &Config) -> Result<Vec<String>, ConfigError> {
+    let mut warnings = Vec::new();
+    validate_cache(config, &mut warnings)?;
+    validate_endpoints(config)?;
+    validate_cluster(config)?;
+    validate_buckets(config)?;
+    validate_clients(config)?;
+    Ok(warnings)
+}
+
+fn validate_cache(config: &Config, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
+    if config.cache.max_object_bytes == 0 {
+        return Err(ConfigError::invalid(
+            "cache.max_object_bytes must be greater than 0",
+        ));
+    }
+    if config.cache.mode != CacheMode::Off && config.cache.max_bytes.is_none() {
+        return Err(ConfigError::invalid(
+            "cache.max_bytes is required when cache.mode is not \"off\". \
+             Set cache.max_bytes to a byte count, or 0 for unlimited.",
+        ));
+    }
+    let Some(max_bytes) = config.cache.max_bytes else {
+        return Ok(());
+    };
+    if max_bytes > 0 {
+        if !(0.0..=1.0).contains(&config.cache.high_watermark) {
+            return Err(ConfigError::invalid(
+                "cache.high_watermark must be between 0.0 and 1.0",
+            ));
+        }
+        if !(0.0..=1.0).contains(&config.cache.low_watermark) {
+            return Err(ConfigError::invalid(
+                "cache.low_watermark must be between 0.0 and 1.0",
+            ));
+        }
+        if config.cache.low_watermark >= config.cache.high_watermark {
+            return Err(ConfigError::invalid(
+                "cache.low_watermark must be less than cache.high_watermark",
+            ));
+        }
+    } else if (config.cache.high_watermark - 0.9).abs() > f64::EPSILON
+        || (config.cache.low_watermark - 0.8).abs() > f64::EPSILON
+    {
+        warnings.push(
+            "cache.high_watermark and cache.low_watermark are ignored when cache.max_bytes is 0"
+                .to_owned(),
+        );
+    }
+    if config.cache.mode != CacheMode::Off && config.cache.endpoint.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "cache.endpoint is required when cache.mode is not \"off\"",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_endpoints(config: &Config) -> Result<(), ConfigError> {
+    if !config.origin.endpoint.trim().is_empty() && !is_http_url(&config.origin.endpoint) {
+        return Err(ConfigError::invalid(
+            "origin.endpoint must start with http:// or https://",
+        ));
+    }
+    if !config.cache.endpoint.trim().is_empty() && !is_http_url(&config.cache.endpoint) {
+        return Err(ConfigError::invalid(
+            "cache.endpoint must start with http:// or https://",
+        ));
+    }
+    if !config.backing.endpoint.trim().is_empty() && !is_http_url(&config.backing.endpoint) {
+        return Err(ConfigError::invalid(
+            "backing.endpoint must start with http:// or https://",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
+    if config.mode != Mode::Cluster {
+        return Ok(());
+    }
+    if config.consensus.raft.peers.is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.raft.peers must not be empty in cluster mode",
+        ));
+    }
+    if config.consensus.raft.node_id.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.raft.node_id is required in cluster mode",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_buckets(config: &Config) -> Result<(), ConfigError> {
+    let mut bucket_names = HashSet::new();
+    for bucket in &config.buckets {
+        if bucket.name.trim().is_empty() {
+            return Err(ConfigError::invalid("bucket name must not be empty"));
+        }
+        if !bucket_names.insert(bucket.name.clone()) {
+            return Err(ConfigError::invalid(format!(
+                "bucket \"{}\" is configured more than one time",
+                bucket.name
+            )));
+        }
+        if bucket
+            .ttl
+            .is_some_and(|ttl| ttl.as_duration() == Duration::ZERO)
+        {
+            return Err(ConfigError::invalid(format!(
+                "bucket \"{}\" ttl must be greater than 0",
+                bucket.name
+            )));
+        }
+        if let (Some(replicas), Some(min_replicas)) = (bucket.replicas, bucket.min_replicas) {
+            if replicas == 0 {
+                return Err(ConfigError::invalid(format!(
+                    "bucket \"{}\" replicas must be greater than 0",
+                    bucket.name
+                )));
+            }
+            if min_replicas > replicas {
+                return Err(ConfigError::invalid(format!(
+                    "bucket \"{}\" min_replicas must not be greater than replicas",
+                    bucket.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_clients(config: &Config) -> Result<(), ConfigError> {
+    let mut access_keys = HashSet::new();
+    for client in &config.clients {
+        if client.access_key_id.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "client access_key_id must not be empty",
+            ));
+        }
+        if client.secret_access_key.expose_secret().is_empty() {
+            return Err(ConfigError::invalid(format!(
+                "client \"{}\" secret_access_key must not be empty",
+                client.access_key_id
+            )));
+        }
+        if !access_keys.insert(client.access_key_id.clone()) {
+            return Err(ConfigError::invalid(format!(
+                "client access_key_id \"{}\" is configured more than one time",
+                client.access_key_id
+            )));
+        }
+        for bucket in &client.buckets {
+            if bucket.trim().is_empty() {
+                return Err(ConfigError::invalid(format!(
+                    "client \"{}\" has an empty bucket name",
+                    client.access_key_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Format a configuration table with redacted secrets and field sources.
+#[must_use]
+pub fn show_table(config: &Config, sources: &SourceMap) -> String {
+    show::render(config, sources)
+}
+
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::time::Duration;
+
+    use super::duration::HumanDuration;
+    use super::*;
+
+    fn base() -> Config {
+        Config::default()
+    }
+
+    #[test]
+    fn cache_mode_requires_max_bytes() {
+        let mut config = base();
+        config.cache.mode = CacheMode::Read;
+        config.cache.endpoint = "http://127.0.0.1:9002".to_owned();
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("cache.max_bytes is required"));
+    }
+
+    #[test]
+    fn unlimited_cache_accepts_zero() {
+        let mut config = base();
+        config.cache.mode = CacheMode::Read;
+        config.cache.endpoint = "http://127.0.0.1:9002".to_owned();
+        config.cache.max_bytes = Some(0);
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn watermarks_must_be_ordered() {
+        let mut config = base();
+        config.cache.mode = CacheMode::Read;
+        config.cache.endpoint = "http://127.0.0.1:9002".to_owned();
+        config.cache.max_bytes = Some(100);
+        config.cache.low_watermark = 0.95;
+        config.cache.high_watermark = 0.9;
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("low_watermark"));
+    }
+
+    #[test]
+    fn max_object_bytes_must_be_positive() {
+        let mut config = base();
+        config.cache.max_object_bytes = 0;
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("max_object_bytes"));
+    }
+
+    #[test]
+    fn bucket_ttl_must_be_positive() {
+        let mut config = base();
+        config.buckets.push(BucketConfig {
+            name: "media".to_owned(),
+            ttl: Some(HumanDuration::new(Duration::ZERO)),
+            ..BucketConfig::default()
+        });
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("ttl"));
+    }
+
+    #[test]
+    fn cluster_mode_requires_peers() {
+        let mut config = base();
+        config.mode = Mode::Cluster;
+        config.consensus.raft.node_id = "a".to_owned();
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("peers"));
+    }
+
+    #[test]
+    fn duplicate_client_keys_are_rejected() {
+        let client = ClientConfig {
+            access_key_id: "AKIA".to_owned(),
+            secret_access_key: secret::SecretString::new("secret"),
+            session_token: None,
+            buckets: vec!["media".to_owned()],
+        };
+        let mut config = base();
+        config.clients = vec![client.clone(), client];
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("more than one time"));
+    }
+
+    #[test]
+    fn duplicate_bucket_names_are_rejected() {
+        let bucket = BucketConfig {
+            name: "media".to_owned(),
+            ..BucketConfig::default()
+        };
+        let mut config = base();
+        config.buckets = vec![bucket.clone(), bucket];
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("more than one time"));
+    }
+
+    #[test]
+    fn duration_parser_accepts_suffixes() {
+        let value: HumanDuration = serde_json::from_str("\"1h\"").unwrap();
+        assert_eq!(value.as_duration(), Duration::from_secs(3_600));
+        let value: HumanDuration = serde_json::from_str("\"30m\"").unwrap();
+        assert_eq!(value.as_duration(), Duration::from_mins(30));
+        let value: HumanDuration = serde_json::from_str("15").unwrap();
+        assert_eq!(value.as_duration(), Duration::from_secs(15));
+    }
+}

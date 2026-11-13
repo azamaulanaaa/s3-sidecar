@@ -1,0 +1,56 @@
+# Example configuration for s3-sidecar.
+# This milestone forwards requests to one origin endpoint.
+# Set cache.mode to "off" for the proxy core.
+
+mode = "cache"                 # cache | cluster
+
+[server]
+bind = "127.0.0.1:9000"
+
+[origin]
+endpoint = "http://127.0.0.1:9001"
+region = "us-east-1"
+access_key_id = "minioadmin"
+# Prefer S3_SIDECAR_ORIGIN__SECRET_ACCESS_KEY_FILE or
+# --origin-secret-access-key-file in production.
+secret_access_key = "minioadmin"
+# force_path_style = true
+
+[cache]
+mode = "off"                   # off | read | write | read_write
+# max_bytes = 0                # Required when cache.mode is not "off". 0 is unlimited.
+# max_object_bytes = 1073741824
+# write_policy = "write_back"  # write_back | write_through
+# on_cache_error = "origin"    # origin | fail
+# high_watermark = 0.9
+# low_watermark = 0.8
+
+[backing]
+# Cluster mode only.
+# endpoint = "http://127.0.0.1:9001"
+# region = "us-east-1"
+# access_key_id = "..."
+# secret_access_key = "..."
+
+[consensus]
+# Cluster mode only.
+backend = "raft"               # raft | consul
+
+[consensus.raft]
+# node_id = "a"
+# peers = ["a", "b", "c"]
+
+[[clients]]
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+buckets = ["media"]
+
+[[buckets]]
+name = "media"
+ttl = "1h"
+# cache_mode = "read_write"
+# cache_write_policy = "write_back"
+# write_ack = "leader"         # leader | quorum | all
+# read = "local_then_peer"     # local | local_then_peer | leader
+# replicas = 3
+# min_replicas = 2
