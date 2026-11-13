@@ -341,6 +341,7 @@ node_id = "a"
 peers = ["a"]
 
 [backing]
+bucket = "s3-sidecar-data"
 endpoint = "http://127.0.0.1:9002"
 region = "us-east-1"
 access_key_id = "..."
@@ -360,14 +361,15 @@ replicas = 1
 min_replicas = 1
 ```
 
-Blobs live in the backing bucket `objects`:
+Blobs live in `backing.bucket` under `objects/`:
 
 ```
-objects/<uuid>
+<backing.bucket>/objects/<uuid>
 ```
 
-`cluster.metadata_path` holds the `redb` state machine. Keep this file on
-durable local storage.
+`backing.bucket` is required when `mode = "cluster"`. It holds all blobs,
+multipart uploads, and the GC listing. `cluster.metadata_path` holds the `redb`
+state machine. Keep this file on durable local storage.
 
 ### Write path
 
@@ -398,8 +400,14 @@ tombstone or absent key returns `404 NoSuchKey`.
 ListObjectsV2 reads committed metadata only. It supports prefix, delimiter,
 continuation token, and max-keys. It never reads the raw backing key space.
 Staging blobs, upload records, tombstones, and non-committed rows are hidden.
-`ListBuckets`, `CopyObject`, and bucket operations that need a real bucket view
-return `NotImplemented` in cluster mode.
+`ListBuckets` and bucket operations that need a real bucket view return
+`NotImplemented` in cluster mode.
+
+CopyObject requires a committed source on this node. It copies the backing blob,
+then commits the destination key. `x-amz-metadata-directive = "COPY"` keeps the
+source metadata, and `"REPLACE"` uses the request headers. Destination
+`If-None-Match` and `If-Match` conditions are enforced. The client bucket
+allow-list applies to the source and destination buckets.
 
 ### Multipart, delete, and garbage collection
 
@@ -430,8 +438,8 @@ index, term, and read-index calls.
 - One origin endpoint and one cache endpoint.
 - Cluster mode supports only `consensus.backend = "single"`. The `raft` and
   `consul` backends, peer replication, quorum acknowledgements, and
-  `local_then_peer` peer fetch are not implemented. Cluster mode uses the
-  backing bucket `objects`.
+  `local_then_peer` peer fetch are not implemented. Cluster mode requires
+  `backing.bucket`.
 - Multipart and CopyObject pass through to origin. The sidecar does not cache
   multipart parts.
 - No TLS listener. Put the sidecar behind a TLS terminator.
@@ -467,8 +475,8 @@ cache-outage fallback, eviction, and the metrics endpoint.
 
 `tests/cluster.rs` runs single-node cluster mode against an in-process fake
 backing S3. It covers PUT, GET, HEAD, DELETE, ListObjectsV2, conditional writes,
-tombstones, restart persistence, multipart, wrong-node upload ids, leader
-reads, bucket config seeding, GC, and startup validation.
+CopyObject, tombstones, restart persistence, multipart, wrong-node upload ids,
+leader reads, bucket config seeding, GC, and startup validation.
 
 `scripts/e2e-rustfs.sh` runs a real origin and the AWS CLI. It needs `rustfs`
 and the AWS CLI v2. The MinIO client `mc` is optional.
