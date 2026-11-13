@@ -661,13 +661,17 @@ retries after the tombstone reaches the target.
 
 Every `cluster.reconcile_interval`, the sidecar checks a bounded batch of
 committed metadata. It sends `HEAD /_blob/<uuid>` to each intended replica. It
-queues a replication job for each missing blob. It does not remove a node from
-the intended set.
+queues a replication job for each missing blob. If the local owner lost its
+blob, the owner fetches it from one reachable replica and stores it locally.
+This repair does not change the metadata version or the replica list. If no
+replica has the blob, the entry stays in place for the next cycle. The sidecar
+does not remove a node from the intended set.
 
 Replication metrics include queue depth, oldest job age, success count, and
 failure count by status or transport class. Reconciliation metrics include the
-number of checked, present, and missing replica targets. Read metrics include
-peer fetches and read repairs.
+number of checked, present, and missing replica targets, owner blobs repaired,
+and owner blobs that no replica could supply. Read metrics include peer fetches
+and read repairs.
 
 ### Multipart, delete, and garbage collection
 
@@ -705,10 +709,17 @@ index, term, and read-index calls.
   on a node that lacks a replica fetches from the intended replicas, then the
   owner. If no replica has the blob, the read returns `404` with
   `x-s3-sidecar-owner`.
+- `cluster.secret` is required only when a bucket has `replicas > 1`.
 - Read repair does not change metadata. The replica list is the intended set,
   not a live inventory.
+- Read repair skips `Range` responses. Storing a partial body would corrupt the
+  full local blob.
 - Replication retries have no maximum attempt count. A permanent target outage
   keeps a job in the queue with a bounded retry interval.
+- `x-s3-sidecar-owner` is returned on a `read = "local"` miss as well as on a
+  no-replica miss.
+- Reconciliation restores a missing owner blob from one reachable replica. If
+  no replica has it, the entry stays in place for the next cycle.
 - Consul mode materializes the full metadata prefix on each change. The cost
   grows with the namespace size.
 - `bootstrap = true` belongs on one node. A restart of that node keeps the
