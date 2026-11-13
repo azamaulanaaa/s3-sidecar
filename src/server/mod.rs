@@ -489,10 +489,8 @@ async fn forward_cluster(
             "This multipart operation is not supported in cluster mode.",
         ));
     }
-    if request_headers.contains_key("x-amz-copy-source") {
-        return Err(S3Error::not_implemented(
-            "CopyObject is not supported in cluster mode.",
-        ));
+    if method == Method::PUT && headers.contains_key("x-amz-copy-source") {
+        return cluster.copy_object(&bucket, &key, &headers).await;
     }
 
     match method {

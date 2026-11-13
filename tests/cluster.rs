@@ -253,6 +253,43 @@ async fn backing_handler(
         );
     }
 
+    if method == Method::PUT && headers.contains_key("x-amz-copy-source") {
+        let source = headers
+            .get("x-amz-copy-source")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let trimmed = source.trim_start_matches('/');
+        let Some((source_bucket, source_key)) = trimmed.split_once('/') else {
+            return xml(
+                StatusCode::BAD_REQUEST,
+                "<Error><Code>InvalidRequest</Code></Error>",
+            );
+        };
+        if source_bucket != "data" {
+            return xml(
+                StatusCode::NOT_FOUND,
+                "<Error><Code>NoSuchKey</Code></Error>",
+            );
+        }
+        let stored = state.objects.lock().unwrap().get(source_key).cloned();
+        let Some(stored) = stored else {
+            return xml(
+                StatusCode::NOT_FOUND,
+                "<Error><Code>NoSuchKey</Code></Error>",
+            );
+        };
+        let etag = stored.etag.clone();
+        let last_modified = stored.last_modified.clone();
+        state.objects.lock().unwrap().insert(key.to_owned(), stored);
+        return xml(
+            StatusCode::OK,
+            &format!(
+                "<CopyObjectResult><ETag>\"{etag}\"</ETag>\
+                 <LastModified>{last_modified}</LastModified></CopyObjectResult>"
+            ),
+        );
+    }
+
     if key.is_empty() {
         return xml(
             StatusCode::NOT_FOUND,
@@ -659,6 +696,146 @@ async fn put_get_head_delete_and_list() {
         .await
         .unwrap();
     assert!(!body_text(response).await.contains("<Key>hello</Key>"));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn copy_object_preserves_and_replaces_metadata() {
+    let (backing, handle) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let source_url = format!("{}/media/source", sidecar.url);
+    let source = put(
+        &client,
+        &source_url,
+        b"copy-body",
+        &[
+            ("content-type", "text/plain"),
+            ("cache-control", "max-age=30"),
+            ("x-amz-meta-color", "blue"),
+        ],
+    )
+    .await;
+    assert_eq!(source.status(), StatusCode::OK);
+    let source_etag = source.headers().get(header::ETAG).unwrap().clone();
+    assert!(
+        sidecar
+            .state
+            .cluster()
+            .unwrap()
+            .state()
+            .get_metadata("media", "source")
+            .unwrap()
+            .is_some()
+    );
+
+    let copied = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/copied", sidecar.url),
+        None,
+        &[("x-amz-copy-source", "/media/source")],
+    )
+    .send()
+    .await
+    .unwrap();
+    let copied_status = copied.status();
+    let copied_body = body_text(copied).await;
+    assert_eq!(copied_status, StatusCode::OK, "{copied_body}");
+    assert!(copied_body.contains("<CopyObjectResult"));
+    assert!(copied_body.contains(source_etag.to_str().unwrap()));
+
+    let response = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/copied", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/plain"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "max-age=30"
+    );
+    assert_eq!(response.headers().get("x-amz-meta-color").unwrap(), "blue");
+    assert_eq!(body_text(response).await, "copy-body");
+
+    let replaced = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/replaced", sidecar.url),
+        None,
+        &[
+            ("x-amz-copy-source", "/media/source"),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("content-type", "application/json"),
+            ("x-amz-meta-color", "red"),
+        ],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(replaced.status(), StatusCode::OK);
+    let response = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/replaced", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    assert_eq!(response.headers().get("x-amz-meta-color").unwrap(), "red");
+    assert_eq!(body_text(response).await, "copy-body");
+
+    let missing = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/missing-copy", sidecar.url),
+        None,
+        &[("x-amz-copy-source", "/media/absent")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let before = handle.keys().len();
+    let blocked = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/copied", sidecar.url),
+        None,
+        &[
+            ("x-amz-copy-source", "/media/source"),
+            ("if-none-match", "*"),
+        ],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(blocked.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(handle.keys().len(), before);
 }
 
 #[tokio::test]

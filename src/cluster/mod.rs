@@ -266,6 +266,152 @@ impl Cluster {
         }
     }
 
+    /// Copy one committed object to a new key.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NoSuchKey` when the source is absent and a service error when
+    /// the backing copy or the commit fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn copy_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        headers: &HeaderMap,
+    ) -> Result<Response, S3Error> {
+        let source_value = header_text(headers, "x-amz-copy-source")
+            .ok_or_else(|| S3Error::invalid_request("The copy source header is required."))?;
+        let (source_bucket, source_key) = parse_copy_source(&source_value)
+            .ok_or_else(|| S3Error::invalid_request("The copy source is not valid."))?;
+        let Some(source) = self
+            .state
+            .get_metadata(&source_bucket, &source_key)
+            .map_err(map_coord_error)?
+        else {
+            return Err(no_such_key());
+        };
+        if !source.is_committed() {
+            return Err(no_such_key().with_header("x-s3-sidecar-owner", &source.owner));
+        }
+        if self.head_blob(&source.blob).await.is_none() {
+            self.metrics.missing_blob();
+            return Err(no_such_key().with_header("x-s3-sidecar-owner", &source.owner));
+        }
+        let current = self
+            .state
+            .get_metadata(bucket, key)
+            .map_err(map_coord_error)?;
+        let if_none_match = header_is(headers, header::IF_NONE_MATCH, "*");
+        let if_match = header_string(headers, header::IF_MATCH);
+        if condition_failed(current.as_ref(), if_none_match, if_match.as_deref()) {
+            return Err(precondition_failed());
+        }
+        let directive =
+            header_text(headers, "x-amz-metadata-directive").unwrap_or_else(|| "COPY".to_owned());
+        let replace = if directive.eq_ignore_ascii_case("COPY") {
+            false
+        } else if directive.eq_ignore_ascii_case("REPLACE") {
+            true
+        } else {
+            return Err(S3Error::invalid_request(
+                "The metadata directive must be COPY or REPLACE.",
+            ));
+        };
+        let (content_type, user_metadata, cache_control, content_encoding, content_disposition) =
+            if replace {
+                (
+                    header_string(headers, header::CONTENT_TYPE),
+                    user_metadata(headers),
+                    header_string(headers, header::CACHE_CONTROL),
+                    header_string(headers, header::CONTENT_ENCODING),
+                    header_string(headers, header::CONTENT_DISPOSITION),
+                )
+            } else {
+                (
+                    source.content_type.clone(),
+                    source.user_metadata.clone(),
+                    source.cache_control.clone(),
+                    source.content_encoding.clone(),
+                    source.content_disposition.clone(),
+                )
+            };
+        let blob = next_id();
+        let source_path = format!("/{}/objects/{}", self.blob_bucket(), source.blob);
+        let mut copy_headers = HeaderMap::new();
+        if let Ok(value) = HeaderValue::from_str(&source_path) {
+            copy_headers.insert("x-amz-copy-source", value);
+        }
+        let response = self
+            .client
+            .execute(
+                &self.credential,
+                ForwardRequest {
+                    method: Method::PUT,
+                    path_and_query: format!("/{}/objects/{blob}", self.blob_bucket()),
+                    headers: copy_headers,
+                    body: None,
+                    content_length: None,
+                },
+            )
+            .await
+            .map_err(|error| storage_error(error, None))?;
+        if !response.status().is_success() {
+            if response.status() == StatusCode::NOT_FOUND {
+                self.metrics.missing_blob();
+                return Err(no_such_key().with_header("x-s3-sidecar-owner", &source.owner));
+            }
+            return Err(S3Error::from_status(response.status()));
+        }
+        let request = CommitRequest {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            base_version: current.as_ref().map_or(0, |metadata| metadata.version),
+            blob: blob.clone(),
+            size: source.size,
+            checksum: source.checksum.clone(),
+            content_type,
+            etag: source.etag.clone(),
+            user_metadata,
+            owner: self.node_id.clone(),
+            replicas: vec![self.node_id.clone()],
+            if_none_match,
+            if_match,
+            cache_control,
+            content_encoding,
+            content_disposition,
+        };
+        let started = Instant::now();
+        let applied = self
+            .coord
+            .propose(Entry::Commit {
+                term: self.coord.term(),
+                request: Box::new(request),
+            })
+            .await;
+        match applied {
+            Ok(applied) => {
+                self.metrics.commit_latency(started.elapsed());
+                self.metrics.committed_write();
+                self.refresh_metrics();
+                let ApplyResult::Commit(metadata) = applied.result else {
+                    return Err(S3Error::internal());
+                };
+                Ok(copy_response(&metadata))
+            }
+            Err(error) => {
+                self.metrics.aborted_write();
+                delete_backing_blob(
+                    self.client.clone(),
+                    Arc::clone(&self.credential),
+                    self.blob_bucket(),
+                    blob,
+                )
+                .await;
+                Err(map_coord_error(error))
+            }
+        }
+    }
+
     /// Read one object or its metadata.
     ///
     /// # Errors
@@ -1043,6 +1189,20 @@ fn put_response(metadata: &Metadata) -> Response {
     response
 }
 
+fn copy_response(metadata: &Metadata) -> Response {
+    let last_modified = metadata.committed_at.map_or_default(unix_timestamp);
+    xml_response(
+        StatusCode::OK,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+             <ETag>\"{}\"</ETag><LastModified>{}</LastModified></CopyObjectResult>",
+            xml_escape(&metadata.etag),
+            xml_escape(&last_modified)
+        ),
+    )
+}
+
 fn metadata_response(metadata: &Metadata) -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::OK;
@@ -1207,6 +1367,24 @@ fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn parse_copy_source(value: &str) -> Option<(String, String)> {
+    let value = value.split('?').next().unwrap_or(value);
+    let decoded = percent_decode_str(value).decode_utf8_lossy();
+    let trimmed = decoded.trim_start_matches('/');
+    let (bucket, key) = trimmed.split_once('/')?;
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((bucket.to_owned(), key.to_owned()))
 }
 
 fn header_is(headers: &HeaderMap, name: header::HeaderName, expected: &str) -> bool {
