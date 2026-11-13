@@ -16,8 +16,19 @@ yanked = "deny"
 
 [licenses]
 version = 2
-# Allow only the two project licenses.
-allow = ["MIT", "Apache-2.0"]
+# The project licenses plus the permissive licenses in the HTTP and TLS tree.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  # ring, untrusted, and rustls use ISC.
+  "ISC",
+  # webpki-roots uses CDLA-Permissive-2.0 data.
+  "CDLA-Permissive-2.0",
+  # rustls-webpki uses BSD-3-Clause.
+  "BSD-3-Clause",
+  # The ICU idna data uses the Unicode license.
+  "Unicode-3.0",
+]
 # Require a high confidence score for license text detection.
 confidence-threshold = 0.9
 
@@ -32,6 +43,24 @@ highlight = "all"
 workspace-default-features = "allow"
 # Allow default features for external crates.
 external-default-features = "allow"
+
+# The duplicate versions below are transitive and cannot be removed without
+# dropping axum, reqwest, or rustls. Each entry states the reason.
+
+[[bans.skip]]
+name = "base64"
+version = "=0.22.1"
+reason = "reqwest 0.12 uses base64 0.22. hyper-util uses base64 0.23."
+
+[[bans.skip]]
+name = "syn"
+version = "=2.0.119"
+reason = "async-stream and tracing-attributes use syn 2. clap uses syn 3."
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.52.0"
+reason = "ring uses windows-sys 0.52. tokio uses windows-sys 0.61."
 
 [sources]
 # Fail the check for unknown registries.
