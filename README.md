@@ -857,7 +857,21 @@ RUSTFS_BIN=/path/to/rustfs mise run bench
 MINIO_BIN=/path/to/minio mise run bench
 ```
 
-The script needs `curl` and the AWS CLI or `mc` to create the test buckets.
+### Benchmark prerequisites
+
+The script needs a local S3 server and an S3 client.
+
+- Put `rustfs` or `minio` on `PATH`, or set `RUSTFS_BIN` or `MINIO_BIN`.
+- Put `aws` or `mc` on `PATH`, or set `AWS_BIN` or `MC_BIN`.
+- Install `curl`.
+
+The script checks for the S3 client at startup. If neither client exists, it
+prints an error and exits non-zero. If a test bucket already exists, the script
+skips creation.
+
+Benchmarks were not run for this repository snapshot because no S3 binary or
+S3 client was available.
+
 Set `BENCH_REQUESTS` to change the request count. Set `BENCH_RESULTS` to change
 the output directory.
 

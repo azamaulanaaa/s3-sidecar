@@ -390,6 +390,21 @@ replicated state.
 9. Check `s3_sidecar_consul_session_losses_total` and
    `s3_sidecar_consul_leader_changes_total`.
 
+## Benchmark prerequisites
+
+The benchmark script needs a local S3 server and an S3 client.
+
+- Put `rustfs` or `minio` on `PATH`, or set `RUSTFS_BIN` or `MINIO_BIN`.
+- Put `aws` or `mc` on `PATH`, or set `AWS_BIN` or `MC_BIN`.
+- Install `curl`.
+
+The script checks for the S3 client at startup. If neither client exists, it
+prints an error and exits non-zero. If a test bucket already exists, the script
+skips creation.
+
+Benchmarks were not run for this repository snapshot because no S3 binary or
+S3 client was available.
+
 ## Known limits
 
 - No S3 versioning.
