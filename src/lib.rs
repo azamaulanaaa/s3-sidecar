@@ -11,9 +11,11 @@
 //! authentication, and byte-preserving pass-through to one origin endpoint.
 
 pub mod auth;
+pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod errors;
+pub mod metrics;
 pub mod observability;
 pub mod server;
 pub mod storage;

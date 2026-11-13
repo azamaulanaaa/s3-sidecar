@@ -100,6 +100,9 @@ pub struct ConfigFlags {
     /// Cache key prefix for this node.
     #[arg(long = "cache-prefix", value_name = "PREFIX")]
     pub cache_prefix: Option<String>,
+    /// Cache node name. It is part of the cache key and journal path.
+    #[arg(long = "cache-node-id", value_name = "ID")]
+    pub cache_node_id: Option<String>,
     /// Cache mode: `off`, `read`, `write`, or `read_write`.
     #[arg(long = "cache-mode", value_name = "MODE")]
     pub cache_mode: Option<String>,
@@ -121,6 +124,33 @@ pub struct ConfigFlags {
     /// Eviction low watermark.
     #[arg(long = "cache-low-watermark", value_name = "FRACTION")]
     pub cache_low_watermark: Option<f64>,
+    /// Age at which a blob with no metadata is an orphan.
+    #[arg(long = "cache-staging-ttl", value_name = "DURATION")]
+    pub cache_staging_ttl: Option<String>,
+    /// Age at which a stale journal entry is removed.
+    #[arg(long = "cache-orphan-ttl", value_name = "DURATION")]
+    pub cache_orphan_ttl: Option<String>,
+    /// Number of concurrent key syncs.
+    #[arg(long = "cache-sync-workers", value_name = "COUNT")]
+    pub cache_sync_workers: Option<usize>,
+    /// Maximum sync attempts before quarantine.
+    #[arg(long = "cache-sync-max-attempts", value_name = "COUNT")]
+    pub cache_sync_max_attempts: Option<u32>,
+    /// Base delay for sync retries, in milliseconds.
+    #[arg(long = "cache-sync-retry-base-ms", value_name = "MS")]
+    pub cache_sync_retry_base_ms: Option<u64>,
+    /// Delay before a key sync starts, in milliseconds.
+    #[arg(long = "cache-sync-debounce-ms", value_name = "MS")]
+    pub cache_sync_debounce_ms: Option<u64>,
+    /// Interval between garbage collection passes.
+    #[arg(long = "cache-gc-interval", value_name = "DURATION")]
+    pub cache_gc_interval: Option<String>,
+    /// Path of the `redb` LRU index.
+    #[arg(long = "cache-index-path", value_name = "PATH")]
+    pub cache_index_path: Option<String>,
+    /// Serve quarantined entries instead of a 404.
+    #[arg(long = "cache-serve-quarantined")]
+    pub cache_serve_quarantined: bool,
     /// Backing S3 endpoint URL for cluster mode.
     #[arg(long = "backing-endpoint", value_name = "URL")]
     pub backing_endpoint: Option<String>,
@@ -285,6 +315,13 @@ impl ConfigFlags {
                 Value::String(value.clone()),
             );
         }
+        if let Some(value) = &self.cache_node_id {
+            set(
+                &mut object,
+                &["cache", "node_id"],
+                Value::String(value.clone()),
+            );
+        }
         if let Some(value) = &self.cache_mode {
             set(
                 &mut object,
@@ -317,6 +354,53 @@ impl ConfigFlags {
         }
         if let Some(value) = self.cache_low_watermark {
             set(&mut object, &["cache", "low_watermark"], json!(value));
+        }
+        if let Some(value) = &self.cache_staging_ttl {
+            set(
+                &mut object,
+                &["cache", "staging_ttl"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.cache_orphan_ttl {
+            set(
+                &mut object,
+                &["cache", "orphan_ttl"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = self.cache_sync_workers {
+            set(&mut object, &["cache", "sync_workers"], json!(value));
+        }
+        if let Some(value) = self.cache_sync_max_attempts {
+            set(&mut object, &["cache", "sync_max_attempts"], json!(value));
+        }
+        if let Some(value) = self.cache_sync_retry_base_ms {
+            set(&mut object, &["cache", "sync_retry_base_ms"], json!(value));
+        }
+        if let Some(value) = self.cache_sync_debounce_ms {
+            set(&mut object, &["cache", "sync_debounce_ms"], json!(value));
+        }
+        if let Some(value) = &self.cache_gc_interval {
+            set(
+                &mut object,
+                &["cache", "gc_interval"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.cache_index_path {
+            set(
+                &mut object,
+                &["cache", "index_path"],
+                Value::String(value.clone()),
+            );
+        }
+        if self.cache_serve_quarantined {
+            set(
+                &mut object,
+                &["cache", "serve_quarantined"],
+                Value::Bool(true),
+            );
         }
 
         if let Some(value) = &self.backing_endpoint {

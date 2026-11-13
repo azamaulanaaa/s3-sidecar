@@ -34,6 +34,22 @@ pub struct ClientCredential {
 }
 
 impl ClientCredential {
+    /// Build a credential from its parts.
+    #[must_use]
+    pub fn new(
+        access_key_id: impl Into<String>,
+        secret_access_key: SecretString,
+        session_token: Option<SecretString>,
+        allowed_buckets: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            access_key_id: access_key_id.into(),
+            secret_access_key,
+            session_token,
+            allowed_buckets: allowed_buckets.into_iter().collect(),
+        }
+    }
+
     /// Return the access key ID.
     #[must_use]
     pub fn access_key_id(&self) -> &str {

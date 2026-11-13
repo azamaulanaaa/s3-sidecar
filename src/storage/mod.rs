@@ -66,6 +66,7 @@ impl fmt::Display for StorageError {
 impl std::error::Error for StorageError {}
 
 /// An S3 client for one endpoint.
+#[derive(Clone)]
 pub struct S3Client {
     http: Client,
     endpoint: Url,

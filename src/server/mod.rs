@@ -19,9 +19,12 @@ use tracing::{info, warn};
 use crate::auth::body::{BodyFailure, BodyStream, failure, failure_flag, verify_hash};
 use crate::auth::chunked::{ChunkMode, decode};
 use crate::auth::verify::authenticate;
-use crate::auth::{AuthContext, CredentialStore, PayloadKind, now};
-use crate::config::{CacheMode, Config, Mode};
+use crate::auth::{AuthContext, ClientCredential, CredentialStore, PayloadKind, now};
+use crate::cache::Cache;
+use crate::cache::meta::{CacheMetadata, EntryState};
+use crate::config::{CacheMode, Config, Mode, WritePolicy};
 use crate::errors::S3Error;
+use crate::metrics;
 use crate::storage::{ForwardRequest, S3Client, StorageError};
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -31,6 +34,8 @@ pub struct AppState {
     config: Arc<Config>,
     credentials: CredentialStore,
     client: S3Client,
+    cache: Option<Arc<Cache>>,
+    metrics: Arc<metrics::Metrics>,
     ready: AtomicBool,
 }
 
@@ -39,25 +44,67 @@ impl AppState {
     ///
     /// # Errors
     ///
-    /// Returns an error when the origin endpoint is not valid.
+    /// Returns an error when an endpoint URL or the cache index is not valid.
     pub fn new(config: Config) -> Result<Self, S3Error> {
+        let config = Arc::new(config);
         let client = S3Client::new(&config.origin)?;
         let credentials = CredentialStore::new(&config.clients);
         if credentials.is_empty() {
             warn!("no clients are configured; all S3 requests will be denied");
         }
+        let metrics = Arc::new(metrics::Metrics::default());
+        metrics
+            .cache_max_bytes
+            .store(config.cache.max_bytes.unwrap_or(0), Ordering::Relaxed);
+        metrics.cache_unlimited.store(
+            u64::from(config.cache.max_bytes == Some(0) || config.cache.mode == CacheMode::Off),
+            Ordering::Relaxed,
+        );
+        let cache = Cache::new(Arc::clone(&config), Arc::clone(&metrics))?;
         Ok(Self {
-            config: Arc::new(config),
+            config,
             credentials,
             client,
+            cache,
+            metrics,
             ready: AtomicBool::new(false),
         })
+    }
+
+    /// Start cache recovery and background workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the journal cannot be read.
+    pub async fn start(&self) -> Result<(), S3Error> {
+        if let Some(cache) = &self.cache {
+            cache.start().await.map_err(|error| {
+                S3Error::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalError",
+                    &format!("cache recovery failed: {error}"),
+                )
+            })?;
+        }
+        Ok(())
     }
 
     /// Return the configuration.
     #[must_use]
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Return the cache, when one is configured.
+    #[must_use]
+    pub fn cache(&self) -> Option<&Arc<Cache>> {
+        self.cache.as_ref()
+    }
+
+    /// Return the metrics.
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<metrics::Metrics> {
+        &self.metrics
     }
 
     /// Set the readiness state.
@@ -75,6 +122,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
+        .route("/metrics", get(metrics_endpoint))
         .fallback(handle_s3)
         .with_state(state)
 }
@@ -93,6 +141,21 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+/// Return the Prometheus metrics response.
+pub async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (pending, lag) = state
+        .cache
+        .as_ref()
+        .map_or((0, 0), |cache| cache.pending_stats());
+    let tracked = state
+        .cache
+        .as_ref()
+        .map_or(0, |cache| cache.tracked_bytes());
+    state.metrics.set_tracked(tracked);
+    let text = metrics::render(&state.metrics, pending, lag);
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text)
+}
+
 /// Start the HTTP server and wait for shutdown.
 ///
 /// # Errors
@@ -103,11 +166,6 @@ pub async fn serve(config: Config, warnings: &[String]) -> Result<(), ServeError
     if config.mode == Mode::Cluster {
         return Err(ServeError::Unsupported(
             "cluster mode is not implemented in this build".to_owned(),
-        ));
-    }
-    if config.cache.mode != CacheMode::Off {
-        return Err(ServeError::Unsupported(
-            "cache modes are not implemented in this build. Set cache.mode to \"off\".".to_owned(),
         ));
     }
     if config.origin.endpoint.trim().is_empty() {
@@ -121,6 +179,10 @@ pub async fn serve(config: Config, warnings: &[String]) -> Result<(), ServeError
 
     let state =
         Arc::new(AppState::new(config.clone()).map_err(|error| ServeError::Config(error.message))?);
+    state
+        .start()
+        .await
+        .map_err(|error| ServeError::Config(error.message))?;
     let address = config.server.bind.clone();
     let listener = TcpListener::bind(&config.server.bind)
         .await
@@ -207,6 +269,7 @@ async fn handle_s3(
     response
 }
 
+#[allow(clippy::too_many_lines)]
 async fn forward(
     state: &AppState,
     method: &Method,
@@ -230,6 +293,103 @@ async fn forward(
     warn_checksum_dropped(headers, &payload, &bucket, &key);
     let prepared = prepare_request(body, headers, payload)?;
     let path_and_query = upstream_path_and_query(uri, is_presigned(uri));
+    let query = uri.query().unwrap_or_default();
+    let multipart =
+        query.contains("uploads") || query.contains("uploadId") || query.contains("partNumber");
+    let copy = headers.contains_key("x-amz-copy-source");
+    let object = !key.is_empty();
+
+    let Some(cache) = state.cache.as_ref() else {
+        return proxy_request(state, method, &credential, prepared, path_and_query).await;
+    };
+
+    if !object || multipart {
+        let response = proxy_request(state, method, &credential, prepared, path_and_query).await?;
+        if method == Method::POST && query.contains("uploadId") && response.status().is_success() {
+            cache.invalidate(&bucket, &key).await;
+        }
+        return Ok(response);
+    }
+
+    if copy {
+        let response = proxy_request(state, method, &credential, prepared, path_and_query).await?;
+        if response.status().is_success() {
+            cache.invalidate(&bucket, &key).await;
+        }
+        return Ok(response);
+    }
+
+    match method {
+        &Method::GET | &Method::HEAD => {
+            read_path(
+                state,
+                cache,
+                method,
+                headers,
+                &credential,
+                prepared,
+                &bucket,
+                &key,
+                &path_and_query,
+            )
+            .await
+        }
+        &Method::PUT => {
+            if cache.writes_cache() {
+                write_put(
+                    state,
+                    cache,
+                    &credential,
+                    headers,
+                    prepared,
+                    &bucket,
+                    &key,
+                    &path_and_query,
+                )
+                .await
+            } else {
+                let response =
+                    proxy_request(state, method, &credential, prepared, path_and_query).await?;
+                if response.status().is_success() {
+                    cache.invalidate(&bucket, &key).await;
+                }
+                Ok(response)
+            }
+        }
+        &Method::DELETE => {
+            if cache.writes_cache() {
+                write_delete(
+                    state,
+                    cache,
+                    &credential,
+                    method,
+                    prepared,
+                    &bucket,
+                    &key,
+                    &path_and_query,
+                )
+                .await
+            } else {
+                let response =
+                    proxy_request(state, method, &credential, prepared, path_and_query).await?;
+                if response.status().is_success() {
+                    cache.invalidate(&bucket, &key).await;
+                }
+                Ok(response)
+            }
+        }
+        _ => proxy_request(state, method, &credential, prepared, path_and_query).await,
+    }
+}
+
+async fn proxy_request(
+    state: &AppState,
+    method: &Method,
+    credential: &Arc<ClientCredential>,
+    prepared: PreparedRequest,
+    path_and_query: String,
+) -> Result<Response, S3Error> {
+    let failure_flag = prepared.failure.clone();
     let request = ForwardRequest {
         method: method.clone(),
         path_and_query,
@@ -237,11 +397,549 @@ async fn forward(
         body: prepared.body,
         content_length: prepared.content_length,
     };
-
-    let result = state.client.execute(credential.as_ref(), request).await;
-    let failure_flag = prepared.failure;
+    let result = state.client.execute(credential, request).await;
     let response = result.map_err(|error| map_storage_error(error, failure_flag.as_ref()))?;
     forward_response(method, response).await
+}
+
+// The read path needs the request context and the cache policy.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn read_path(
+    state: &AppState,
+    cache: &Arc<Cache>,
+    method: &Method,
+    headers: &HeaderMap,
+    credential: &Arc<ClientCredential>,
+    prepared: PreparedRequest,
+    bucket: &str,
+    key: &str,
+    path_and_query: &str,
+) -> Result<Response, S3Error> {
+    if cache.is_tombstoned(bucket, key) {
+        return Err(S3Error::new(
+            StatusCode::NOT_FOUND,
+            "NoSuchKey",
+            "The key does not exist.",
+        ));
+    }
+
+    let origin_headers = prepared.headers.clone();
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    if let Some(meta) = cache.pending_entry(bucket, key) {
+        match serve_cached(state, cache, method, range.as_deref(), &meta, bucket, key).await {
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) => {}
+            Err(error) => {
+                if !cache_error_fallback(cache, &error) {
+                    return Err(cache_error(&error));
+                }
+            }
+        }
+    }
+
+    if cache.mode() == CacheMode::Write {
+        return origin_read(
+            state,
+            cache,
+            method,
+            &origin_headers,
+            credential,
+            bucket,
+            key,
+            path_and_query,
+            None,
+        )
+        .await;
+    }
+
+    let meta = match cache.read_meta(bucket, key).await {
+        Ok(meta) => meta,
+        Err(error) => {
+            if !cache_error_fallback(cache, &error) {
+                return Err(cache_error(&error));
+            }
+            state.metrics.fallback();
+            None
+        }
+    };
+
+    let Some(meta) = meta else {
+        state.metrics.miss();
+        return origin_read(
+            state,
+            cache,
+            method,
+            &origin_headers,
+            credential,
+            bucket,
+            key,
+            path_and_query,
+            None,
+        )
+        .await;
+    };
+
+    if meta.state == EntryState::Failed && !cache.serve_quarantined() {
+        return Err(S3Error::new(
+            StatusCode::NOT_FOUND,
+            "NoSuchKey",
+            "The key does not exist.",
+        ));
+    }
+
+    let ttl = cache.ttl_for(bucket);
+    if meta.is_fresh(unix_now(), ttl) || meta.state == EntryState::Failed {
+        match serve_cached(state, cache, method, range.as_deref(), &meta, bucket, key).await {
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) => {}
+            Err(error) => {
+                if !cache_error_fallback(cache, &error) {
+                    return Err(cache_error(&error));
+                }
+                state.metrics.fallback();
+            }
+        }
+    } else if range.is_some() {
+        // A range is only served from a fresh complete entry. A stale entry
+        // passes the range to origin and does not cache the partial body.
+        state.metrics.miss();
+        return origin_read(
+            state,
+            cache,
+            method,
+            &origin_headers,
+            credential,
+            bucket,
+            key,
+            path_and_query,
+            None,
+        )
+        .await;
+    } else {
+        let response = origin_read(
+            state,
+            cache,
+            method,
+            &origin_headers,
+            credential,
+            bucket,
+            key,
+            path_and_query,
+            Some(&meta),
+        )
+        .await?;
+        return Ok(response);
+    }
+
+    origin_read(
+        state,
+        cache,
+        method,
+        &origin_headers,
+        credential,
+        bucket,
+        key,
+        path_and_query,
+        None,
+    )
+    .await
+}
+
+// The read path passes request headers, credentials, and cache metadata.
+#[allow(clippy::too_many_arguments)]
+async fn origin_read(
+    state: &AppState,
+    cache: &Arc<Cache>,
+    method: &Method,
+    headers: &HeaderMap,
+    credential: &Arc<ClientCredential>,
+    bucket: &str,
+    key: &str,
+    path_and_query: &str,
+    revalidate: Option<&CacheMetadata>,
+) -> Result<Response, S3Error> {
+    let mut request_headers = headers.clone();
+    if let Some(meta) = revalidate
+        && !meta.etag.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&meta.etag)
+    {
+        request_headers.insert(header::IF_NONE_MATCH, value);
+    }
+    let request = ForwardRequest {
+        method: method.clone(),
+        path_and_query: path_and_query.to_owned(),
+        headers: request_headers,
+        body: None,
+        content_length: None,
+    };
+    let response = state
+        .client
+        .execute(credential, request)
+        .await
+        .map_err(|error| map_storage_error(error, None))?;
+
+    if revalidate.is_some() && response.status() == StatusCode::NOT_MODIFIED {
+        state.metrics.revalidated();
+        if let Some(mut meta) = revalidate.cloned() {
+            meta.refresh(unix_now());
+            if let Err(error) = cache.store_meta(bucket, key, &meta).await {
+                warn!(%error, "cache metadata refresh failed");
+            }
+            let range = headers
+                .get(header::RANGE)
+                .and_then(|value| value.to_str().ok());
+            if let Ok(Some(response)) =
+                serve_cached(state, cache, method, range, &meta, bucket, key).await
+            {
+                return Ok(response);
+            }
+            cache.invalidate(bucket, key).await;
+            return Box::pin(origin_read(
+                state,
+                cache,
+                method,
+                headers,
+                credential,
+                bucket,
+                key,
+                path_and_query,
+                None,
+            ))
+            .await;
+        }
+    }
+
+    if response.status() == StatusCode::NOT_FOUND {
+        cache.invalidate(bucket, key).await;
+        return forward_response(method, response).await;
+    }
+
+    if !response.status().is_success() {
+        return forward_response(method, response).await;
+    }
+
+    let size = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let eligible = cache.reads_cache()
+        && method == Method::GET
+        && headers.get(header::RANGE).is_none()
+        && size.is_some_and(|size| size <= cache.max_object_bytes());
+
+    if eligible {
+        let meta = Cache::metadata_from_response(bucket, key, &response);
+        if meta.size > 0 {
+            state
+                .metrics
+                .origin_bytes
+                .fetch_add(meta.size, Ordering::Relaxed);
+            let size = meta.size;
+            let body = cache.tee_response(response, meta);
+            return Ok(response_from_stream(body, StatusCode::OK, Some(size)));
+        }
+    }
+
+    if let Some(size) = size {
+        metrics::Metrics::add_bytes(&state.metrics.origin_bytes, size);
+    }
+    if method == Method::HEAD && revalidate.is_some() {
+        cache.invalidate(bucket, key).await;
+    }
+    forward_response(method, response).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_cached(
+    state: &AppState,
+    cache: &Arc<Cache>,
+    method: &Method,
+    range: Option<&str>,
+    meta: &CacheMetadata,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<Response>, crate::cache::CacheError> {
+    if meta.size > cache.max_object_bytes() {
+        return Ok(None);
+    }
+    if method == Method::HEAD {
+        state.metrics.hit();
+        cache.touch(bucket, key);
+        return Ok(Some(metadata_response(meta)));
+    }
+    let Some(response) = cache.get_blob(bucket, key, range).await? else {
+        cache.invalidate(bucket, key).await;
+        return Ok(None);
+    };
+    let status = if range.is_some() && response.status() == StatusCode::PARTIAL_CONTENT {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let cache_headers = response.headers().clone();
+    let mut output =
+        Response::new(Body::from_stream(response.bytes_stream().map_err(
+            |error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()),
+        )));
+    *output.status_mut() = status;
+    copy_cache_headers(&cache_headers, output.headers_mut());
+    set_meta_headers(meta, output.headers_mut());
+    if status == StatusCode::OK
+        && let Ok(value) = HeaderValue::from_str(&meta.size.to_string())
+    {
+        output.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    state.metrics.hit();
+    metrics::Metrics::add_bytes(&state.metrics.bytes_served, meta.size);
+    cache.touch(bucket, key);
+    Ok(Some(output))
+}
+
+fn metadata_response(meta: &CacheMetadata) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::OK;
+    set_meta_headers(meta, response.headers_mut());
+    if let Ok(value) = HeaderValue::from_str(&meta.size.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    response
+}
+
+fn set_meta_headers(meta: &CacheMetadata, headers: &mut HeaderMap) {
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if !meta.etag.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&meta.etag)
+    {
+        headers.insert(header::ETAG, value);
+    }
+    if let Some(value) = &meta.last_modified
+        && let Ok(value) = HeaderValue::from_str(value)
+    {
+        headers.insert(header::LAST_MODIFIED, value);
+    }
+    if let Some(value) = &meta.content_type
+        && let Ok(value) = HeaderValue::from_str(value)
+    {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
+    if let Some(value) = &meta.content_encoding
+        && let Ok(value) = HeaderValue::from_str(value)
+    {
+        headers.insert(header::CONTENT_ENCODING, value);
+    }
+}
+
+fn copy_cache_headers(source: &HeaderMap, target: &mut HeaderMap) {
+    for name in [
+        header::CONTENT_RANGE,
+        header::CONTENT_LENGTH,
+        header::ACCEPT_RANGES,
+    ] {
+        if let Some(value) = source.get(&name) {
+            target.insert(name, value.clone());
+        }
+    }
+}
+
+fn response_from_stream(body: BodyStream, status: StatusCode, size: Option<u64>) -> Response {
+    let mut response = Response::new(Body::from_stream(body));
+    *response.status_mut() = status;
+    if let Some(size) = size
+        && let Ok(value) = HeaderValue::from_str(&size.to_string())
+    {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    response
+}
+
+// The write path needs the request context and the cache policy.
+#[allow(clippy::too_many_arguments)]
+async fn write_put(
+    state: &AppState,
+    cache: &Arc<Cache>,
+    credential: &Arc<ClientCredential>,
+    headers: &HeaderMap,
+    prepared: PreparedRequest,
+    bucket: &str,
+    key: &str,
+    path_and_query: &str,
+) -> Result<Response, S3Error> {
+    let policy = cache.write_policy_for(bucket);
+    if policy == WritePolicy::WriteThrough {
+        let response = proxy_request(
+            state,
+            &Method::PUT,
+            credential,
+            prepared,
+            path_and_query.to_owned(),
+        )
+        .await?;
+        if response.status().is_success() {
+            cache.spawn_fill_from_origin(bucket.to_owned(), key.to_owned());
+        }
+        return Ok(response);
+    }
+
+    let Some(length) = prepared.content_length else {
+        // A body without a length cannot be replayed by the sync worker.
+        let response = proxy_request(
+            state,
+            &Method::PUT,
+            credential,
+            prepared,
+            path_and_query.to_owned(),
+        )
+        .await?;
+        if response.status().is_success() {
+            cache.invalidate(bucket, key).await;
+        }
+        return Ok(response);
+    };
+
+    if length > cache.max_object_bytes() {
+        let response = proxy_request(
+            state,
+            &Method::PUT,
+            credential,
+            prepared,
+            path_and_query.to_owned(),
+        )
+        .await?;
+        if response.status().is_success() {
+            cache.invalidate(bucket, key).await;
+        }
+        return Ok(response);
+    }
+
+    if let Err(error) = cache.probe(bucket).await {
+        if cache.on_cache_error() == crate::config::OnCacheError::Origin {
+            state.metrics.fallback();
+            warn!(%error, "cache probe failed; writing to origin");
+            let response = proxy_request(
+                state,
+                &Method::PUT,
+                credential,
+                prepared,
+                path_and_query.to_owned(),
+            )
+            .await?;
+            return Ok(response);
+        }
+        return Err(cache_error(&error));
+    }
+
+    let content_type = header_string(&prepared.headers, header::CONTENT_TYPE);
+    let content_encoding = header_string(&prepared.headers, header::CONTENT_ENCODING);
+    let failure_flag = prepared.failure.clone();
+    let body = prepared.body.unwrap_or_else(empty_body);
+    let body_started = Arc::new(AtomicBool::new(false));
+    let meta = match cache
+        .stage_put(
+            bucket,
+            key,
+            body,
+            length,
+            content_type,
+            content_encoding,
+            body_started,
+        )
+        .await
+    {
+        Ok(meta) => meta,
+        Err(error) => {
+            if let Some(body_error) = body_failure_error(failure_flag.as_ref()) {
+                return Err(body_error);
+            }
+            return Err(cache_error(&error));
+        }
+    };
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::OK;
+    if let Ok(value) = HeaderValue::from_str(&meta.etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    let _ = headers;
+    Ok(response)
+}
+
+// The delete path needs the request context and the cache policy.
+#[allow(clippy::too_many_arguments)]
+async fn write_delete(
+    state: &AppState,
+    cache: &Arc<Cache>,
+    credential: &Arc<ClientCredential>,
+    method: &Method,
+    prepared: PreparedRequest,
+    bucket: &str,
+    key: &str,
+    path_and_query: &str,
+) -> Result<Response, S3Error> {
+    if cache.pending_entry(bucket, key).is_some() {
+        cache
+            .delete_pending(bucket, key)
+            .await
+            .map_err(|error| cache_error(&error))?;
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::OK;
+        return Ok(response);
+    }
+    match cache.stage_delete(bucket, key).await {
+        Ok(()) => {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::OK;
+            Ok(response)
+        }
+        Err(error) => {
+            if cache.on_cache_error() == crate::config::OnCacheError::Origin {
+                state.metrics.fallback();
+                warn!(%error, "cache delete failed; deleting at origin");
+                proxy_request(
+                    state,
+                    method,
+                    credential,
+                    prepared,
+                    path_and_query.to_owned(),
+                )
+                .await
+            } else {
+                Err(cache_error(&error))
+            }
+        }
+    }
+}
+
+fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn empty_body() -> BodyStream {
+    let stream = async_stream::try_stream! {
+        if false {
+            yield Bytes::new();
+        }
+    };
+    Box::pin(stream)
+}
+
+fn cache_error_fallback(cache: &Cache, error: &crate::cache::CacheError) -> bool {
+    cache.on_cache_error() == crate::config::OnCacheError::Origin && error.is_unavailable()
+}
+
+fn cache_error(error: &crate::cache::CacheError) -> S3Error {
+    warn!(%error, "cache request failed");
+    S3Error::service_unavailable()
+}
+
+fn unix_now() -> i64 {
+    crate::cache::meta::unix_now()
 }
 
 fn check_bucket(auth: &AuthContext, uri: &Uri, headers: &HeaderMap) -> Result<(), S3Error> {
@@ -642,15 +1340,19 @@ fn map_storage_error(
         StorageError::Sign(error) => error,
         StorageError::Transport(_) => {
             warn!(kind, "upstream request failed");
-            match failure_flag.map(|flag| failure(flag)) {
-                Some(BodyFailure::PayloadHash) => S3Error::payload_mismatch(),
-                Some(BodyFailure::ChunkSignature) => S3Error::signature_mismatch(),
-                Some(BodyFailure::ChunkFormat | BodyFailure::DecodedLength) => {
-                    S3Error::invalid_request("The request body is not valid.")
-                }
-                _ => S3Error::service_unavailable(),
-            }
+            body_failure_error(failure_flag).unwrap_or_else(S3Error::service_unavailable)
         }
+    }
+}
+
+fn body_failure_error(failure_flag: Option<&Arc<std::sync::atomic::AtomicU8>>) -> Option<S3Error> {
+    match failure_flag.map(|flag| failure(flag)) {
+        Some(BodyFailure::PayloadHash) => Some(S3Error::payload_mismatch()),
+        Some(BodyFailure::ChunkSignature) => Some(S3Error::signature_mismatch()),
+        Some(BodyFailure::ChunkFormat | BodyFailure::DecodedLength) => {
+            Some(S3Error::invalid_request("The request body is not valid."))
+        }
+        _ => None,
     }
 }
 

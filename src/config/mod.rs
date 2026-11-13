@@ -235,6 +235,8 @@ pub struct CacheConfig {
     pub force_path_style: bool,
     /// Key prefix for this node.
     pub prefix: String,
+    /// Name of this sidecar node. It is part of the cache key and journal path.
+    pub node_id: String,
     /// Cache behavior.
     pub mode: CacheMode,
     /// Maximum cache size in bytes. `0` means unlimited.
@@ -249,6 +251,25 @@ pub struct CacheConfig {
     pub high_watermark: f64,
     /// Eviction low watermark, as a fraction.
     pub low_watermark: f64,
+    /// Age at which a blob with no metadata is an orphan.
+    pub staging_ttl: HumanDuration,
+    /// Age at which a stale journal entry is removed.
+    pub orphan_ttl: HumanDuration,
+    /// Number of concurrent key syncs.
+    pub sync_workers: usize,
+    /// Maximum sync attempts before quarantine.
+    pub sync_max_attempts: u32,
+    /// Base delay for sync retries, in milliseconds.
+    pub sync_retry_base_ms: u64,
+    /// Delay before a key sync starts, in milliseconds. This lets writes
+    /// coalesce and lets a delete cancel a queued put.
+    pub sync_debounce_ms: u64,
+    /// Interval between garbage collection passes.
+    pub gc_interval: HumanDuration,
+    /// Path of the `redb` LRU index. Used when `max_bytes` is not 0.
+    pub index_path: String,
+    /// Serve a quarantined entry instead of a 404.
+    pub serve_quarantined: bool,
 }
 
 impl Default for CacheConfig {
@@ -261,6 +282,7 @@ impl Default for CacheConfig {
             session_token: None,
             force_path_style: false,
             prefix: "cache".to_owned(),
+            node_id: "node".to_owned(),
             mode: CacheMode::Off,
             max_bytes: None,
             max_object_bytes: 1_073_741_824,
@@ -268,6 +290,15 @@ impl Default for CacheConfig {
             on_cache_error: OnCacheError::default(),
             high_watermark: 0.9,
             low_watermark: 0.8,
+            staging_ttl: HumanDuration::new(Duration::from_secs(3600)),
+            orphan_ttl: HumanDuration::new(Duration::from_hours(24)),
+            sync_workers: 4,
+            sync_max_attempts: 5,
+            sync_retry_base_ms: 200,
+            sync_debounce_ms: 100,
+            gc_interval: HumanDuration::new(Duration::from_secs(60)),
+            index_path: "s3-sidecar-cache-index.redb".to_owned(),
+            serve_quarantined: false,
         }
     }
 }
@@ -495,6 +526,43 @@ fn validate_cache(config: &Config, warnings: &mut Vec<String>) -> Result<(), Con
         return Err(ConfigError::invalid(
             "cache.endpoint is required when cache.mode is not \"off\"",
         ));
+    }
+    if config.cache.mode != CacheMode::Off {
+        if config.cache.node_id.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "cache.node_id must not be empty when cache.mode is not \"off\"",
+            ));
+        }
+        if config.cache.sync_workers == 0 {
+            return Err(ConfigError::invalid(
+                "cache.sync_workers must be greater than 0",
+            ));
+        }
+        if config.cache.sync_max_attempts == 0 {
+            return Err(ConfigError::invalid(
+                "cache.sync_max_attempts must be greater than 0",
+            ));
+        }
+        if config.cache.staging_ttl.as_duration() == Duration::ZERO {
+            return Err(ConfigError::invalid(
+                "cache.staging_ttl must be greater than 0",
+            ));
+        }
+        if config.cache.orphan_ttl.as_duration() == Duration::ZERO {
+            return Err(ConfigError::invalid(
+                "cache.orphan_ttl must be greater than 0",
+            ));
+        }
+        if config.cache.gc_interval.as_duration() == Duration::ZERO {
+            return Err(ConfigError::invalid(
+                "cache.gc_interval must be greater than 0",
+            ));
+        }
+        if config.cache.index_path.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "cache.index_path must not be empty when cache.mode is not \"off\"",
+            ));
+        }
     }
     Ok(())
 }

@@ -65,6 +65,12 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
     push_row(
         &mut rows,
         sources,
+        "cache.node_id",
+        config.cache.node_id.clone(),
+    );
+    push_row(
+        &mut rows,
+        sources,
         "cache.mode",
         config.cache.mode.to_string(),
     );
@@ -107,6 +113,60 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         sources,
         "cache.low_watermark",
         config.cache.low_watermark.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cache.staging_ttl",
+        config.cache.staging_ttl.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cache.orphan_ttl",
+        config.cache.orphan_ttl.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cache.sync_workers",
+        config.cache.sync_workers.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cache.sync_max_attempts",
+        config.cache.sync_max_attempts.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cache.sync_retry_base_ms",
+        config.cache.sync_retry_base_ms.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cache.sync_debounce_ms",
+        config.cache.sync_debounce_ms.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cache.gc_interval",
+        config.cache.gc_interval.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cache.index_path",
+        config.cache.index_path.clone(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cache.serve_quarantined",
+        config.cache.serve_quarantined.to_string(),
     );
 
     push_endpoint(&mut rows, sources, "backing", &config.backing);
