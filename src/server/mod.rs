@@ -23,6 +23,7 @@ use crate::auth::verify::authenticate;
 use crate::auth::{AuthContext, ClientCredential, CredentialStore, PayloadKind, now};
 use crate::cache::Cache;
 use crate::cache::meta::{CacheMetadata, EntryState};
+use crate::cluster::{Cluster, WriteBody};
 use crate::config::{CacheMode, Config, Mode, WritePolicy};
 use crate::errors::S3Error;
 use crate::metrics;
@@ -36,6 +37,7 @@ pub struct AppState {
     credentials: CredentialStore,
     client: S3Client,
     cache: Option<Arc<Cache>>,
+    cluster: Option<Arc<Cluster>>,
     metrics: Arc<metrics::Metrics>,
     ready: AtomicBool,
 }
@@ -48,7 +50,12 @@ impl AppState {
     /// Returns an error when an endpoint URL or the cache index is not valid.
     pub fn new(config: Config) -> Result<Self, S3Error> {
         let config = Arc::new(config);
-        let client = S3Client::new(&config.origin)?;
+        let endpoint = if config.mode == Mode::Cluster {
+            &config.backing
+        } else {
+            &config.origin
+        };
+        let client = S3Client::new(endpoint)?;
         let credentials = CredentialStore::new(&config.clients);
         if credentials.is_empty() {
             warn!("no clients are configured; all S3 requests will be denied");
@@ -62,21 +69,24 @@ impl AppState {
             Ordering::Relaxed,
         );
         let cache = Cache::new(Arc::clone(&config), Arc::clone(&metrics))?;
+        let cluster = Cluster::new(Arc::clone(&config), Arc::clone(&metrics))?;
         Ok(Self {
             config,
             credentials,
             client,
             cache,
+            cluster,
             metrics,
             ready: AtomicBool::new(false),
         })
     }
 
-    /// Start cache recovery and background workers.
+    /// Start cache recovery, cluster seeding, and background workers.
     ///
     /// # Errors
     ///
-    /// Returns an error when the journal cannot be read.
+    /// Returns an error when the journal cannot be read or a bucket config
+    /// cannot be stored.
     pub async fn start(&self) -> Result<(), S3Error> {
         if let Some(cache) = &self.cache {
             cache.start().await.map_err(|error| {
@@ -86,6 +96,9 @@ impl AppState {
                     &format!("cache recovery failed: {error}"),
                 )
             })?;
+        }
+        if let Some(cluster) = &self.cluster {
+            cluster.start().await?;
         }
         Ok(())
     }
@@ -100,6 +113,22 @@ impl AppState {
     #[must_use]
     pub fn cache(&self) -> Option<&Arc<Cache>> {
         self.cache.as_ref()
+    }
+
+    /// Return cluster state, when cluster mode is active.
+    #[must_use]
+    pub fn cluster(&self) -> Option<&Arc<Cluster>> {
+        self.cluster.as_ref()
+    }
+
+    /// Return the region used to verify client signatures.
+    #[must_use]
+    pub fn auth_region(&self) -> &str {
+        if self.config.mode == Mode::Cluster {
+            self.config.backing.region_or_default()
+        } else {
+            self.config.origin.region_or_default()
+        }
     }
 
     /// Return the metrics.
@@ -153,6 +182,9 @@ pub async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRe
         .as_ref()
         .map_or(0, |cache| cache.tracked_bytes());
     state.metrics.set_tracked(tracked);
+    if let Some(cluster) = &state.cluster {
+        cluster.refresh_metrics();
+    }
     let text = metrics::render(&state.metrics, pending, lag);
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text)
 }
@@ -164,12 +196,7 @@ pub async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRe
 /// Returns an error when the configuration is not supported in this build,
 /// the state cannot be built, or the listener cannot bind.
 pub async fn serve(config: Config, warnings: &[String]) -> Result<(), ServeError> {
-    if config.mode == Mode::Cluster {
-        return Err(ServeError::Unsupported(
-            "cluster mode is not implemented in this build".to_owned(),
-        ));
-    }
-    if config.origin.endpoint.trim().is_empty() {
+    if config.mode != Mode::Cluster && config.origin.endpoint.trim().is_empty() {
         return Err(ServeError::Config(
             "origin.endpoint is required for serve".to_owned(),
         ));
@@ -283,7 +310,7 @@ async fn forward(
         uri,
         headers,
         &state.credentials,
-        state.config.origin.region_or_default(),
+        state.auth_region(),
         now(),
     )?;
     check_bucket(&auth, uri, headers)?;
@@ -299,6 +326,10 @@ async fn forward(
         query.contains("uploads") || query.contains("uploadId") || query.contains("partNumber");
     let copy = headers.contains_key("x-amz-copy-source");
     let object = !key.is_empty();
+
+    if let Some(cluster) = state.cluster.as_ref() {
+        return forward_cluster(cluster, method, uri, headers, prepared).await;
+    }
 
     let Some(cache) = state.cache.as_ref() else {
         return proxy_request(state, method, &credential, prepared, path_and_query).await;
@@ -380,6 +411,110 @@ async fn forward(
             }
         }
         _ => proxy_request(state, method, &credential, prepared, path_and_query).await,
+    }
+}
+
+async fn forward_cluster(
+    cluster: &Arc<Cluster>,
+    method: &Method,
+    uri: &Uri,
+    request_headers: &HeaderMap,
+    prepared: PreparedRequest,
+) -> Result<Response, S3Error> {
+    let bucket = bucket_name(uri.path())?;
+    let key = object_key(uri.path());
+    let query = uri.query().unwrap_or_default();
+    let PreparedRequest {
+        headers,
+        body,
+        content_length,
+        failure,
+    } = prepared;
+
+    if key.is_empty() {
+        if method == Method::GET && query_param(query, "list-type").as_deref() == Some("2") {
+            return cluster.list_objects(&bucket, query);
+        }
+        return Err(S3Error::not_implemented(
+            "This bucket operation is not supported in cluster mode.",
+        ));
+    }
+
+    if method == Method::POST && query_has(query, "uploads") {
+        return cluster.create_multipart(&bucket, &key, &headers).await;
+    }
+    if method == Method::PUT && query_has(query, "partNumber") {
+        let upload_id = query_param(query, "uploadId")
+            .ok_or_else(|| S3Error::invalid_request("The upload id is required."))?;
+        let part_number = query_param(query, "partNumber").unwrap_or_default();
+        return cluster
+            .upload_part(
+                &upload_id,
+                &part_number,
+                WriteBody {
+                    body,
+                    content_length,
+                    failure,
+                },
+            )
+            .await;
+    }
+    if method == Method::POST && query_has(query, "uploadId") {
+        let upload_id = query_param(query, "uploadId")
+            .ok_or_else(|| S3Error::invalid_request("The upload id is required."))?;
+        return cluster
+            .complete_multipart(
+                &upload_id,
+                WriteBody {
+                    body,
+                    content_length,
+                    failure,
+                },
+            )
+            .await;
+    }
+    if method == Method::DELETE && query_has(query, "uploadId") {
+        let upload_id = query_param(query, "uploadId")
+            .ok_or_else(|| S3Error::invalid_request("The upload id is required."))?;
+        return cluster.abort_multipart(&upload_id).await;
+    }
+    if method == Method::GET && query_has(query, "uploadId") {
+        let upload_id = query_param(query, "uploadId")
+            .ok_or_else(|| S3Error::invalid_request("The upload id is required."))?;
+        return cluster.list_parts(&upload_id, query).await;
+    }
+    if query_has(query, "uploadId") || query_has(query, "partNumber") || query_has(query, "uploads")
+    {
+        return Err(S3Error::not_implemented(
+            "This multipart operation is not supported in cluster mode.",
+        ));
+    }
+    if request_headers.contains_key("x-amz-copy-source") {
+        return Err(S3Error::not_implemented(
+            "CopyObject is not supported in cluster mode.",
+        ));
+    }
+
+    match method {
+        &Method::GET | &Method::HEAD => cluster.get(method, &bucket, &key, request_headers).await,
+        &Method::PUT => {
+            cluster
+                .put(
+                    &bucket,
+                    &key,
+                    &headers,
+                    WriteBody {
+                        body,
+                        content_length,
+                        failure,
+                    },
+                )
+                .await
+        }
+        &Method::DELETE => cluster.delete(&bucket, &key).await,
+        _ => Err(S3Error::not_implemented(
+            "This operation is not supported in cluster mode.",
+        )),
     }
 }
 
@@ -1468,6 +1603,28 @@ fn body_failure_error(failure_flag: Option<&Arc<std::sync::atomic::AtomicU8>>) -
         }
         _ => None,
     }
+}
+
+fn query_has(query: &str, name: &str) -> bool {
+    query.split('&').any(|pair| {
+        let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        key == name
+    })
+}
+
+fn query_param(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == name {
+            Some(
+                percent_encoding::percent_decode_str(value)
+                    .decode_utf8_lossy()
+                    .into_owned(),
+            )
+        } else {
+            None
+        }
+    })
 }
 
 fn next_request_id() -> String {

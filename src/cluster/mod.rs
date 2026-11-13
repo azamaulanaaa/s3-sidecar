@@ -1,6 +1,1475 @@
-//! Single-node cluster mode: the metadata state machine and coordinator.
-//!
-//! The object path is added in the next commit.
+//! Single-node cluster mode: staged writes, metadata reads, and garbage
+//! collection.
 
 pub mod coordinator;
 pub mod state;
+
+use std::collections::BTreeMap;
+use std::io;
+use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
+
+use axum::body::Body;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::response::Response;
+use futures_util::{StreamExt, TryStreamExt};
+use md5::Md5;
+use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
+use sha2::{Digest as _, Sha256};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use tracing::warn;
+
+use self::coordinator::{CommitRequest, CoordError, Coordinator, Entry, RejectReason, SingleNode};
+use self::state::{ApplyResult, BucketConfigRecord, Metadata, StateMachine};
+use crate::auth::ClientCredential;
+use crate::auth::body::{BodyFailure, BodyStream, failure};
+use crate::config::{Config, ConsensusBackend, Mode, ReadMode};
+use crate::errors::S3Error;
+use crate::metrics::Metrics;
+use crate::storage::{ForwardRequest, S3Client, StorageError};
+
+/// Backing bucket that holds every immutable blob.
+const BLOB_BUCKET: &str = "objects";
+
+/// A request body for one cluster write.
+pub struct WriteBody {
+    /// Decoded body stream.
+    pub body: Option<BodyStream>,
+    /// Decoded content length, when known.
+    pub content_length: Option<u64>,
+    /// Body verification failure flag.
+    pub failure: Option<Arc<std::sync::atomic::AtomicU8>>,
+}
+
+/// Summary of one garbage collection pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GcReport {
+    /// Uploads that exceeded `staging_ttl`.
+    pub uploads_aborted: u64,
+    /// Tombstones that exceeded `orphan_ttl`.
+    pub tombstones_removed: u64,
+    /// Orphan blobs that were deleted.
+    pub orphan_blobs_removed: u64,
+}
+
+/// Cluster mode state.
+pub struct Cluster {
+    config: Arc<Config>,
+    state: Arc<StateMachine>,
+    coord: Arc<SingleNode>,
+    client: S3Client,
+    credential: Arc<ClientCredential>,
+    node_id: String,
+    metrics: Arc<Metrics>,
+}
+
+impl Cluster {
+    /// Build cluster mode state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backend is not implemented or the metadata
+    /// file cannot be opened.
+    pub fn new(config: Arc<Config>, metrics: Arc<Metrics>) -> Result<Option<Arc<Self>>, S3Error> {
+        if config.mode != Mode::Cluster {
+            return Ok(None);
+        }
+        if config.consensus.backend != ConsensusBackend::Single {
+            return Err(S3Error::not_implemented(
+                "consensus backend is not implemented in this build",
+            ));
+        }
+        for bucket in &config.buckets {
+            if matches!(
+                bucket.write_ack,
+                Some(crate::config::WriteAck::Quorum | crate::config::WriteAck::All)
+            ) {
+                return Err(S3Error::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    &format!(
+                        "bucket \"{}\" write_ack is not implemented in this build; use \"leader\"",
+                        bucket.name
+                    ),
+                ));
+            }
+        }
+        let state = Arc::new(
+            StateMachine::open(Path::new(config.cluster.metadata_path.as_str())).map_err(
+                |error| S3Error::internal().with_header("x-s3-sidecar-error", &error.to_string()),
+            )?,
+        );
+        let coord = Arc::new(SingleNode::new(Arc::clone(&state), Arc::clone(&metrics)));
+        let client = S3Client::new(&config.backing)?;
+        let credential = Arc::new(ClientCredential::new(
+            config.backing.access_key_id.clone(),
+            config.backing.secret_access_key.clone(),
+            config.backing.session_token.clone(),
+            Vec::new(),
+        ));
+        let node_id = config.consensus.raft.node_id.clone();
+        Ok(Some(Arc::new(Self {
+            config,
+            state,
+            coord,
+            client,
+            credential,
+            node_id,
+            metrics,
+        })))
+    }
+
+    /// Seed bucket configs and start the garbage collection loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a bucket config cannot be stored.
+    pub async fn start(self: &Arc<Self>) -> Result<(), S3Error> {
+        for bucket in &self.config.buckets {
+            if self
+                .state
+                .bucket_config(&bucket.name)
+                .map_err(map_coord_error)?
+                .is_none()
+            {
+                let request = BucketConfigRecord::from_config(bucket);
+                self.coord
+                    .propose(Entry::BucketConfig {
+                        term: self.coord.term(),
+                        bucket: bucket.name.clone(),
+                        request,
+                    })
+                    .await
+                    .map_err(map_coord_error)?;
+            }
+        }
+        self.refresh_metrics();
+        let interval = self.config.cluster.gc_interval.as_duration();
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(cluster) = weak.upgrade() else {
+                    break;
+                };
+                if let Err(error) = cluster.gc_once().await {
+                    warn!(%error, "cluster garbage collection failed");
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Return the coordinator.
+    #[must_use]
+    pub fn coordinator(&self) -> &Arc<SingleNode> {
+        &self.coord
+    }
+
+    /// Return the metadata state machine.
+    #[must_use]
+    pub fn state(&self) -> &Arc<StateMachine> {
+        &self.state
+    }
+
+    /// Refresh the applied index, term, and tombstone gauges.
+    pub fn refresh_metrics(&self) {
+        self.coord.refresh_metrics();
+    }
+
+    /// Apply one object write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the blob cannot be staged, the proposal is
+    /// rejected, or a condition fails.
+    pub async fn put(
+        &self,
+        bucket: &str,
+        key: &str,
+        headers: &HeaderMap,
+        input: WriteBody,
+    ) -> Result<Response, S3Error> {
+        let current = self
+            .state
+            .get_metadata(bucket, key)
+            .map_err(map_coord_error)?;
+        let if_none_match = header_is(headers, header::IF_NONE_MATCH, "*");
+        let if_match = header_string(headers, header::IF_MATCH);
+        if condition_failed(current.as_ref(), if_none_match, if_match.as_deref()) {
+            return Err(precondition_failed());
+        }
+        let base_version = current.as_ref().map_or(0, |metadata| metadata.version);
+        let blob = next_id();
+        let fingerprint = Arc::new(Mutex::new(Fingerprint::new()));
+        if let Err(error) = self
+            .stage_blob(&blob, input, Arc::clone(&fingerprint))
+            .await
+        {
+            self.metrics.aborted_write();
+            return Err(error);
+        }
+        let (etag, checksum, size) = fingerprint_result(&fingerprint);
+        let request = CommitRequest {
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            base_version,
+            blob: blob.clone(),
+            size,
+            checksum,
+            content_type: header_string(headers, header::CONTENT_TYPE),
+            etag: etag.clone(),
+            user_metadata: user_metadata(headers),
+            owner: self.node_id.clone(),
+            replicas: vec![self.node_id.clone()],
+            if_none_match,
+            if_match,
+            cache_control: header_string(headers, header::CACHE_CONTROL),
+            content_encoding: header_string(headers, header::CONTENT_ENCODING),
+            content_disposition: header_string(headers, header::CONTENT_DISPOSITION),
+        };
+        let started = Instant::now();
+        let applied = self
+            .coord
+            .propose(Entry::Commit {
+                term: self.coord.term(),
+                request: Box::new(request),
+            })
+            .await;
+        match applied {
+            Ok(applied) => {
+                self.metrics.commit_latency(started.elapsed());
+                self.metrics.committed_write();
+                self.refresh_metrics();
+                let ApplyResult::Commit(metadata) = applied.result else {
+                    return Err(S3Error::internal());
+                };
+                Ok(put_response(&metadata))
+            }
+            Err(error) => {
+                self.metrics.aborted_write();
+                delete_backing_blob(self.client.clone(), Arc::clone(&self.credential), blob).await;
+                Err(map_coord_error(error))
+            }
+        }
+    }
+
+    /// Read one object or its metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NoSuchKey` when the key or blob is absent and a service error
+    /// when the backing S3 request fails.
+    pub async fn get(
+        &self,
+        method: &Method,
+        bucket: &str,
+        key: &str,
+        headers: &HeaderMap,
+    ) -> Result<Response, S3Error> {
+        let config = self.bucket_config(bucket)?;
+        if config.read == ReadMode::Leader {
+            self.coord.read_index().await.map_err(map_coord_error)?;
+        }
+        let Some(metadata) = self
+            .state
+            .get_metadata(bucket, key)
+            .map_err(map_coord_error)?
+        else {
+            return Err(no_such_key());
+        };
+        if !metadata.is_committed() {
+            return Err(no_such_key());
+        }
+        let mut request_headers = HeaderMap::new();
+        if let Some(range) = headers.get(header::RANGE) {
+            request_headers.insert(header::RANGE, range.clone());
+        }
+        let request = ForwardRequest {
+            method: method.clone(),
+            path_and_query: format!("/{BLOB_BUCKET}/{}", metadata.blob),
+            headers: request_headers,
+            body: None,
+            content_length: None,
+        };
+        let response = self
+            .client
+            .execute(&self.credential, request)
+            .await
+            .map_err(|error| storage_error(error, None))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            self.metrics.missing_blob();
+            return Err(no_such_key().with_header("x-s3-sidecar-owner", &metadata.owner));
+        }
+        if !response.status().is_success() {
+            return Err(S3Error::from_status(response.status()));
+        }
+        self.metrics.cluster_read_local();
+        self.metrics
+            .bytes_served
+            .fetch_add(metadata.size, Ordering::Relaxed);
+        if method == Method::HEAD {
+            drop(response);
+            return Ok(metadata_response(&metadata));
+        }
+        Ok(stream_response(response, &metadata))
+    }
+
+    /// Delete one object. A missing key also returns `204`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the delete proposal fails.
+    pub async fn delete(&self, bucket: &str, key: &str) -> Result<Response, S3Error> {
+        let current = self
+            .state
+            .get_metadata(bucket, key)
+            .map_err(map_coord_error)?;
+        let blob = current
+            .as_ref()
+            .map(|metadata| metadata.blob.clone())
+            .filter(|blob| !blob.is_empty());
+        self.coord
+            .propose(Entry::Delete {
+                term: self.coord.term(),
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                owner: self.node_id.clone(),
+            })
+            .await
+            .map_err(map_coord_error)?;
+        self.refresh_metrics();
+        if let Some(blob) = blob {
+            let client = self.client.clone();
+            let credential = Arc::clone(&self.credential);
+            tokio::spawn(async move {
+                delete_backing_blob(client, credential, blob).await;
+            });
+        }
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NO_CONTENT;
+        Ok(response)
+    }
+
+    /// List objects from committed metadata only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid token or a metadata read failure.
+    pub fn list_objects(&self, bucket: &str, query: &str) -> Result<Response, S3Error> {
+        let pairs = query_pairs(query);
+        if query_value(&pairs, "list-type") != Some("2") {
+            return Err(S3Error::not_implemented(
+                "Only ListObjectsV2 is supported in cluster mode.",
+            ));
+        }
+        let prefix = query_value(&pairs, "prefix").unwrap_or_default();
+        let delimiter = query_value(&pairs, "delimiter").filter(|value| !value.is_empty());
+        let max_keys = query_value(&pairs, "max-keys")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_000)
+            .min(1_000);
+        let start_after = match query_value(&pairs, "continuation-token") {
+            Some(token) => Some(decode_token(token)?),
+            None => query_value(&pairs, "start-after").map(str::to_owned),
+        };
+        let rows = self.state.scan_bucket(bucket).map_err(map_coord_error)?;
+        let mut contents = Vec::new();
+        let mut prefixes: Vec<String> = Vec::new();
+        let mut count = 0;
+        let mut last = None;
+        let mut truncated = false;
+        for (key, metadata) in rows {
+            if !metadata.is_committed() || !key.starts_with(prefix) {
+                continue;
+            }
+            let rest = &key[prefix.len()..];
+            if let Some(delimiter) = delimiter
+                && let Some(index) = rest.find(delimiter)
+            {
+                let common = format!("{prefix}{}", &rest[..index + delimiter.len()]);
+                if start_after
+                    .as_ref()
+                    .is_some_and(|after| common.as_str() <= after.as_str())
+                {
+                    continue;
+                }
+                if prefixes.last() == Some(&common) {
+                    continue;
+                }
+                if count >= max_keys {
+                    truncated = true;
+                    break;
+                }
+                last = Some(common.clone());
+                prefixes.push(common);
+                count += 1;
+                continue;
+            }
+            if start_after
+                .as_ref()
+                .is_some_and(|after| key.as_str() <= after.as_str())
+            {
+                continue;
+            }
+            if count >= max_keys {
+                truncated = true;
+                break;
+            }
+            last = Some(key.clone());
+            contents.push((key, metadata));
+            count += 1;
+        }
+        let token = last.as_deref().map(encode_token);
+        Ok(list_response(
+            bucket,
+            prefix,
+            max_keys,
+            truncated,
+            token.as_deref(),
+            &contents,
+            &prefixes,
+        ))
+    }
+
+    /// Start one multipart upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing upload cannot be created.
+    pub async fn create_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        headers: &HeaderMap,
+    ) -> Result<Response, S3Error> {
+        let blob = next_id();
+        let upload_id = format!("{}-{}", hex::encode(self.node_id.as_bytes()), next_id());
+        let response = self
+            .client
+            .execute(
+                &self.credential,
+                ForwardRequest {
+                    method: Method::POST,
+                    path_and_query: format!("/{BLOB_BUCKET}/{blob}?uploads"),
+                    headers: HeaderMap::new(),
+                    body: None,
+                    content_length: Some(0),
+                },
+            )
+            .await
+            .map_err(|error| storage_error(error, None))?;
+        if !response.status().is_success() {
+            return Err(S3Error::from_status(response.status()));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| S3Error::service_unavailable())?;
+        let text = String::from_utf8_lossy(&body);
+        let backing_upload_id = extract_tag(&text, "UploadId")
+            .ok_or_else(S3Error::internal)?
+            .to_owned();
+        let record = state::UploadRecord {
+            upload_id: upload_id.clone(),
+            backing_upload_id,
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            node_id: self.node_id.clone(),
+            blob: blob.clone(),
+            content_type: header_string(headers, header::CONTENT_TYPE),
+            user_metadata: user_metadata(headers),
+            created_at: state::unix_now(),
+        };
+        self.state.put_upload(&record).map_err(map_coord_error)?;
+        self.state
+            .set_pending(bucket, key, &blob, &self.node_id)
+            .map_err(map_coord_error)?;
+        Ok(xml_response(
+            StatusCode::OK,
+            format!(
+                "<InitiateMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key>\
+                 <UploadId>{}</UploadId></InitiateMultipartUploadResult>",
+                xml_escape(bucket),
+                xml_escape(key),
+                xml_escape(&upload_id)
+            ),
+        ))
+    }
+
+    /// Upload one part to the owning node.
+    ///
+    /// # Errors
+    ///
+    /// Returns a clear error when the upload belongs to another node.
+    pub async fn upload_part(
+        &self,
+        upload_id: &str,
+        part_number: &str,
+        input: WriteBody,
+    ) -> Result<Response, S3Error> {
+        let record = self.upload_for_node(upload_id)?;
+        let path = format!(
+            "/{BLOB_BUCKET}/{}?partNumber={}&uploadId={}",
+            record.blob,
+            encode_query(part_number),
+            encode_query(&record.backing_upload_id)
+        );
+        let request = ForwardRequest {
+            method: Method::PUT,
+            path_and_query: path,
+            headers: HeaderMap::new(),
+            body: input.body,
+            content_length: input.content_length,
+        };
+        let response = self
+            .client
+            .execute(&self.credential, request)
+            .await
+            .map_err(|error| storage_error(error, input.failure.as_ref()))?;
+        if !response.status().is_success() {
+            return Err(S3Error::from_status(response.status()));
+        }
+        let mut output = Response::new(Body::empty());
+        *output.status_mut() = StatusCode::OK;
+        if let Some(etag) = response.headers().get(header::ETAG) {
+            output.headers_mut().insert(header::ETAG, etag.clone());
+        }
+        Ok(output)
+    }
+
+    /// Complete one multipart upload and commit its metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing upload or the commit fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn complete_multipart(
+        &self,
+        upload_id: &str,
+        input: WriteBody,
+    ) -> Result<Response, S3Error> {
+        let record = self.upload_for_node(upload_id)?;
+        let path = format!(
+            "/{BLOB_BUCKET}/{}?uploadId={}",
+            record.blob,
+            encode_query(&record.backing_upload_id)
+        );
+        let response = self
+            .client
+            .execute(
+                &self.credential,
+                ForwardRequest {
+                    method: Method::POST,
+                    path_and_query: path,
+                    headers: HeaderMap::new(),
+                    body: input.body,
+                    content_length: input.content_length,
+                },
+            )
+            .await
+            .map_err(|error| storage_error(error, input.failure.as_ref()))?;
+        if !response.status().is_success() {
+            return Err(S3Error::from_status(response.status()));
+        }
+        let header_etag = response
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| S3Error::service_unavailable())?;
+        let text = String::from_utf8_lossy(&body);
+        let etag = header_etag
+            .or_else(|| extract_tag(&text, "ETag").map(str::to_owned))
+            .unwrap_or_default();
+        let size = self.head_blob(&record.blob).await.unwrap_or(0);
+        let current = self
+            .state
+            .get_metadata(&record.bucket, &record.key)
+            .map_err(map_coord_error)?;
+        let request = CommitRequest {
+            bucket: record.bucket.clone(),
+            key: record.key.clone(),
+            base_version: current.as_ref().map_or(0, |metadata| metadata.version),
+            blob: record.blob.clone(),
+            size,
+            checksum: etag.clone(),
+            content_type: record.content_type.clone(),
+            etag: etag.clone(),
+            user_metadata: record.user_metadata.clone(),
+            owner: self.node_id.clone(),
+            replicas: vec![self.node_id.clone()],
+            if_none_match: false,
+            if_match: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+        };
+        let started = Instant::now();
+        let applied = self
+            .coord
+            .propose(Entry::Commit {
+                term: self.coord.term(),
+                request: Box::new(request),
+            })
+            .await;
+        match applied {
+            Ok(applied) => {
+                self.metrics.commit_latency(started.elapsed());
+                self.metrics.committed_write();
+                self.state
+                    .remove_upload(&record.upload_id)
+                    .map_err(map_coord_error)?;
+                self.refresh_metrics();
+                let ApplyResult::Commit(metadata) = applied.result else {
+                    return Err(S3Error::internal());
+                };
+                Ok(xml_response(
+                    StatusCode::OK,
+                    format!(
+                        "<CompleteMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key>\
+                         <ETag>\"{}\"</ETag></CompleteMultipartUploadResult>",
+                        xml_escape(&record.bucket),
+                        xml_escape(&record.key),
+                        xml_escape(&metadata.etag)
+                    ),
+                ))
+            }
+            Err(error) => {
+                self.metrics.aborted_write();
+                delete_backing_blob(
+                    self.client.clone(),
+                    Arc::clone(&self.credential),
+                    record.blob.clone(),
+                )
+                .await;
+                self.state
+                    .remove_upload(&record.upload_id)
+                    .map_err(map_coord_error)?;
+                Err(map_coord_error(error))
+            }
+        }
+    }
+
+    /// Abort one multipart upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the backing abort fails.
+    pub async fn abort_multipart(&self, upload_id: &str) -> Result<Response, S3Error> {
+        let record = self.upload_for_node(upload_id)?;
+        self.abort_backing(&record).await?;
+        self.state
+            .remove_upload(&record.upload_id)
+            .map_err(map_coord_error)?;
+        self.state
+            .clear_pending(&record.bucket, &record.key)
+            .map_err(map_coord_error)?;
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::NO_CONTENT;
+        Ok(response)
+    }
+
+    /// List the parts of one multipart upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the upload belongs to another node.
+    pub async fn list_parts(&self, upload_id: &str, query: &str) -> Result<Response, S3Error> {
+        let record = self.upload_for_node(upload_id)?;
+        let pairs = query_pairs(query);
+        let mut path = format!(
+            "/{BLOB_BUCKET}/{}?uploadId={}",
+            record.blob,
+            encode_query(&record.backing_upload_id)
+        );
+        for name in ["part-number-marker", "max-parts"] {
+            if let Some(value) = query_value(&pairs, name) {
+                path.push('&');
+                path.push_str(name);
+                path.push('=');
+                path.push_str(&encode_query(value));
+            }
+        }
+        let response = self
+            .client
+            .execute(
+                &self.credential,
+                ForwardRequest {
+                    method: Method::GET,
+                    path_and_query: path,
+                    headers: HeaderMap::new(),
+                    body: None,
+                    content_length: None,
+                },
+            )
+            .await
+            .map_err(|error| storage_error(error, None))?;
+        if !response.status().is_success() {
+            return Err(S3Error::from_status(response.status()));
+        }
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = Body::from_stream(
+            response
+                .bytes_stream()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string())),
+        );
+        let mut output = Response::new(body);
+        *output.status_mut() = status;
+        copy_headers(&headers, output.headers_mut());
+        Ok(output)
+    }
+
+    /// Run one garbage collection pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when metadata or the backing listing cannot be read.
+    pub async fn gc_once(&self) -> Result<GcReport, S3Error> {
+        let now = state::unix_now();
+        let staging = duration_seconds(self.config.cluster.staging_ttl.as_duration());
+        let orphan = duration_seconds(self.config.cluster.orphan_ttl.as_duration());
+        let mut report = GcReport::default();
+        for upload in self.state.uploads().map_err(map_coord_error)? {
+            if now.saturating_sub(upload.created_at) >= staging {
+                self.abort_backing(&upload).await?;
+                self.state
+                    .remove_upload(&upload.upload_id)
+                    .map_err(map_coord_error)?;
+                self.state
+                    .clear_pending(&upload.bucket, &upload.key)
+                    .map_err(map_coord_error)?;
+                report.uploads_aborted += 1;
+            }
+        }
+        for (bucket, key, metadata) in self.state.tombstones().map_err(map_coord_error)? {
+            if metadata
+                .deleted_at
+                .is_some_and(|deleted| now.saturating_sub(deleted) >= orphan)
+            {
+                if !metadata.blob.is_empty() {
+                    delete_backing_blob(
+                        self.client.clone(),
+                        Arc::clone(&self.credential),
+                        metadata.blob.clone(),
+                    )
+                    .await;
+                    report.orphan_blobs_removed += 1;
+                    self.metrics.gc_deleted();
+                }
+                self.state
+                    .remove_metadata(&bucket, &key)
+                    .map_err(map_coord_error)?;
+                report.tombstones_removed += 1;
+            }
+        }
+        let referenced = self.state.referenced_blobs().map_err(map_coord_error)?;
+        for object in self.list_backing_objects().await? {
+            if referenced.contains(&object.key) {
+                continue;
+            }
+            if let Some(modified) = object.modified
+                && now.saturating_sub(modified) >= staging
+            {
+                delete_backing_blob(
+                    self.client.clone(),
+                    Arc::clone(&self.credential),
+                    object.key,
+                )
+                .await;
+                report.orphan_blobs_removed += 1;
+                self.metrics.gc_deleted();
+            }
+        }
+        self.refresh_metrics();
+        Ok(report)
+    }
+
+    fn bucket_config(&self, bucket: &str) -> Result<BucketConfigRecord, S3Error> {
+        if let Some(config) = self.state.bucket_config(bucket).map_err(map_coord_error)? {
+            return Ok(config);
+        }
+        let from_file = self
+            .config
+            .buckets
+            .iter()
+            .find(|entry| entry.name == bucket)
+            .map(BucketConfigRecord::from_config);
+        Ok(from_file.unwrap_or(BucketConfigRecord {
+            write_ack: crate::config::WriteAck::Leader,
+            read: ReadMode::LocalThenPeer,
+            replicas: 1,
+            min_replicas: 1,
+        }))
+    }
+
+    fn upload_for_node(&self, upload_id: &str) -> Result<state::UploadRecord, S3Error> {
+        if let Some(owner) = upload_owner(upload_id)
+            && owner != self.node_id
+        {
+            return Err(wrong_node(&owner));
+        }
+        let record = self
+            .state
+            .upload(upload_id)
+            .map_err(map_coord_error)?
+            .ok_or_else(no_such_upload)?;
+        if record.node_id != self.node_id {
+            return Err(wrong_node(&record.node_id));
+        }
+        Ok(record)
+    }
+
+    async fn stage_blob(
+        &self,
+        blob: &str,
+        input: WriteBody,
+        fingerprint: Arc<Mutex<Fingerprint>>,
+    ) -> Result<(), S3Error> {
+        let body = input
+            .body
+            .map(|body| fingerprint_stream(body, Arc::clone(&fingerprint)));
+        let request = ForwardRequest {
+            method: Method::PUT,
+            path_and_query: format!("/{BLOB_BUCKET}/{blob}"),
+            headers: HeaderMap::new(),
+            body,
+            content_length: input.content_length,
+        };
+        let response = self
+            .client
+            .execute(&self.credential, request)
+            .await
+            .map_err(|error| storage_error(error, input.failure.as_ref()))?;
+        if !response.status().is_success() {
+            return Err(S3Error::from_status(response.status()));
+        }
+        if let Some(error) = body_failure_error(input.failure.as_ref()) {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn head_blob(&self, blob: &str) -> Option<u64> {
+        let request = ForwardRequest {
+            method: Method::HEAD,
+            path_and_query: format!("/{BLOB_BUCKET}/{blob}"),
+            headers: HeaderMap::new(),
+            body: None,
+            content_length: None,
+        };
+        let response = self.client.execute(&self.credential, request).await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+    }
+
+    async fn abort_backing(&self, record: &state::UploadRecord) -> Result<(), S3Error> {
+        let response = self
+            .client
+            .execute(
+                &self.credential,
+                ForwardRequest {
+                    method: Method::DELETE,
+                    path_and_query: format!(
+                        "/{BLOB_BUCKET}/{}?uploadId={}",
+                        record.blob,
+                        encode_query(&record.backing_upload_id)
+                    ),
+                    headers: HeaderMap::new(),
+                    body: None,
+                    content_length: None,
+                },
+            )
+            .await
+            .map_err(|error| storage_error(error, None))?;
+        if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            Err(S3Error::from_status(response.status()))
+        }
+    }
+
+    async fn list_backing_objects(&self) -> Result<Vec<ListedObject>, S3Error> {
+        let mut output = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut path = format!("/{BLOB_BUCKET}?list-type=2&prefix=");
+            if let Some(token) = &token {
+                path.push('&');
+                path.push_str("continuation-token=");
+                path.push_str(&encode_query(token));
+            }
+            let response = self
+                .client
+                .execute(
+                    &self.credential,
+                    ForwardRequest {
+                        method: Method::GET,
+                        path_and_query: path,
+                        headers: HeaderMap::new(),
+                        body: None,
+                        content_length: None,
+                    },
+                )
+                .await
+                .map_err(|error| storage_error(error, None))?;
+            if !response.status().is_success() {
+                return Err(S3Error::from_status(response.status()));
+            }
+            let body = response
+                .bytes()
+                .await
+                .map_err(|_| S3Error::service_unavailable())?;
+            let text = String::from_utf8_lossy(&body);
+            output.extend(parse_listing(&text));
+            let truncated = extract_tag(&text, "IsTruncated")
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+            if !truncated {
+                break;
+            }
+            token = extract_tag(&text, "NextContinuationToken").map(str::to_owned);
+            if token.is_none() {
+                break;
+            }
+        }
+        Ok(output)
+    }
+}
+
+struct ListedObject {
+    key: String,
+    modified: Option<i64>,
+}
+
+struct Fingerprint {
+    md5: Md5,
+    sha: Sha256,
+    size: u64,
+}
+
+impl Fingerprint {
+    fn new() -> Self {
+        Self {
+            md5: Md5::new(),
+            sha: Sha256::new(),
+            size: 0,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.md5.update(bytes);
+        self.sha.update(bytes);
+        self.size = self
+            .size
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    }
+
+    fn finish(self) -> (String, String, u64) {
+        (
+            hex::encode(self.md5.finalize()),
+            hex::encode(self.sha.finalize()),
+            self.size,
+        )
+    }
+}
+
+fn fingerprint_result(fingerprint: &Arc<Mutex<Fingerprint>>) -> (String, String, u64) {
+    let mut guard = fingerprint.lock().unwrap_or_else(PoisonError::into_inner);
+    let state = std::mem::replace(&mut *guard, Fingerprint::new());
+    state.finish()
+}
+
+fn fingerprint_stream(body: BodyStream, fingerprint: Arc<Mutex<Fingerprint>>) -> BodyStream {
+    let stream = async_stream::try_stream! {
+        let mut body = body;
+        while let Some(chunk) = body.next().await {
+            let bytes = chunk?;
+            {
+                let mut guard = fingerprint
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                guard.update(&bytes);
+            }
+            yield bytes;
+        }
+    };
+    Box::pin(stream)
+}
+
+fn put_response(metadata: &Metadata) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::OK;
+    set_metadata_headers(metadata, response.headers_mut());
+    response
+}
+
+fn metadata_response(metadata: &Metadata) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::OK;
+    set_metadata_headers(metadata, response.headers_mut());
+    if let Ok(value) = HeaderValue::from_str(&metadata.size.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    response
+}
+
+fn stream_response(response: reqwest::Response, metadata: &Metadata) -> Response {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = Body::from_stream(
+        response
+            .bytes_stream()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string())),
+    );
+    let mut output = Response::new(body);
+    *output.status_mut() = status;
+    copy_headers(&headers, output.headers_mut());
+    set_metadata_headers(metadata, output.headers_mut());
+    output
+}
+
+fn set_metadata_headers(metadata: &Metadata, headers: &mut HeaderMap) {
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if !metadata.etag.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&format!("\"{}\"", metadata.etag))
+    {
+        headers.insert(header::ETAG, value);
+    }
+    for (name, value) in [
+        (header::CONTENT_TYPE, metadata.content_type.as_ref()),
+        (header::CONTENT_ENCODING, metadata.content_encoding.as_ref()),
+        (header::CACHE_CONTROL, metadata.cache_control.as_ref()),
+        (
+            header::CONTENT_DISPOSITION,
+            metadata.content_disposition.as_ref(),
+        ),
+    ] {
+        if let Some(value) = value
+            && let Ok(value) = HeaderValue::from_str(value)
+        {
+            headers.insert(name, value);
+        }
+    }
+    for (name, value) in &metadata.user_metadata {
+        let name = format!("x-amz-meta-{name}");
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            headers.insert(name, value);
+        }
+    }
+}
+
+fn copy_headers(source: &HeaderMap, target: &mut HeaderMap) {
+    for (name, value) in source {
+        if matches!(
+            name.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+        ) {
+            continue;
+        }
+        target.insert(name.clone(), value.clone());
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::format_push_string)]
+fn list_response(
+    bucket: &str,
+    prefix: &str,
+    max_keys: usize,
+    truncated: bool,
+    token: Option<&str>,
+    contents: &[(String, Metadata)],
+    prefixes: &[String],
+) -> Response {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    xml.push_str("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    xml.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
+    xml.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(prefix)));
+    xml.push_str(&format!(
+        "<KeyCount>{}</KeyCount>",
+        contents.len() + prefixes.len()
+    ));
+    xml.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+    if let Some(token) = token {
+        xml.push_str(&format!(
+            "<NextContinuationToken>{}</NextContinuationToken>",
+            xml_escape(token)
+        ));
+    }
+    for (key, metadata) in contents {
+        xml.push_str("<Contents>");
+        xml.push_str(&format!("<Key>{}</Key>", xml_escape(key)));
+        if let Some(committed) = metadata.committed_at {
+            xml.push_str(&format!(
+                "<LastModified>{}</LastModified>",
+                unix_timestamp(committed)
+            ));
+        }
+        xml.push_str(&format!("<ETag>\"{}\"</ETag>", xml_escape(&metadata.etag)));
+        xml.push_str(&format!("<Size>{}</Size>", metadata.size));
+        xml.push_str("<StorageClass>STANDARD</StorageClass>");
+        xml.push_str("</Contents>");
+    }
+    for prefix in prefixes {
+        xml.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            xml_escape(prefix)
+        ));
+    }
+    xml.push_str("</ListBucketResult>");
+    xml_response(StatusCode::OK, xml)
+}
+
+fn xml_response(status: StatusCode, xml: String) -> Response {
+    let mut response = Response::new(Body::from(xml));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    response
+}
+
+fn unix_timestamp(seconds: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()
+        .and_then(|value| value.format(&Rfc3339).ok())
+        .unwrap_or_default()
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&apos;"),
+            other => output.push(other),
+        }
+    }
+    output
+}
+
+fn header_string(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn header_is(headers: &HeaderMap, name: header::HeaderName, expected: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == expected)
+}
+
+fn user_metadata(headers: &HeaderMap) -> BTreeMap<String, String> {
+    let mut output = BTreeMap::new();
+    for (name, value) in headers {
+        let name = name.as_str();
+        if let Some(suffix) = name.strip_prefix("x-amz-meta-")
+            && let Ok(value) = value.to_str()
+        {
+            output.insert(suffix.to_owned(), value.to_owned());
+        }
+    }
+    output
+}
+
+fn condition_failed(
+    current: Option<&Metadata>,
+    if_none_match: bool,
+    if_match: Option<&str>,
+) -> bool {
+    if if_none_match && current.is_some_and(Metadata::is_committed) {
+        return true;
+    }
+    if let Some(expected) = if_match {
+        let Some(metadata) = current else {
+            return true;
+        };
+        if !metadata.is_committed() {
+            return true;
+        }
+        if expected.trim() != "*" && metadata.etag != expected.trim().trim_matches('"') {
+            return true;
+        }
+    }
+    false
+}
+
+fn precondition_failed() -> S3Error {
+    S3Error::new(
+        StatusCode::PRECONDITION_FAILED,
+        "PreconditionFailed",
+        "A condition in the request failed.",
+    )
+}
+
+fn no_such_key() -> S3Error {
+    S3Error::new(
+        StatusCode::NOT_FOUND,
+        "NoSuchKey",
+        "The key does not exist.",
+    )
+}
+
+fn no_such_upload() -> S3Error {
+    S3Error::new(
+        StatusCode::NOT_FOUND,
+        "NoSuchUpload",
+        "The upload id does not exist.",
+    )
+}
+
+fn wrong_node(owner: &str) -> S3Error {
+    S3Error::new(
+        StatusCode::BAD_REQUEST,
+        "InvalidRequest",
+        &format!("The upload id belongs to node \"{owner}\". Send the request to that node."),
+    )
+}
+
+fn map_coord_error(error: CoordError) -> S3Error {
+    match error {
+        CoordError::Rejected(RejectReason::PreconditionFailed) => precondition_failed(),
+        CoordError::Rejected(RejectReason::Conflict) => S3Error::new(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "The object changed during the write.",
+        ),
+        CoordError::StaleTerm { .. } => S3Error::service_unavailable(),
+        CoordError::Storage(message) => {
+            warn!(error = %message, "cluster metadata operation failed");
+            S3Error::internal()
+        }
+        CoordError::NotImplemented(message) => S3Error::not_implemented(message),
+    }
+}
+
+fn storage_error(
+    error: StorageError,
+    failure_flag: Option<&Arc<std::sync::atomic::AtomicU8>>,
+) -> S3Error {
+    match error {
+        StorageError::Sign(error) => error,
+        StorageError::Transport(_) => {
+            body_failure_error(failure_flag).unwrap_or_else(S3Error::service_unavailable)
+        }
+    }
+}
+
+fn body_failure_error(failure_flag: Option<&Arc<std::sync::atomic::AtomicU8>>) -> Option<S3Error> {
+    match failure_flag.map(|flag| failure(flag)) {
+        Some(BodyFailure::PayloadHash) => Some(S3Error::payload_mismatch()),
+        Some(BodyFailure::ChunkSignature) => Some(S3Error::signature_mismatch()),
+        Some(BodyFailure::ChunkFormat | BodyFailure::DecodedLength) => {
+            Some(S3Error::invalid_request("The request body is not valid."))
+        }
+        _ => None,
+    }
+}
+
+async fn delete_backing_blob(client: S3Client, credential: Arc<ClientCredential>, blob: String) {
+    let request = ForwardRequest {
+        method: Method::DELETE,
+        path_and_query: format!("/{BLOB_BUCKET}/{blob}"),
+        headers: HeaderMap::new(),
+        body: None,
+        content_length: None,
+    };
+    if let Err(error) = client.execute(&credential, request).await {
+        warn!(%error, "cluster blob delete failed");
+    }
+}
+
+fn parse_listing(xml: &str) -> Vec<ListedObject> {
+    let mut output = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Contents>") {
+        let after = &rest[start + "<Contents>".len()..];
+        let Some(end) = after.find("</Contents>") else {
+            break;
+        };
+        let block = &after[..end];
+        if let Some(key) = extract_tag(block, "Key") {
+            let modified = extract_tag(block, "LastModified")
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                .map(OffsetDateTime::unix_timestamp);
+            output.push(ListedObject {
+                key: key.to_owned(),
+                modified,
+            });
+        }
+        rest = &after[end + "</Contents>".len()..];
+    }
+    output
+}
+
+fn extract_tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = xml.find(&open)?;
+    let after = &xml[start + open.len()..];
+    let end = after.find(&close)?;
+    Some(&after[..end])
+}
+
+fn query_pairs(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (decode_query(key), decode_query(value))
+        })
+        .collect()
+}
+
+fn query_value<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn decode_query(value: &str) -> String {
+    percent_decode_str(&value.replace('+', " "))
+        .decode_utf8_lossy()
+        .into_owned()
+}
+
+fn encode_query(value: &str) -> String {
+    utf8_percent_encode(value, NON_ALPHANUMERIC).to_string()
+}
+
+fn encode_token(value: &str) -> String {
+    hex::encode(value.as_bytes())
+}
+
+fn decode_token(value: &str) -> Result<String, S3Error> {
+    let bytes = hex::decode(value).map_err(|_| {
+        S3Error::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The continuation token is not valid.",
+        )
+    })?;
+    String::from_utf8(bytes).map_err(|_| {
+        S3Error::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The continuation token is not valid.",
+        )
+    })
+}
+
+fn upload_owner(upload_id: &str) -> Option<String> {
+    let (node, _) = upload_id.split_once('-')?;
+    let bytes = hex::decode(node).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn duration_seconds(duration: std::time::Duration) -> i64 {
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+}
+
+fn next_id() -> String {
+    use std::sync::atomic::AtomicU64;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("{nanos:032x}{counter:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::cluster::state::ObjectState;
+
+    #[test]
+    fn tokens_round_trip() {
+        let token = encode_token("a/b c");
+        assert_eq!(decode_token(&token).unwrap(), "a/b c");
+        assert!(decode_token("zz").is_err());
+    }
+
+    #[test]
+    fn listing_parses_contents_and_token() {
+        let xml = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+                   <NextContinuationToken>next</NextContinuationToken>\
+                   <Contents><Key>a</Key>\
+                   <LastModified>2000-01-01T00:00:00Z</LastModified>\
+                   </Contents></ListBucketResult>";
+        let objects = parse_listing(xml);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].key, "a");
+        assert!(objects[0].modified.is_some());
+        assert_eq!(extract_tag(xml, "NextContinuationToken"), Some("next"));
+    }
+
+    #[test]
+    fn upload_owner_reads_the_node_hex() {
+        let id = format!("{}-{}", hex::encode("node-a").as_str(), "123");
+        assert_eq!(upload_owner(&id).as_deref(), Some("node-a"));
+    }
+
+    #[test]
+    fn conditions_compare_etags() {
+        let metadata = Metadata {
+            state: ObjectState::Committed,
+            version: 1,
+            blob: "blob".to_owned(),
+            size: 1,
+            checksum: String::new(),
+            content_type: None,
+            etag: "abc".to_owned(),
+            user_metadata: BTreeMap::new(),
+            owner: "a".to_owned(),
+            replicas: Vec::new(),
+            created_at: 0,
+            committed_at: Some(0),
+            deleted_at: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+        };
+        assert!(condition_failed(Some(&metadata), true, None));
+        assert!(!condition_failed(Some(&metadata), false, Some("\"abc\"")));
+        assert!(condition_failed(Some(&metadata), false, Some("\"other\"")));
+    }
+}
