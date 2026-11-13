@@ -1,0 +1,32 @@
+name: Fuzz
+
+# The fuzz run is not part of the pull request gate. It runs on a schedule and
+# on demand.
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [sigv4, s3_xml]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run the ${{ matrix.target }} target
+        working-directory: fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
