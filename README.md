@@ -11,15 +11,18 @@ single-node foundation of M2 (coordination):
 - Read-through cache with TTL and `If-None-Match` revalidation.
 - Write-back journal with async origin sync, deletes, and tombstones.
 - Quarantine, retry with backoff, garbage collection, and LRU eviction.
-- Cluster mode with `consensus.backend = "single"`: staged writes, a `redb`
-  metadata state machine, metadata-backed reads and listing, multipart,
+- Cluster mode with `consensus.backend = "single"` or `"raft"`: staged writes,
+  a `redb` metadata state machine, metadata-backed reads and listing, multipart,
   tombstones, garbage collection, and metrics.
+- Raft mode with an `openraft` leader, a `redb` log store, snapshots, and an
+  HTTP transport for internal RPCs.
 - Health, readiness, and Prometheus metrics endpoints.
 - `s3-sidecar check --show-config` with redacted secrets and field sources.
 
-Cluster mode supports one node in this build. The `raft` and `consul` backends
-return `consensus backend is not implemented in this build`. Peer replication
-and quorum acknowledgements are later milestones.
+Raft mode replicates metadata. Blob bytes stay on the node that accepted the
+write. Peer blob replication, `write_ack = quorum|all`, and
+`read = local_then_peer` peer fetch are later milestones. The `consul` backend
+returns `NotImplemented`.
 
 ## Build and test
 
@@ -361,6 +364,67 @@ replicas = 1
 min_replicas = 1
 ```
 
+### Raft mode
+
+Set `consensus.backend = "raft"` and list every node. The list includes this
+node. Each node name is unique, and each address is the base URL of that node's
+sidecar listener.
+
+```toml
+[consensus]
+backend = "raft"
+
+[consensus.raft]
+node_id = "a"
+bootstrap = false
+secret = "replace-me"
+addr = "http://127.0.0.1:9000"
+rpc_timeout = "5s"
+
+[[consensus.raft.nodes]]
+id = "a"
+addr = "http://127.0.0.1:9000"
+
+[[consensus.raft.nodes]]
+id = "b"
+addr = "http://127.0.0.1:9100"
+
+[[consensus.raft.nodes]]
+id = "c"
+addr = "http://127.0.0.1:9200"
+```
+
+Rules:
+
+- `nodes` is required with `raft`. `peers` is not valid with `raft`. Use
+  `peers` with the `single` backend.
+- `consensus.raft.secret` is required. Internal `/_raft/` requests must send
+  `x-s3-sidecar-raft-token` with this value. A missing or wrong token returns
+  `401`.
+- Set `bootstrap = true` on one node. That node forms the cluster with every
+  entry in `nodes`. A node with `bootstrap = false` does not initialize a
+  competing cluster. A single-node cluster bootstraps without the flag.
+- The raft log, vote, committed index, applied index, membership, and snapshot
+  share `cluster.metadata_path` with the metadata tables.
+- `consensus.raft.addr` must be an `http://` or `https://` URL.
+- `consensus.raft.rpc_timeout` bounds each internal HTTP request.
+
+A write on a follower writes the blob to the local backing S3 endpoint, then
+forwards the proposal to the leader. The leader appends the entry to the raft
+log. The follower returns `200` after the entry commits. A read on a node with
+committed metadata but no local blob returns `404` with `x-s3-sidecar-owner`.
+
+The RAFT log uses `snapshot_policy = LogsSinceLast(64)`. A snapshot is a JSON
+export of the metadata, bucket config, uploads, last applied log id, and
+membership. Install replaces the state tables and the snapshot record in one
+transaction.
+
+Raft metrics include `s3_sidecar_raft_term`, `s3_sidecar_raft_leader`,
+`s3_sidecar_raft_last_log_index`, `s3_sidecar_raft_last_applied`,
+`s3_sidecar_raft_snapshot_index`, and `s3_sidecar_raft_elections_total`.
+`/readyz` returns `503` with a reason until the node has a leader and has
+applied at least one entry.
+
 Blobs live in `backing.bucket` under `objects/`:
 
 ```
@@ -436,10 +500,16 @@ index, term, and read-index calls.
 
 - Path-style bucket addressing only.
 - One origin endpoint and one cache endpoint.
-- Cluster mode supports only `consensus.backend = "single"`. The `raft` and
-  `consul` backends, peer replication, quorum acknowledgements, and
-  `local_then_peer` peer fetch are not implemented. Cluster mode requires
-  `backing.bucket`.
+- Cluster mode supports `consensus.backend = "single"` and `"raft"`. The
+  `consul` backend, peer blob replication, quorum acknowledgements
+  (`write_ack = "quorum"|"all"`), and `local_then_peer` peer fetch are not
+  implemented. Cluster mode requires `backing.bucket`.
+- Raft mode replicates metadata only. A committed blob is available only on the
+  node that accepted the write until peer replication exists. A read on another
+  node returns `404` with `x-s3-sidecar-owner`.
+- `bootstrap = true` belongs on one node. A restart of that node keeps the
+  existing cluster. A fresh second node with `bootstrap = false` waits for the
+  leader and does not form a cluster alone.
 - Multipart and CopyObject pass through to origin. The sidecar does not cache
   multipart parts.
 - No TLS listener. Put the sidecar behind a TLS terminator.

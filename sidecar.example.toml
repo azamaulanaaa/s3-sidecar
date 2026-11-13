@@ -59,7 +59,19 @@ backend = "single"             # single | raft | consul
 
 [consensus.raft]
 # node_id = "a"
+# The single backend uses peers. The raft backend uses nodes.
 # peers = ["a"]
+# The raft backend requires a shared secret and one bootstrap node.
+# bootstrap = false
+# secret = "replace-me"
+# addr = "http://127.0.0.1:9000"
+# rpc_timeout = "5s"
+# [[consensus.raft.nodes]]
+# id = "a"
+# addr = "http://127.0.0.1:9000"
+# [[consensus.raft.nodes]]
+# id = "b"
+# addr = "http://127.0.0.1:9100"
 
 [cluster]
 # Cluster mode only.
