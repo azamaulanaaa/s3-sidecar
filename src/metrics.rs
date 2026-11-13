@@ -75,6 +75,20 @@ pub struct Metrics {
     pub cluster_owner_blobs_repaired: AtomicU64,
     /// Owner blobs that no replica could supply.
     pub cluster_owner_blobs_unrecoverable: AtomicU64,
+    /// Accepted writes by acknowledgement policy.
+    pub cluster_write_ack_total: Mutex<BTreeMap<String, u64>>,
+    /// Quorum writes that reached the required acknowledgements.
+    pub cluster_quorum_success: AtomicU64,
+    /// Quorum writes that did not reach the required acknowledgements.
+    pub cluster_quorum_failure: AtomicU64,
+    /// Total synchronous replication latency in microseconds.
+    pub cluster_sync_replication_latency_micros: AtomicU64,
+    /// Synchronous peer copy attempts.
+    pub cluster_sync_replication_count: AtomicU64,
+    /// Peer copies that acknowledged the blob.
+    pub cluster_replica_acks: AtomicU64,
+    /// Peer copies that failed or timed out.
+    pub cluster_replica_ack_failures: AtomicU64,
     /// Current raft term.
     pub raft_term: AtomicU64,
     /// Last raft log index.
@@ -242,6 +256,45 @@ impl Metrics {
     /// Record one owner blob that no replica could supply.
     pub fn owner_blob_unrecoverable(&self) {
         self.cluster_owner_blobs_unrecoverable
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one write attempt with an acknowledgement policy.
+    pub fn write_ack(&self, policy: &str) {
+        let mut counts = self
+            .cluster_write_ack_total
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *counts.entry(policy.to_owned()).or_insert(0) += 1;
+    }
+
+    /// Record one quorum write that reached the required acknowledgements.
+    pub fn quorum_success(&self) {
+        self.cluster_quorum_success.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one quorum write that did not reach the required acknowledgements.
+    pub fn quorum_failure(&self) {
+        self.cluster_quorum_failure.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the latency of one synchronous peer copy.
+    pub fn sync_replication(&self, elapsed: std::time::Duration) {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.cluster_sync_replication_latency_micros
+            .fetch_add(micros, Ordering::Relaxed);
+        self.cluster_sync_replication_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one peer that acknowledged a blob.
+    pub fn replica_ack(&self) {
+        self.cluster_replica_acks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one peer copy that failed or timed out.
+    pub fn replica_ack_failure(&self) {
+        self.cluster_replica_ack_failures
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -510,6 +563,64 @@ pub fn render(metrics: &Metrics, pending: u64, sync_lag_seconds: u64) -> String 
             .cluster_owner_blobs_unrecoverable
             .load(Ordering::Relaxed),
     );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_quorum_success_total",
+        "Quorum writes that reached the required acknowledgements.",
+        metrics.cluster_quorum_success.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_quorum_failure_total",
+        "Quorum writes that did not reach the required acknowledgements.",
+        metrics.cluster_quorum_failure.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_sync_replication_latency_micros_total",
+        "Total synchronous replication latency in microseconds.",
+        metrics
+            .cluster_sync_replication_latency_micros
+            .load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_sync_replication_count_total",
+        "Synchronous peer copy attempts.",
+        metrics
+            .cluster_sync_replication_count
+            .load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_replica_acks_total",
+        "Peer copies that acknowledged the blob.",
+        metrics.cluster_replica_acks.load(Ordering::Relaxed),
+    );
+    push_counter(
+        &mut output,
+        "s3_sidecar_cluster_replica_ack_failures_total",
+        "Peer copies that failed or timed out.",
+        metrics.cluster_replica_ack_failures.load(Ordering::Relaxed),
+    );
+    {
+        let counts = metrics
+            .cluster_write_ack_total
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        output.push_str(
+            "# HELP s3_sidecar_cluster_write_ack_total Accepted writes by acknowledgement policy.\n",
+        );
+        output.push_str("# TYPE s3_sidecar_cluster_write_ack_total gauge\n");
+        for (policy, count) in counts.iter() {
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                output,
+                "s3_sidecar_cluster_write_ack_total{{policy=\"{}\"}} {count}",
+                escape_label(policy)
+            );
+        }
+    }
     {
         let failures = metrics
             .cluster_replication_failures

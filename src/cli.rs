@@ -238,6 +238,9 @@ pub struct ConfigFlags {
     /// Number of concurrent replication workers.
     #[arg(long = "cluster-replicate-workers", value_name = "COUNT")]
     pub cluster_replicate_workers: Option<usize>,
+    /// Maximum time to wait for one synchronous peer blob copy.
+    #[arg(long = "cluster-replicate-timeout", value_name = "DURATION")]
+    pub cluster_replicate_timeout: Option<String>,
     /// Interval between replica reconciliation passes.
     #[arg(long = "cluster-reconcile-interval", value_name = "DURATION")]
     pub cluster_reconcile_interval: Option<String>,
@@ -638,6 +641,13 @@ impl ConfigFlags {
         }
         if let Some(value) = self.cluster_replicate_workers {
             set(&mut object, &["cluster", "replicate_workers"], json!(value));
+        }
+        if let Some(value) = &self.cluster_replicate_timeout {
+            set(
+                &mut object,
+                &["cluster", "replicate_timeout"],
+                Value::String(value.clone()),
+            );
         }
         if let Some(value) = &self.cluster_reconcile_interval {
             set(

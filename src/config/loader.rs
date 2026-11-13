@@ -312,6 +312,7 @@ fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
         "CLUSTER__SECRET" => (EnvKind::Text, vec!["cluster", "secret"]),
         "CLUSTER__READ_REPAIR" => (EnvKind::Bool, vec!["cluster", "read_repair"]),
         "CLUSTER__REPLICATE_WORKERS" => (EnvKind::Unsigned, vec!["cluster", "replicate_workers"]),
+        "CLUSTER__REPLICATE_TIMEOUT" => (EnvKind::Text, vec!["cluster", "replicate_timeout"]),
         "CLUSTER__RECONCILE_INTERVAL" => (EnvKind::Text, vec!["cluster", "reconcile_interval"]),
         "CLUSTER__NODES" => (EnvKind::Json, vec!["cluster", "nodes"]),
         "CLIENTS" => (EnvKind::Json, vec!["clients"]),

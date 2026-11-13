@@ -306,6 +306,12 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
     push_row(
         &mut rows,
         sources,
+        "cluster.replicate_timeout",
+        config.cluster.replicate_timeout.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
         "cluster.reconcile_interval",
         config.cluster.reconcile_interval.to_string(),
     );
