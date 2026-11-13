@@ -2,7 +2,8 @@
 
 An S3 sidecar proxy in Rust.
 
-This build implements milestones M0 (proxy core) and M1 (cache):
+This build implements milestones M0 (proxy core), M1 (cache), and the
+single-node foundation of M2 (coordination):
 
 - Layered configuration: defaults, TOML file, environment, and flags.
 - SigV4 authentication: header auth and presigned query auth.
@@ -10,11 +11,15 @@ This build implements milestones M0 (proxy core) and M1 (cache):
 - Read-through cache with TTL and `If-None-Match` revalidation.
 - Write-back journal with async origin sync, deletes, and tombstones.
 - Quarantine, retry with backoff, garbage collection, and LRU eviction.
+- Cluster mode with `consensus.backend = "single"`: staged writes, a `redb`
+  metadata state machine, metadata-backed reads and listing, multipart,
+  tombstones, garbage collection, and metrics.
 - Health, readiness, and Prometheus metrics endpoints.
 - `s3-sidecar check --show-config` with redacted secrets and field sources.
 
-Cluster mode is not in this build. The sidecar rejects it at startup and names
-the missing feature.
+Cluster mode supports one node in this build. The `raft` and `consul` backends
+return `consensus backend is not implemented in this build`. Peer replication
+and quorum acknowledgements are later milestones.
 
 ## Build and test
 
@@ -319,11 +324,114 @@ references.
 - evictions and tracked bytes
 - `cache_max_bytes` (`0` means unlimited) and `cache_unlimited`
 
+## Cluster mode
 
+Cluster mode stores object bytes as immutable blobs on the local backing S3
+endpoint. Metadata is the namespace. The backing S3 key space is not visible to
+clients.
+
+```toml
+mode = "cluster"
+
+[consensus]
+backend = "single"
+
+[consensus.raft]
+node_id = "a"
+peers = ["a"]
+
+[backing]
+endpoint = "http://127.0.0.1:9002"
+region = "us-east-1"
+access_key_id = "..."
+secret_access_key = "..."
+
+[cluster]
+staging_ttl = "1h"
+orphan_ttl = "24h"
+gc_interval = "60s"
+metadata_path = "./s3-sidecar-meta.redb"
+
+[[buckets]]
+name = "media"
+write_ack = "leader"
+read = "local"
+replicas = 1
+min_replicas = 1
+```
+
+Blobs live in the backing bucket `objects`:
+
+```
+objects/<uuid>
+```
+
+`cluster.metadata_path` holds the `redb` state machine. Keep this file on
+durable local storage.
+
+### Write path
+
+A PUT streams the body to `objects/<uuid>`, computes the MD5 ETag and SHA-256
+checksum, then proposes a `Commit` entry. The client receives `200` only after
+the state machine applies the entry. A rejected proposal deletes the staged
+blob. A single PUT does not create a `Pending` metadata row. `Pending` is
+reserved for in-flight multipart uploads. The upload record is the durable
+staging reference.
+
+The sidecar honors `If-None-Match: *` and `If-Match`. A failed condition returns
+`412 PreconditionFailed`, and no staged blob remains.
+
+`write_ack` accepts only `leader` in this build. `quorum` and `all` are
+validation errors. `read = "local_then_peer"` behaves as `local` until peer
+fetch exists. `read = "leader"` calls `read_index` before the metadata lookup.
+
+### Read and list path
+
+GET and HEAD resolve metadata from the applied state. A committed key with a
+local blob streams from the backing S3 endpoint and passes `Range` through.
+HEAD returns stored metadata and does not read the body.
+
+A committed key with a missing blob returns `404 NoSuchKey` with an
+`x-s3-sidecar-owner` header and a metric. Peer fetch is a later milestone. A
+tombstone or absent key returns `404 NoSuchKey`.
+
+ListObjectsV2 reads committed metadata only. It supports prefix, delimiter,
+continuation token, and max-keys. It never reads the raw backing key space.
+Staging blobs, upload records, tombstones, and non-committed rows are hidden.
+`ListBuckets`, `CopyObject`, and bucket operations that need a real bucket view
+return `NotImplemented` in cluster mode.
+
+### Multipart, delete, and garbage collection
+
+Create, upload, complete, and abort use the backing S3 multipart API. The
+sidecar upload id encodes the owner node. An upload id on the wrong node returns
+an error that names the owner node. Complete returns `200` only after the
+commit applies.
+
+DELETE proposes a tombstone. The key is invisible after apply. A missing key
+also returns `204`. The blob delete is asynchronous.
+
+The GC loop removes:
+
+- orphan `objects/<uuid>` blobs after `staging_ttl`
+- tombstones and their blobs after `orphan_ttl`
+- stuck multipart uploads after `staging_ttl`
+
+The GC loop compares the backing `objects/` listing with metadata references.
+It does not delete a blob that metadata still references.
+
+Cluster metrics include committed writes, aborted writes, commit latency,
+local read hits, missing-blob reads, tombstone count, GC deletions, applied
+index, term, and read-index calls.
+
+## Limitations
 
 - Path-style bucket addressing only.
 - One origin endpoint and one cache endpoint.
-- Cluster mode is not implemented.
+- Cluster mode supports only `consensus.backend = "single"`. The `raft` and
+  `consul` backends, peer replication, quorum acknowledgements, and
+  `local_then_peer` peer fetch are not implemented. Cluster mode uses the
+  backing bucket `objects`.
 - Multipart and CopyObject pass through to origin. The sidecar does not cache
   multipart parts.
 - No TLS listener. Put the sidecar behind a TLS terminator.
@@ -356,6 +464,11 @@ credentials, and the bucket allow-list.
 cache. It covers repeat reads, TTL revalidation, pending read-your-write,
 restart recovery, retry, quarantine, delete of a pending write, coalescing,
 cache-outage fallback, eviction, and the metrics endpoint.
+
+`tests/cluster.rs` runs single-node cluster mode against an in-process fake
+backing S3. It covers PUT, GET, HEAD, DELETE, ListObjectsV2, conditional writes,
+tombstones, restart persistence, multipart, wrong-node upload ids, leader
+reads, bucket config seeding, GC, and startup validation.
 
 `scripts/e2e-rustfs.sh` runs a real origin and the AWS CLI. It needs `rustfs`
 and the AWS CLI v2. The MinIO client `mc` is optional.
