@@ -83,7 +83,17 @@ detect_tools() {
 		MC=${MC_BIN:-mc}
 		CLI=mc
 	else
-		printf 'ERROR: set AWS_BIN or MC_BIN to create the test buckets.\n' >&2
+		printf 'ERROR: no S3 client found. Set AWS_BIN or MC_BIN, or put aws or mc on PATH.\n' >&2
+		exit 2
+	fi
+
+	if [ "$CLI" = aws ]; then
+		if ! command -v "$AWS" >/dev/null 2>&1 && [ ! -x "$AWS" ]; then
+			printf 'ERROR: cannot run the S3 client %s.\n' "$AWS" >&2
+			exit 2
+		fi
+	elif ! command -v "$MC" >/dev/null 2>&1 && [ ! -x "$MC" ]; then
+		printf 'ERROR: cannot run the S3 client %s.\n' "$MC" >&2
 		exit 2
 	fi
 
@@ -174,9 +184,38 @@ stop_pid() {
 	kill -9 "$pid" 2>/dev/null || true
 }
 
+mc_alias() {
+	local url=$1
+	if [ "$url" = "$ORIGIN" ]; then
+		printf 'bench-origin'
+	else
+		printf 'bench-cache'
+	fi
+}
+
+bucket_exists() {
+	local url=$1
+	local bucket=$2
+	if [ "$CLI" = aws ]; then
+		AWS_ACCESS_KEY_ID=$ACCESS_KEY \
+			AWS_SECRET_ACCESS_KEY=$SECRET_KEY \
+			AWS_DEFAULT_REGION=$REGION \
+			AWS_EC2_METADATA_DISABLED=true \
+			"$AWS" --endpoint-url "$url" s3api head-bucket --bucket "$bucket" >/dev/null 2>&1
+	else
+		local alias_name
+		alias_name=$(mc_alias "$url")
+		MC_CONFIG_DIR=$TMP/mc "$MC" ls "$alias_name/$bucket" >/dev/null 2>&1
+	fi
+}
+
 s3_mb() {
 	local url=$1
 	local bucket=$2
+	if bucket_exists "$url" "$bucket"; then
+		printf '==> bucket %s already exists; skip creation\n' "$bucket"
+		return 0
+	fi
 	if [ "$CLI" = aws ]; then
 		AWS_ACCESS_KEY_ID=$ACCESS_KEY \
 			AWS_SECRET_ACCESS_KEY=$SECRET_KEY \
@@ -185,11 +224,7 @@ s3_mb() {
 			"$AWS" --endpoint-url "$url" s3 mb "s3://$bucket" --only-show-errors
 	else
 		local alias_name
-		if [ "$url" = "$ORIGIN" ]; then
-			alias_name=bench-origin
-		else
-			alias_name=bench-cache
-		fi
+		alias_name=$(mc_alias "$url")
 		MC_CONFIG_DIR=$TMP/mc "$MC" mb --ignore-existing "$alias_name/$bucket" >/dev/null
 	fi
 }
