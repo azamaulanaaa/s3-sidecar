@@ -406,7 +406,17 @@ pub struct ConsensusConfig {
     pub consul: ConsulConfig,
 }
 
-/// Garbage collection and metadata settings for cluster mode.
+/// One sidecar node in the cluster directory.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterNodeConfig {
+    /// Node name.
+    pub id: String,
+    /// Base URL of the sidecar listener, for example `http://10.0.0.2:9000`.
+    pub addr: String,
+}
+
+/// Garbage collection, replication, and metadata settings for cluster mode.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClusterConfig {
@@ -418,6 +428,16 @@ pub struct ClusterConfig {
     pub gc_interval: HumanDuration,
     /// Path of the `redb` metadata file.
     pub metadata_path: String,
+    /// Shared token for internal blob transport requests.
+    pub secret: SecretString,
+    /// Store a peer blob locally while serving it.
+    pub read_repair: bool,
+    /// Number of concurrent replication workers.
+    pub replicate_workers: usize,
+    /// Interval between replica reconciliation passes.
+    pub reconcile_interval: HumanDuration,
+    /// Every sidecar node and its listener address.
+    pub nodes: Vec<ClusterNodeConfig>,
 }
 
 impl Default for ClusterConfig {
@@ -427,7 +447,23 @@ impl Default for ClusterConfig {
             orphan_ttl: HumanDuration::new(Duration::from_hours(24)),
             gc_interval: HumanDuration::new(Duration::from_secs(60)),
             metadata_path: "./s3-sidecar-meta.redb".to_owned(),
+            secret: SecretString::default(),
+            read_repair: true,
+            replicate_workers: 4,
+            reconcile_interval: HumanDuration::new(Duration::from_mins(5)),
+            nodes: Vec::new(),
         }
+    }
+}
+
+impl ClusterConfig {
+    /// Return the address of one node.
+    #[must_use]
+    pub fn node_addr(&self, id: &str) -> Option<&str> {
+        self.nodes
+            .iter()
+            .find(|node| node.id == id)
+            .map(|node| node.addr.as_str())
     }
 }
 
@@ -751,12 +787,82 @@ fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
             "cluster.gc_interval must be greater than 0",
         ));
     }
+    if config.cluster.reconcile_interval.as_duration() == Duration::ZERO {
+        return Err(ConfigError::invalid(
+            "cluster.reconcile_interval must be greater than 0",
+        ));
+    }
+    if config.cluster.replicate_workers == 0 {
+        return Err(ConfigError::invalid(
+            "cluster.replicate_workers must be greater than 0",
+        ));
+    }
+    validate_cluster_nodes(config)?;
     for bucket in &config.buckets {
         if matches!(bucket.write_ack, Some(WriteAck::Quorum | WriteAck::All)) {
             return Err(ConfigError::invalid(format!(
                 "bucket \"{}\" write_ack is not implemented in this build; use \"leader\"",
                 bucket.name
             )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_cluster_nodes(config: &Config) -> Result<(), ConfigError> {
+    let replication = config
+        .buckets
+        .iter()
+        .any(|bucket| bucket.replicas.unwrap_or(1) > 1);
+    if replication {
+        if config.cluster.nodes.is_empty() {
+            return Err(ConfigError::invalid(
+                "cluster.nodes is required when a bucket replicas value is greater than 1",
+            ));
+        }
+        if config.cluster.secret.is_empty() {
+            return Err(ConfigError::invalid(
+                "cluster.secret is required when replication is enabled",
+            ));
+        }
+    }
+    let mut ids = HashSet::new();
+    for node in &config.cluster.nodes {
+        if node.id.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "each cluster.nodes entry requires an id",
+            ));
+        }
+        if !ids.insert(node.id.clone()) {
+            return Err(ConfigError::invalid(format!(
+                "cluster node \"{}\" is configured more than one time",
+                node.id
+            )));
+        }
+        if node.addr.trim().is_empty() {
+            return Err(ConfigError::invalid(format!(
+                "cluster node \"{}\" requires an addr",
+                node.id
+            )));
+        }
+        if !is_http_url(&node.addr) {
+            return Err(ConfigError::invalid(format!(
+                "cluster node \"{}\" addr must start with http:// or https://",
+                node.id
+            )));
+        }
+    }
+    if !config.cluster.nodes.is_empty() {
+        let node_id = match config.consensus.backend {
+            ConsensusBackend::Consul => config.consensus.consul.node_id.as_str(),
+            ConsensusBackend::Raft | ConsensusBackend::Single => {
+                config.consensus.raft.node_id.as_str()
+            }
+        };
+        if !ids.contains(node_id) {
+            return Err(ConfigError::invalid(
+                "cluster.nodes must contain the local node id",
+            ));
         }
     }
     Ok(())
@@ -908,14 +1014,16 @@ fn validate_buckets(config: &Config) -> Result<(), ConfigError> {
                 bucket.name
             )));
         }
-        if let (Some(replicas), Some(min_replicas)) = (bucket.replicas, bucket.min_replicas) {
+        if let Some(replicas) = bucket.replicas {
             if replicas == 0 {
                 return Err(ConfigError::invalid(format!(
                     "bucket \"{}\" replicas must be greater than 0",
                     bucket.name
                 )));
             }
-            if min_replicas > replicas {
+            if let Some(min_replicas) = bucket.min_replicas
+                && min_replicas > replicas
+            {
                 return Err(ConfigError::invalid(format!(
                     "bucket \"{}\" min_replicas must not be greater than replicas",
                     bucket.name
@@ -1229,6 +1337,73 @@ mod tests {
         config.consensus.raft.peers = vec!["a".to_owned(), "b".to_owned()];
         let error = validate(&config).unwrap_err();
         assert!(error.to_string().contains("exactly one peer"));
+    }
+
+    fn replicated_bucket() -> BucketConfig {
+        BucketConfig {
+            name: "media".to_owned(),
+            replicas: Some(2),
+            min_replicas: Some(1),
+            ..BucketConfig::default()
+        }
+    }
+
+    #[test]
+    fn replication_requires_cluster_nodes() {
+        let mut config = cluster_base();
+        config.buckets.push(replicated_bucket());
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("cluster.nodes"));
+    }
+
+    #[test]
+    fn replication_requires_a_cluster_secret() {
+        let mut config = cluster_base();
+        config.buckets.push(replicated_bucket());
+        config.cluster.nodes = vec![ClusterNodeConfig {
+            id: "a".to_owned(),
+            addr: "http://127.0.0.1:9000".to_owned(),
+        }];
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("cluster.secret"));
+    }
+
+    #[test]
+    fn cluster_nodes_must_contain_the_local_node() {
+        let mut config = cluster_base();
+        config.cluster.nodes = vec![ClusterNodeConfig {
+            id: "b".to_owned(),
+            addr: "http://127.0.0.1:9100".to_owned(),
+        }];
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("local node id"));
+    }
+
+    #[test]
+    fn cluster_nodes_reject_duplicate_ids() {
+        let mut config = cluster_base();
+        config.cluster.nodes = vec![
+            ClusterNodeConfig {
+                id: "a".to_owned(),
+                addr: "http://127.0.0.1:9000".to_owned(),
+            },
+            ClusterNodeConfig {
+                id: "a".to_owned(),
+                addr: "http://127.0.0.1:9100".to_owned(),
+            },
+        ];
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("more than one time"));
+    }
+
+    #[test]
+    fn cluster_secret_is_redacted() {
+        let mut config = cluster_base();
+        config.cluster.secret = secret::SecretString::new("cluster-secret-value");
+        let table = show_table(&config, &SourceMap::new());
+        assert!(!table.contains("cluster-secret-value"));
+        assert!(table.contains("cluster.secret"));
+        assert!(table.contains("****"));
     }
 
     #[test]

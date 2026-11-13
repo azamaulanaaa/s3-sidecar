@@ -226,6 +226,24 @@ pub struct ConfigFlags {
     /// Path of the `redb` cluster metadata file.
     #[arg(long = "cluster-metadata-path", value_name = "PATH")]
     pub cluster_metadata_path: Option<String>,
+    /// File that contains the cluster blob transport token.
+    #[arg(long = "cluster-secret-file", value_name = "PATH")]
+    pub cluster_secret_file: Option<PathBuf>,
+    /// Read the cluster blob transport token from stdin.
+    #[arg(long = "cluster-secret-stdin")]
+    pub cluster_secret_stdin: bool,
+    /// Store a peer blob locally while serving it.
+    #[arg(long = "cluster-read-repair")]
+    pub cluster_read_repair: bool,
+    /// Number of concurrent replication workers.
+    #[arg(long = "cluster-replicate-workers", value_name = "COUNT")]
+    pub cluster_replicate_workers: Option<usize>,
+    /// Interval between replica reconciliation passes.
+    #[arg(long = "cluster-reconcile-interval", value_name = "DURATION")]
+    pub cluster_reconcile_interval: Option<String>,
+    /// Cluster nodes as a JSON array.
+    #[arg(long = "cluster-nodes-json", value_name = "JSON")]
+    pub cluster_nodes_json: Option<String>,
     /// Buckets as a JSON array.
     #[arg(long = "buckets-json", value_name = "JSON")]
     pub buckets_json: Option<String>,
@@ -254,6 +272,7 @@ impl ConfigFlags {
                 self.consensus_consul_secret_stdin,
                 StdinTarget::ConsulSecret,
             ),
+            (self.cluster_secret_stdin, StdinTarget::Cluster),
         ];
         let mut selected = targets
             .into_iter()
@@ -606,6 +625,31 @@ impl ConfigFlags {
                 Value::String(value.clone()),
             );
         }
+        if let Some(path) = &self.cluster_secret_file {
+            let secret = read_secret_file(path)?;
+            set(
+                &mut object,
+                &["cluster", "secret"],
+                Value::String(secret.expose_secret().to_owned()),
+            );
+        }
+        if self.cluster_read_repair {
+            set(&mut object, &["cluster", "read_repair"], Value::Bool(true));
+        }
+        if let Some(value) = self.cluster_replicate_workers {
+            set(&mut object, &["cluster", "replicate_workers"], json!(value));
+        }
+        if let Some(value) = &self.cluster_reconcile_interval {
+            set(
+                &mut object,
+                &["cluster", "reconcile_interval"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.cluster_nodes_json {
+            let parsed = parse_json_array("--cluster-nodes-json", value)?;
+            set(&mut object, &["cluster", "nodes"], parsed);
+        }
 
         if let Some(value) = &self.buckets_json {
             let parsed = parse_json_array("--buckets-json", value)?;
@@ -638,6 +682,7 @@ impl ConfigFlags {
                 StdinTarget::Raft => &["consensus", "raft", "secret"],
                 StdinTarget::ConsulToken => &["consensus", "consul", "token"],
                 StdinTarget::ConsulSecret => &["consensus", "consul", "secret"],
+                StdinTarget::Cluster => &["cluster", "secret"],
             };
             set(
                 &mut object,
@@ -665,6 +710,8 @@ pub enum StdinTarget {
     ConsulToken,
     /// Consul proposal token.
     ConsulSecret,
+    /// Cluster blob transport token.
+    Cluster,
 }
 
 fn parse_json_array(name: &str, value: &str) -> Result<Value, ConfigError> {
@@ -723,6 +770,7 @@ impl std::fmt::Display for StdinTarget {
             Self::Raft => f.write_str("raft"),
             Self::ConsulToken => f.write_str("consul token"),
             Self::ConsulSecret => f.write_str("consul secret"),
+            Self::Cluster => f.write_str("cluster secret"),
         }
     }
 }
@@ -735,7 +783,29 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::ConfigFlags;
+    use super::{ConfigFlags, StdinTarget};
+
+    #[test]
+    fn cluster_secret_file_flag_sets_the_token() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cluster-token");
+        fs::write(&path, "cluster-file-token\n").unwrap();
+        let flags = ConfigFlags {
+            cluster_secret_file: Some(path),
+            ..ConfigFlags::default()
+        };
+        let layer = flags.to_layer(None).unwrap();
+        assert_eq!(layer["cluster"]["secret"], "cluster-file-token");
+    }
+
+    #[test]
+    fn cluster_secret_stdin_flag_selects_the_cluster_target() {
+        let flags = ConfigFlags {
+            cluster_secret_stdin: true,
+            ..ConfigFlags::default()
+        };
+        assert_eq!(flags.stdin_target().unwrap(), Some(StdinTarget::Cluster));
+    }
 
     #[test]
     fn raft_secret_file_flag_sets_the_token() {

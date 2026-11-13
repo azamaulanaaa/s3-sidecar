@@ -285,6 +285,36 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         "cluster.metadata_path",
         config.cluster.metadata_path.clone(),
     );
+    push_row(
+        &mut rows,
+        sources,
+        "cluster.secret",
+        config.cluster.secret.redacted().to_owned(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cluster.read_repair",
+        config.cluster.read_repair.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cluster.replicate_workers",
+        config.cluster.replicate_workers.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cluster.reconcile_interval",
+        config.cluster.reconcile_interval.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "cluster.nodes",
+        serde_json::to_string(&config.cluster.nodes).unwrap_or_else(|_| "[]".to_owned()),
+    );
 
     if config.clients.is_empty() {
         push_row(&mut rows, sources, "clients", "[]".to_owned());

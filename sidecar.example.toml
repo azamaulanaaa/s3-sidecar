@@ -92,6 +92,21 @@ backend = "single"             # single | raft | consul
 # orphan_ttl = "24h"           # Age at which a tombstone and its blob are removed.
 # gc_interval = "60s"
 # metadata_path = "./s3-sidecar-meta.redb"
+# The blob transport token. Required when a bucket replicas value is greater
+# than 1. Prefer S3_SIDECAR_CLUSTER__SECRET_FILE or --cluster-secret-file.
+# secret = "replace-me"
+# read_repair = true           # Store a peer blob locally while serving it.
+# replicate_workers = 4        # Concurrent replication workers.
+# reconcile_interval = "5m"    # Replica reconciliation interval.
+# [[cluster.nodes]]            # The full node directory. Required for replication.
+# id = "a"
+# addr = "http://127.0.0.1:9000"
+# [[cluster.nodes]]
+# id = "b"
+# addr = "http://127.0.0.1:9100"
+# [[cluster.nodes]]
+# id = "c"
+# addr = "http://127.0.0.1:9200"
 
 [[clients]]
 access_key_id = "minioadmin"

@@ -309,6 +309,11 @@ fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
         "CLUSTER__ORPHAN_TTL" => (EnvKind::Text, vec!["cluster", "orphan_ttl"]),
         "CLUSTER__GC_INTERVAL" => (EnvKind::Text, vec!["cluster", "gc_interval"]),
         "CLUSTER__METADATA_PATH" => (EnvKind::Text, vec!["cluster", "metadata_path"]),
+        "CLUSTER__SECRET" => (EnvKind::Text, vec!["cluster", "secret"]),
+        "CLUSTER__READ_REPAIR" => (EnvKind::Bool, vec!["cluster", "read_repair"]),
+        "CLUSTER__REPLICATE_WORKERS" => (EnvKind::Unsigned, vec!["cluster", "replicate_workers"]),
+        "CLUSTER__RECONCILE_INTERVAL" => (EnvKind::Text, vec!["cluster", "reconcile_interval"]),
+        "CLUSTER__NODES" => (EnvKind::Json, vec!["cluster", "nodes"]),
         "CLIENTS" => (EnvKind::Json, vec!["clients"]),
         "BUCKETS" => (EnvKind::Json, vec!["buckets"]),
         _ => return None,
@@ -324,6 +329,7 @@ fn secret_env_key(key: &str) -> Option<SecretEnv> {
         "CONSENSUS__RAFT__SECRET_FILE" => vec!["consensus", "raft", "secret"],
         "CONSENSUS__CONSUL__TOKEN_FILE" => vec!["consensus", "consul", "token"],
         "CONSENSUS__CONSUL__SECRET_FILE" => vec!["consensus", "consul", "secret"],
+        "CLUSTER__SECRET_FILE" => vec!["cluster", "secret"],
         _ => return None,
     };
     Some(SecretEnv { path })
@@ -563,6 +569,33 @@ addr = "http://127.0.0.1:9000"
         assert_eq!(
             loaded.config.consensus.raft.secret.expose_secret(),
             "raft-file-secret"
+        );
+    }
+
+    #[test]
+    fn cluster_secret_file_environment_variable_is_read() {
+        let dir = tempdir().unwrap();
+        let secret_path = dir.path().join("cluster-secret");
+        std::fs::write(&secret_path, "cluster-file-secret\n").unwrap();
+        let file = r#"
+mode = "cluster"
+[backing]
+endpoint = "http://127.0.0.1:9002"
+bucket = "data"
+[consensus]
+backend = "single"
+[consensus.raft]
+node_id = "a"
+peers = ["a"]
+"#;
+        let env = vec![(
+            "S3_SIDECAR_CLUSTER__SECRET_FILE".to_owned(),
+            secret_path.display().to_string(),
+        )];
+        let loaded = load_with(dir.path(), Some(file), env, json!({})).unwrap();
+        assert_eq!(
+            loaded.config.cluster.secret.expose_secret(),
+            "cluster-file-secret"
         );
     }
 
