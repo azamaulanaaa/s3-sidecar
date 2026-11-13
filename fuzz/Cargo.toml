@@ -1,0 +1,29 @@
+[package]
+name = "s3-sidecar-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+s3-sidecar = { path = ".." }
+
+[[bin]]
+name = "sigv4"
+path = "fuzz_targets/sigv4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "s3_xml"
+path = "fuzz_targets/s3_xml.rs"
+test = false
+doc = false
+bench = false
+
+# Keep this crate out of the root workspace.
+[workspace]

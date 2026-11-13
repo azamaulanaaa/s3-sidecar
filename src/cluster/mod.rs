@@ -1942,6 +1942,24 @@ fn next_id() -> String {
     format!("{nanos:032x}{counter:016x}")
 }
 
+/// Send arbitrary text to the cluster XML parsers.
+///
+/// This function is an entry point for the fuzz target. It returns a small
+/// count that the target can discard. It does not panic.
+#[doc(hidden)]
+#[must_use]
+pub fn fuzz_s3_xml(input: &str) -> usize {
+    let objects = parse_listing(input);
+    let token = usize::from(extract_tag(input, "NextContinuationToken").is_some());
+    let upload = usize::from(extract_tag(input, "UploadId").is_some());
+    let etag = usize::from(extract_tag(input, "ETag").is_some());
+    objects
+        .len()
+        .saturating_add(token)
+        .saturating_add(upload)
+        .saturating_add(etag)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

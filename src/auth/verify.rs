@@ -1,6 +1,6 @@
 //! Verify `SigV4` header and presigned query authentication.
 
-use axum::http::{HeaderMap, Method, Uri, header::HOST};
+use axum::http::{HeaderMap, HeaderValue, Method, Uri, header::HOST};
 use time::OffsetDateTime;
 
 use super::{
@@ -491,6 +491,38 @@ fn decode(value: &str) -> String {
     percent_encoding::percent_decode_str(value)
         .decode_utf8_lossy()
         .into_owned()
+}
+
+/// Send arbitrary bytes to the `SigV4` parser and the canonical request code.
+///
+/// This function is an entry point for the fuzz target. It accepts arbitrary
+/// bytes and does not panic.
+#[doc(hidden)]
+#[must_use]
+pub fn fuzz_authorization(input: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(input);
+    let parsed = parse_authorization(&text);
+    let signed_headers = parsed.as_ref().map_or("host", |value| value.signed_headers);
+
+    let path = text.split('?').next().unwrap_or("/");
+    let target = format!("/{}", path.trim_start_matches('/'));
+    let uri: Uri = target.parse().unwrap_or_else(|_| Uri::from_static("/"));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(HOST, HeaderValue::from_static("example.com"));
+    let canonical_headers =
+        build_canonical_headers(&headers, &uri, signed_headers).unwrap_or_default();
+    let _ = build_canonical_request(
+        &Method::GET,
+        &uri,
+        &canonical_headers,
+        signed_headers,
+        "UNSIGNED-PAYLOAD",
+        None,
+    );
+    let _ = canonical_uri(path);
+    let _ = canonical_query(Some(&text), None);
+    parsed.is_ok()
 }
 
 #[cfg(test)]

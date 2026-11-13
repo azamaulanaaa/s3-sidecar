@@ -16,6 +16,8 @@ pub mod cli;
 pub mod cluster;
 pub mod config;
 pub mod errors;
+#[doc(hidden)]
+pub mod fuzz_support;
 pub mod metrics;
 pub mod observability;
 pub mod server;

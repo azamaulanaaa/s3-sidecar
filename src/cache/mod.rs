@@ -1842,6 +1842,16 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Send arbitrary text to the cache key parser.
+///
+/// This function is an entry point for the fuzz target. It returns the number
+/// of parsed keys. It does not panic.
+#[doc(hidden)]
+#[must_use]
+pub fn fuzz_s3_xml(input: &str) -> usize {
+    parse_keys(input).len()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
