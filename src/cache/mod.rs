@@ -108,7 +108,6 @@ pub struct Cache {
     jobs: Mutex<SyncJobs>,
     sync_slots: Arc<Semaphore>,
     metrics: Arc<Metrics>,
-    buckets: Vec<String>,
     started: AtomicBool,
 }
 
@@ -160,17 +159,6 @@ impl Cache {
             )),
             None => None,
         };
-        let mut buckets: Vec<String> = config
-            .buckets
-            .iter()
-            .map(|bucket| bucket.name.clone())
-            .filter(|name| !name.is_empty())
-            .collect();
-        for client in &config.clients {
-            buckets.extend(client.buckets.iter().cloned());
-        }
-        buckets.sort();
-        buckets.dedup();
 
         let max_bytes = config.cache.max_bytes.unwrap_or(0);
         metrics.cache_max_bytes.store(max_bytes, Ordering::Relaxed);
@@ -194,9 +182,14 @@ impl Cache {
                 running: HashSet::new(),
             }),
             metrics,
-            buckets,
             started: AtomicBool::new(false),
         })))
+    }
+
+    /// Return the cache bucket name.
+    #[must_use]
+    pub fn cache_bucket(&self) -> &str {
+        &self.config.cache.bucket
     }
 
     /// Return the configured cache mode.
@@ -330,7 +323,10 @@ impl Cache {
             bucket,
             key,
         );
-        let Some(response) = self.get_object(bucket, &meta_key(&cache_key), None).await? else {
+        let Some(response) = self
+            .get_object(self.cache_bucket(), &meta_key(&cache_key), None)
+            .await?
+        else {
             return Ok(None);
         };
         let body = response.bytes().await.map_err(|_| CacheError::Body)?;
@@ -355,7 +351,8 @@ impl Cache {
             bucket,
             key,
         );
-        self.get_object(bucket, &cache_key, range).await
+        self.get_object(self.cache_bucket(), &cache_key, range)
+            .await
     }
 
     /// Store updated metadata for an entry.
@@ -375,7 +372,7 @@ impl Cache {
             bucket,
             key,
         );
-        self.put_meta(bucket, &cache_key, meta).await
+        self.put_meta(self.cache_bucket(), &cache_key, meta).await
     }
 
     /// Update the LRU access time for an entry.
@@ -399,10 +396,10 @@ impl Cache {
     /// # Errors
     ///
     /// Returns an error when the cache endpoint is not available.
-    pub async fn probe(&self, bucket: &str) -> Result<(), CacheError> {
+    pub async fn probe(&self) -> Result<(), CacheError> {
         let request = ForwardRequest {
             method: Method::HEAD,
-            path_and_query: object_path(bucket, ""),
+            path_and_query: object_path(self.cache_bucket(), ""),
             headers: HeaderMap::new(),
             body: None,
             content_length: None,
@@ -436,10 +433,13 @@ impl Cache {
             bucket,
             key,
         );
-        if let Err(error) = self.delete_object(bucket, &meta_key(&cache_key)).await {
+        if let Err(error) = self
+            .delete_object(self.cache_bucket(), &meta_key(&cache_key))
+            .await
+        {
             warn!(%error, "cache metadata delete failed");
         }
-        if let Err(error) = self.delete_object(bucket, &cache_key).await {
+        if let Err(error) = self.delete_object(self.cache_bucket(), &cache_key).await {
             warn!(%error, "cache blob delete failed");
         }
         self.index_remove(&cache_key);
@@ -486,7 +486,7 @@ impl Cache {
         meta.state = EntryState::Pending;
         let hashes = self
             .put_blob_stream(
-                bucket,
+                self.cache_bucket(),
                 &cache_key,
                 body,
                 Some(length),
@@ -502,18 +502,23 @@ impl Cache {
             &self.config.cache.node_id,
             &journal.id,
         );
-        if let Err(error) = self.put_journal(bucket, &journal_key, &journal).await {
-            let _ = self.delete_object(bucket, &cache_key).await;
+        if let Err(error) = self
+            .put_journal(self.cache_bucket(), &journal_key, &journal)
+            .await
+        {
+            let _ = self.delete_object(self.cache_bucket(), &cache_key).await;
             return Err(error);
         }
-        if let Err(error) = self.put_meta(bucket, &cache_key, &meta).await {
-            let _ = self.delete_object(bucket, &journal_key).await;
-            let _ = self.delete_object(bucket, &cache_key).await;
+        if let Err(error) = self.put_meta(self.cache_bucket(), &cache_key, &meta).await {
+            let _ = self.delete_object(self.cache_bucket(), &journal_key).await;
+            let _ = self.delete_object(self.cache_bucket(), &cache_key).await;
             return Err(error);
         }
         let previous = lock(&self.pending).remove(&(bucket.to_owned(), key.to_owned()));
         if let Some(previous) = previous {
-            let _ = self.delete_object(bucket, &previous.journal_key).await;
+            let _ = self
+                .delete_object(self.cache_bucket(), &previous.journal_key)
+                .await;
         }
         lock(&self.pending).insert(
             (bucket.to_owned(), key.to_owned()),
@@ -541,10 +546,13 @@ impl Cache {
         );
         let pending = lock(&self.pending).remove(&(bucket.to_owned(), key.to_owned()));
         if let Some(entry) = pending {
-            self.delete_object(bucket, &entry.journal_key).await?;
+            self.delete_object(self.cache_bucket(), &entry.journal_key)
+                .await?;
         }
-        let _ = self.delete_object(bucket, &meta_key(&cache_key)).await;
-        let _ = self.delete_object(bucket, &cache_key).await;
+        let _ = self
+            .delete_object(self.cache_bucket(), &meta_key(&cache_key))
+            .await;
+        let _ = self.delete_object(self.cache_bucket(), &cache_key).await;
         self.index_remove(&cache_key);
         lock(&self.tombstones).insert((bucket.to_owned(), key.to_owned()), unix_now());
         Ok(())
@@ -563,8 +571,10 @@ impl Cache {
             bucket,
             key,
         );
-        let _ = self.delete_object(bucket, &meta_key(&cache_key)).await;
-        let _ = self.delete_object(bucket, &cache_key).await;
+        let _ = self
+            .delete_object(self.cache_bucket(), &meta_key(&cache_key))
+            .await;
+        let _ = self.delete_object(self.cache_bucket(), &cache_key).await;
         self.index_remove(&cache_key);
         lock(&self.pending).remove(&(bucket.to_owned(), key.to_owned()));
         let journal = JournalEntry::delete(id, bucket, key, cache_key, unix_now());
@@ -573,7 +583,8 @@ impl Cache {
             &self.config.cache.node_id,
             &journal.id,
         );
-        self.put_journal(bucket, &journal_key, &journal).await?;
+        self.put_journal(self.cache_bucket(), &journal_key, &journal)
+            .await?;
         lock(&self.tombstones).insert((bucket.to_owned(), key.to_owned()), unix_now());
         self.enqueue((bucket.to_owned(), key.to_owned()), journal);
         Ok(())
@@ -593,14 +604,20 @@ impl Cache {
         let max_object_bytes = self.max_object_bytes();
         let expected = meta.size;
         let meta_writer = meta.clone();
-        let bucket = meta.origin_bucket.clone();
-        let key = meta.origin_key.clone();
+        let origin_bucket = meta.origin_bucket.clone();
+        let origin_key = meta.origin_key.clone();
+        let cache_key_value = blob_key(
+            &self.config.cache.prefix,
+            &self.config.cache.node_id,
+            &origin_bucket,
+            &origin_key,
+        );
         tokio::spawn(async move {
             let body = receiver_stream(receiver);
             match cache
                 .put_blob_stream(
-                    &bucket,
-                    &meta_writer_key(&cache, &bucket, &key),
+                    cache.cache_bucket(),
+                    &cache_key_value,
                     body,
                     Some(meta_writer.size),
                     None,
@@ -610,7 +627,7 @@ impl Cache {
                 Ok(hashes) => {
                     if !completed_writer.load(Ordering::Acquire) {
                         let _ = cache
-                            .delete_object(&bucket, &meta_writer_key(&cache, &bucket, &key))
+                            .delete_object(cache.cache_bucket(), &cache_key_value)
                             .await;
                         return;
                     }
@@ -619,15 +636,12 @@ impl Cache {
                     stored.checksum = hashes.sha256;
                     stored.etag = format!("\"{}\"", hashes.md5);
                     if let Err(error) = cache
-                        .put_meta(&bucket, &stored_cache_key(&cache, &bucket, &key), &stored)
+                        .put_meta(cache.cache_bucket(), &cache_key_value, &stored)
                         .await
                     {
                         warn!(%error, "cache metadata write failed");
                     }
-                    if let Err(error) = cache
-                        .index_upsert(&cache_key(&cache, &bucket, &key), &stored)
-                        .await
-                    {
+                    if let Err(error) = cache.index_upsert(&cache_key_value, &stored).await {
                         warn!(%error, "cache index update failed");
                     }
                 }
@@ -691,10 +705,8 @@ impl Cache {
     ///
     /// Returns an error when the cache listing fails.
     pub async fn gc_once(&self) -> Result<(), CacheError> {
-        for bucket in self.buckets.clone() {
-            self.gc_bucket(&bucket).await?;
-        }
-        Ok(())
+        let bucket = self.cache_bucket().to_owned();
+        self.gc_bucket(&bucket).await
     }
 
     async fn gc_bucket(&self, bucket: &str) -> Result<(), CacheError> {
@@ -777,50 +789,49 @@ impl Cache {
     }
 
     async fn recover(self: &Arc<Self>) -> Result<(), CacheError> {
-        for bucket in self.buckets.clone() {
-            let prefix = journal_prefix(&self.config.cache.prefix, &self.config.cache.node_id);
-            let keys = match self.list_keys(&bucket, &prefix).await {
-                Ok(keys) => keys,
-                Err(error) => {
-                    warn!(bucket, %error, "cannot scan the cache journal");
-                    continue;
-                }
+        let bucket = self.cache_bucket().to_owned();
+        let prefix = journal_prefix(&self.config.cache.prefix, &self.config.cache.node_id);
+        let keys = match self.list_keys(&bucket, &prefix).await {
+            Ok(keys) => keys,
+            Err(error) => {
+                warn!(%error, "cannot scan the cache journal");
+                return Ok(());
+            }
+        };
+        let mut by_key: HashMap<CacheKey, JournalEntry> = HashMap::new();
+        for object in &keys {
+            let Some(response) = self.get_object(&bucket, object, None).await? else {
+                continue;
             };
-            let mut by_key: HashMap<CacheKey, JournalEntry> = HashMap::new();
-            for object in &keys {
-                let Some(response) = self.get_object(&bucket, object, None).await? else {
-                    continue;
-                };
-                let body = response.bytes().await.map_err(|_| CacheError::Body)?;
-                let Ok(entry) = serde_json::from_slice::<JournalEntry>(&body) else {
-                    warn!(bucket, key = %object, "skipping invalid journal record");
-                    continue;
-                };
-                let cache_key = (entry.bucket.clone(), entry.key.clone());
-                let replace = by_key.get(&cache_key).is_none_or(|current| {
-                    (entry.created_at, &entry.id) > (current.created_at, &current.id)
-                });
-                if replace {
-                    if let Some(previous) = by_key.insert(cache_key, entry) {
-                        let stale = journal_key(
-                            &self.config.cache.prefix,
-                            &self.config.cache.node_id,
-                            &previous.id,
-                        );
-                        let _ = self.delete_object(&bucket, &stale).await;
-                    }
-                } else {
+            let body = response.bytes().await.map_err(|_| CacheError::Body)?;
+            let Ok(entry) = serde_json::from_slice::<JournalEntry>(&body) else {
+                warn!(key = %object, "skipping invalid journal record");
+                continue;
+            };
+            let cache_key = (entry.bucket.clone(), entry.key.clone());
+            let replace = by_key.get(&cache_key).is_none_or(|current| {
+                (entry.created_at, &entry.id) > (current.created_at, &current.id)
+            });
+            if replace {
+                if let Some(previous) = by_key.insert(cache_key, entry) {
                     let stale = journal_key(
                         &self.config.cache.prefix,
                         &self.config.cache.node_id,
-                        &entry.id,
+                        &previous.id,
                     );
                     let _ = self.delete_object(&bucket, &stale).await;
                 }
+            } else {
+                let stale = journal_key(
+                    &self.config.cache.prefix,
+                    &self.config.cache.node_id,
+                    &entry.id,
+                );
+                let _ = self.delete_object(&bucket, &stale).await;
             }
-            for (cache_key, entry) in by_key {
-                self.restore_entry(&bucket, cache_key, entry).await;
-            }
+        }
+        for (cache_key, entry) in by_key {
+            self.restore_entry(&bucket, cache_key, entry).await;
         }
         Ok(())
     }
@@ -938,7 +949,7 @@ impl Cache {
                 &self.config.cache.node_id,
                 &entry.id,
             );
-            let _ = self.delete_object(&entry.bucket, &path).await;
+            let _ = self.delete_object(self.cache_bucket(), &path).await;
             return;
         }
         let max_attempts = self.config.cache.sync_max_attempts;
@@ -962,7 +973,7 @@ impl Cache {
                             &self.config.cache.node_id,
                             &current.id,
                         );
-                        let _ = self.put_journal(&current.bucket, &path, &current).await;
+                        let _ = self.put_journal(self.cache_bucket(), &path, &current).await;
                         self.sleep_backoff(current.attempts).await;
                         continue;
                     }
@@ -1001,13 +1012,13 @@ impl Cache {
                 .flatten()
                 .unwrap_or_else(|| metadata_from_journal(entry));
             meta.mark_synced(etag.unwrap_or_else(|| entry.etag.clone()), unix_now());
-            let _ = self.put_meta(bucket, &cache_key, &meta).await;
+            let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
             let _ = self.index_upsert(&cache_key, &meta).await;
             lock(&self.pending).remove(&(bucket.clone(), entry.key.clone()));
         } else {
             lock(&self.tombstones).remove(&(entry.bucket.clone(), entry.key.clone()));
         }
-        let _ = self.delete_object(&entry.bucket, &path).await;
+        let _ = self.delete_object(self.cache_bucket(), &path).await;
         self.metrics.synced();
         info!(
             bucket = %entry.bucket,
@@ -1024,7 +1035,7 @@ impl Cache {
         );
         let mut failed = entry.clone();
         failed.state = EntryState::Failed;
-        let _ = self.put_journal(&entry.bucket, &path, &failed).await;
+        let _ = self.put_journal(self.cache_bucket(), &path, &failed).await;
         if entry.kind == JournalKind::Put {
             let cache_key = blob_key(
                 &self.config.cache.prefix,
@@ -1034,7 +1045,7 @@ impl Cache {
             );
             if let Ok(Some(mut meta)) = self.read_meta(&entry.bucket, &entry.key).await {
                 meta.mark_failed();
-                let _ = self.put_meta(&entry.bucket, &cache_key, &meta).await;
+                let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
                 self.index_remove(&cache_key);
             }
             lock(&self.pending).remove(&(entry.bucket.clone(), entry.key.clone()));
@@ -1487,9 +1498,9 @@ impl Cache {
         };
         for (cache_key, entry) in evicted {
             let _ = self
-                .delete_object(&entry.origin_bucket, &meta_key(&cache_key))
+                .delete_object(self.cache_bucket(), &meta_key(&cache_key))
                 .await;
-            let _ = self.delete_object(&entry.origin_bucket, &cache_key).await;
+            let _ = self.delete_object(self.cache_bucket(), &cache_key).await;
             info!(
                 bucket = %entry.origin_bucket,
                 key = %entry.origin_key,
@@ -1517,37 +1528,36 @@ impl Cache {
             }
         }
         let mut entries = Vec::new();
-        for bucket in self.buckets.clone() {
-            let prefix = node_prefix(&self.config.cache.prefix, &self.config.cache.node_id);
-            let Ok(keys) = self.list_keys(&bucket, &prefix).await else {
+        let bucket = self.cache_bucket().to_owned();
+        let prefix = node_prefix(&self.config.cache.prefix, &self.config.cache.node_id);
+        let Ok(keys) = self.list_keys(&bucket, &prefix).await else {
+            return;
+        };
+        for key in keys {
+            if !is_meta_key(&key) {
+                continue;
+            }
+            let blob = key.trim_end_matches(".meta");
+            let Ok(Some(response)) = self.get_object(&bucket, &key, None).await else {
                 continue;
             };
-            for key in keys {
-                if !is_meta_key(&key) {
-                    continue;
-                }
-                let blob = key.trim_end_matches(".meta");
-                let Ok(Some(response)) = self.get_object(&bucket, &key, None).await else {
-                    continue;
-                };
-                let Ok(body) = response.bytes().await else {
-                    continue;
-                };
-                let Ok(meta) = serde_json::from_slice::<CacheMetadata>(&body) else {
-                    continue;
-                };
-                entries.push((
-                    blob.to_owned(),
-                    IndexEntry {
-                        origin_bucket: meta.origin_bucket.clone(),
-                        origin_key: meta.origin_key.clone(),
-                        size: meta.size,
-                        last_access: meta.validated_at,
-                        validated_at: meta.validated_at,
-                        state: meta.state,
-                    },
-                ));
-            }
+            let Ok(body) = response.bytes().await else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_slice::<CacheMetadata>(&body) else {
+                continue;
+            };
+            entries.push((
+                blob.to_owned(),
+                IndexEntry {
+                    origin_bucket: meta.origin_bucket.clone(),
+                    origin_key: meta.origin_key.clone(),
+                    size: meta.size,
+                    last_access: meta.validated_at,
+                    validated_at: meta.validated_at,
+                    state: meta.state,
+                },
+            ));
         }
         let index = lock(index);
         if let Err(error) = index.rebuild(entries) {
@@ -1755,24 +1765,6 @@ fn watermark(max_bytes: u64, fraction: f64) -> u64 {
     // result exact enough for the threshold.
     let scaled = (clamped * 1_000_000.0).round() as u64;
     u64::try_from((u128::from(max_bytes) * u128::from(scaled)) / 1_000_000).unwrap_or(max_bytes)
-}
-
-// Helpers keep the tee closure free of repeated key construction.
-fn cache_key(cache: &Cache, bucket: &str, key: &str) -> String {
-    blob_key(
-        &cache.config.cache.prefix,
-        &cache.config.cache.node_id,
-        bucket,
-        key,
-    )
-}
-
-fn stored_cache_key(cache: &Cache, bucket: &str, key: &str) -> String {
-    cache_key(cache, bucket, key)
-}
-
-fn meta_writer_key(cache: &Cache, bucket: &str, key: &str) -> String {
-    cache_key(cache, bucket, key)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

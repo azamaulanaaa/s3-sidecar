@@ -816,7 +816,7 @@ async fn write_put(
         return Ok(response);
     }
 
-    if let Err(error) = cache.probe(bucket).await {
+    if let Err(error) = cache.probe().await {
         if cache.on_cache_error() == crate::config::OnCacheError::Origin {
             state.metrics.fallback();
             warn!(%error, "cache probe failed; writing to origin");

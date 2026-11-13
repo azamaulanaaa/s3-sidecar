@@ -59,6 +59,12 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
     push_row(
         &mut rows,
         sources,
+        "cache.bucket",
+        config.cache.bucket.clone(),
+    );
+    push_row(
+        &mut rows,
+        sources,
         "cache.prefix",
         config.cache.prefix.clone(),
     );

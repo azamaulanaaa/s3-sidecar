@@ -97,6 +97,9 @@ pub struct ConfigFlags {
     /// Use path-style cache bucket addresses.
     #[arg(long = "cache-force-path-style")]
     pub cache_force_path_style: bool,
+    /// Cache S3 bucket. All cache objects and journal entries live here.
+    #[arg(long = "cache-bucket", value_name = "BUCKET")]
+    pub cache_bucket: Option<String>,
     /// Cache key prefix for this node.
     #[arg(long = "cache-prefix", value_name = "PREFIX")]
     pub cache_prefix: Option<String>,
@@ -312,6 +315,13 @@ impl ConfigFlags {
             set(
                 &mut object,
                 &["cache", "prefix"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.cache_bucket {
+            set(
+                &mut object,
+                &["cache", "bucket"],
                 Value::String(value.clone()),
             );
         }

@@ -23,6 +23,7 @@ region = "us-east-1"
 access_key_id = "minioadmin"
 secret_access_key = "minioadmin"
 # force_path_style = true
+bucket = "s3-sidecar-cache"
 prefix = "cache"
 node_id = "node-a"
 mode = "read_write"            # off | read | write | read_write

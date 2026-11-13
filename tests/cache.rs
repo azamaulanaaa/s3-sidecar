@@ -459,6 +459,7 @@ fn config(
             secret_access_key: SecretString::new("cache-secret"),
             session_token: None,
             force_path_style: true,
+            bucket: "cachebucket".to_owned(),
             prefix: "cache".to_owned(),
             node_id: "node-a".to_owned(),
             mode: cache_mode,
@@ -747,17 +748,17 @@ async fn crash_after_ack_resumes_on_restart() {
         created_at: now,
     };
     let entry = JournalEntry::put("crash-id".to_owned(), blob.clone(), &meta);
-    seed_cache(&cache_url, "media", &blob, body).await;
+    seed_cache(&cache_url, "cachebucket", &blob, body).await;
     seed_cache(
         &cache_url,
-        "media",
+        "cachebucket",
         &format!("{blob}.meta"),
         serde_json::to_string(&meta).unwrap().as_bytes(),
     )
     .await;
     seed_cache(
         &cache_url,
-        "media",
+        "cachebucket",
         &journal,
         serde_json::to_string(&entry).unwrap().as_bytes(),
     )

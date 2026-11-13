@@ -263,6 +263,7 @@ fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
         "CACHE__SESSION_TOKEN" => (EnvKind::Text, vec!["cache", "session_token"]),
         "CACHE__FORCE_PATH_STYLE" => (EnvKind::Bool, vec!["cache", "force_path_style"]),
         "CACHE__PREFIX" => (EnvKind::Text, vec!["cache", "prefix"]),
+        "CACHE__BUCKET" => (EnvKind::Text, vec!["cache", "bucket"]),
         "CACHE__NODE_ID" => (EnvKind::Text, vec!["cache", "node_id"]),
         "CACHE__MODE" => (EnvKind::Text, vec!["cache", "mode"]),
         "CACHE__MAX_BYTES" => (EnvKind::Unsigned, vec!["cache", "max_bytes"]),

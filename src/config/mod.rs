@@ -233,6 +233,8 @@ pub struct CacheConfig {
     pub session_token: Option<SecretString>,
     /// Use path-style bucket addresses for the cache.
     pub force_path_style: bool,
+    /// Cache S3 bucket. All blobs, metadata, and journal entries live here.
+    pub bucket: String,
     /// Key prefix for this node.
     pub prefix: String,
     /// Name of this sidecar node. It is part of the cache key and journal path.
@@ -281,6 +283,7 @@ impl Default for CacheConfig {
             secret_access_key: SecretString::default(),
             session_token: None,
             force_path_style: false,
+            bucket: String::new(),
             prefix: "cache".to_owned(),
             node_id: "node".to_owned(),
             mode: CacheMode::Off,
@@ -528,6 +531,11 @@ fn validate_cache(config: &Config, warnings: &mut Vec<String>) -> Result<(), Con
         ));
     }
     if config.cache.mode != CacheMode::Off {
+        if config.cache.bucket.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "cache.bucket is required when cache.mode is not \"off\"",
+            ));
+        }
         if config.cache.node_id.trim().is_empty() {
             return Err(ConfigError::invalid(
                 "cache.node_id must not be empty when cache.mode is not \"off\"",
@@ -711,8 +719,19 @@ mod tests {
         let mut config = base();
         config.cache.mode = CacheMode::Read;
         config.cache.endpoint = "http://127.0.0.1:9002".to_owned();
+        config.cache.bucket = "cache".to_owned();
         config.cache.max_bytes = Some(0);
         assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn cache_mode_requires_a_cache_bucket() {
+        let mut config = base();
+        config.cache.mode = CacheMode::Read;
+        config.cache.endpoint = "http://127.0.0.1:9002".to_owned();
+        config.cache.max_bytes = Some(0);
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("cache.bucket is required"));
     }
 
     #[test]
@@ -720,6 +739,7 @@ mod tests {
         let mut config = base();
         config.cache.mode = CacheMode::Read;
         config.cache.endpoint = "http://127.0.0.1:9002".to_owned();
+        config.cache.bucket = "cache".to_owned();
         config.cache.max_bytes = Some(100);
         config.cache.low_watermark = 0.95;
         config.cache.high_watermark = 0.9;
