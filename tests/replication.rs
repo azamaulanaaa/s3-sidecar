@@ -562,6 +562,45 @@ async fn write_copies_blob_and_reads_use_local_or_peer() {
 }
 
 #[tokio::test]
+async fn reconcile_restores_a_missing_owner_blob() {
+    let cluster = spawn_cluster(ReadMode::Local, 2, false).await;
+    let client = client_request();
+    let url = format!("{}/media/reconcile-owner", cluster.node("a").url);
+    assert_eq!(
+        put(&client, &url, b"owner-repair").await.status(),
+        StatusCode::OK
+    );
+    wait_metadata(&cluster, "reconcile-owner", Duration::from_secs(10)).await;
+    let before = metadata(&cluster, "a", "reconcile-owner");
+    let blob = before.blob.clone();
+    for replica in &before.replicas {
+        wait_present(
+            &cluster.node(replica).backing,
+            &blob,
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+    wait_queue_empty(&cluster, Duration::from_secs(10)).await;
+
+    cluster.node("a").backing.remove(&blob);
+    assert!(!cluster.node("a").backing.has(&blob));
+    cluster
+        .node("a")
+        .state
+        .cluster()
+        .unwrap()
+        .reconcile_once()
+        .await
+        .unwrap();
+    wait_present(&cluster.node("a").backing, &blob, Duration::from_secs(10)).await;
+
+    let after = metadata(&cluster, "a", "reconcile-owner");
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.replicas, before.replicas);
+}
+
+#[tokio::test]
 async fn read_repair_stores_the_blob_when_enabled() {
     let cluster = spawn_cluster(ReadMode::LocalThenPeer, 2, true).await;
     let client = client_request();
