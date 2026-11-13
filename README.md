@@ -60,6 +60,7 @@ endpoint = "http://127.0.0.1:9002"
 region = "us-east-1"
 access_key_id = "minioadmin"
 secret_access_key = "minioadmin"
+bucket = "s3-sidecar-cache"
 prefix = "cache"
 node_id = "node-a"
 mode = "read_write"
@@ -171,15 +172,18 @@ Do not use it without TLS.
 ## Cache mode
 
 The cache is a second S3 endpoint. Use a different endpoint, region, or
-provider from origin. The cache bucket name must match the origin bucket name.
-The sidecar stores cache objects under this path:
+provider from origin. Set `cache.bucket` to one bucket on the cache endpoint.
+All cache blobs, metadata, and journal entries live in that bucket. The
+`<bucket-hash>` path segment scopes origin buckets, so one cache bucket serves
+every origin bucket. The sidecar stores cache objects under this path:
 
 ```
-<prefix>/<node-id>/<sha256(bucket)>/<sha256(key)>
-<prefix>/<node-id>/<sha256(bucket)>/<sha256(key)>.meta
+<prefix>/<node-id>/<bucket-hash>/<sha256(key)>
+<prefix>/<node-id>/<bucket-hash>/<sha256(key)>.meta
 <prefix>/journal/<node-id>/<uuid>.json
 ```
 
+`cache.bucket` is required when `cache.mode` is not `off`.
 `cache.prefix` defaults to `cache`. Set `cache.node_id` to a stable name for
 each sidecar. The node id is part of the key and the journal path. Sidecars do
 not process each other's journals.
@@ -249,6 +253,25 @@ Pending writes and tombstones are visible only on the sidecar that accepted
 them. Another sidecar sees the write after sync completes. This is a property
 of write-back mode.
 
+### Write-through
+
+`write_policy = "write_through"` sends the client body to origin and the cache
+at the same time. The sidecar reads the body one time. No second origin `GET`
+is used.
+
+The cache entry becomes synced only after origin returns success. If origin
+fails, the sidecar deletes the cache object. If the cache write fails, origin
+still receives the object and the client still receives success. The sidecar
+deletes a partial cache object.
+
+### Delete
+
+A successful delete returns `204`. In `write` and `read_write` modes the
+sidecar removes the cache object and writes a tombstone journal record before
+it returns. A delete of a pending write makes no origin call. A tombstone hides
+the key from reads. In `read` mode and `off` mode the delete goes to origin
+first.
+
 ### Failure policy
 
 The sync worker retries `5xx`, timeouts, and throttling with exponential
@@ -260,7 +283,7 @@ logs a warning. A read of a quarantined entry returns `404` unless
 `cache.serve_quarantined = true`.
 
 The default conflict policy is last-write-wins. Origin receives the latest
-body.
+body. There is no conflict knob in M1. This is a documented limitation.
 
 If the cache is down, `cache.on_cache_error = "origin"` sends the write to
 origin and returns success. `"fail"` returns an error.
