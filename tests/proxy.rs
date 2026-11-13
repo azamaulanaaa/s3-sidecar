@@ -182,6 +182,7 @@ fn config(origin: String) -> Config {
 
 async fn spawn_sidecar(origin: String) -> (String, Arc<AppState>) {
     let state = Arc::new(AppState::new(config(origin)).unwrap());
+    state.start().await.unwrap();
     state.set_ready(true);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address: SocketAddr = listener.local_addr().unwrap();
