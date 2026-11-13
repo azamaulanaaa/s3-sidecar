@@ -689,16 +689,6 @@ impl Cache {
         Box::pin(stream)
     }
 
-    /// Start a background fill from origin after a write-through.
-    pub fn spawn_fill_from_origin(self: &Arc<Self>, bucket: String, key: String) {
-        let cache = Arc::clone(self);
-        tokio::spawn(async move {
-            if let Err(error) = cache.fill_from_origin(&bucket, &key).await {
-                warn!(%error, bucket, key, "write-through cache fill failed");
-            }
-        });
-    }
-
     /// Run one garbage collection pass.
     ///
     /// # Errors
@@ -1147,46 +1137,95 @@ impl Cache {
         ))
     }
 
-    async fn fill_from_origin(self: &Arc<Self>, bucket: &str, key: &str) -> Result<(), CacheError> {
-        let request = ForwardRequest {
-            method: Method::GET,
-            path_and_query: object_path(bucket, key),
-            headers: HeaderMap::new(),
-            body: None,
-            content_length: None,
-        };
-        let response = self
-            .origin
-            .execute(&self.origin_credential, request)
-            .await
-            .map_err(|error| CacheError::Index(format!("origin request failed: {error}")))?;
-        if !response.status().is_success() {
-            return Err(CacheError::Status(response.status().as_u16()));
-        }
-        let meta = metadata_from_response(bucket, key, &response);
-        if meta.size > self.max_object_bytes() {
-            return Ok(());
-        }
+    /// Write a client body to the cache for a write-through request.
+    ///
+    /// The caller must call [`Self::commit_synced_blob`] only after origin
+    /// accepts the object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache write fails.
+    pub async fn write_blob_from_receiver(
+        &self,
+        origin_bucket: &str,
+        origin_key: &str,
+        receiver: mpsc::Receiver<Result<Bytes, io::Error>>,
+        length: Option<u64>,
+    ) -> Result<StoredBlob, CacheError> {
         let cache_key = blob_key(
             &self.config.cache.prefix,
             &self.config.cache.node_id,
-            bucket,
-            key,
+            origin_bucket,
+            origin_key,
         );
-        let body: BodyStream = Box::pin(
-            response
-                .bytes_stream()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string())),
-        );
+        let body = receiver_stream(receiver);
         let hashes = self
-            .put_blob_stream(bucket, &cache_key, body, Some(meta.size), None)
+            .put_blob_stream(self.cache_bucket(), &cache_key, body, length, None)
             .await?;
-        let mut stored = meta;
-        stored.size = hashes.size;
-        stored.checksum = hashes.sha256;
-        stored.etag = format!("\"{}\"", hashes.md5);
-        self.put_meta(bucket, &cache_key, &stored).await?;
-        self.index_upsert(&cache_key, &stored).await
+        Ok(StoredBlob {
+            cache_key,
+            size: hashes.size,
+            checksum: hashes.sha256,
+            md5: hashes.md5,
+        })
+    }
+
+    /// Mark a write-through blob as synced after origin accepted it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the metadata or index write fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_synced_blob(
+        self: &Arc<Self>,
+        origin_bucket: &str,
+        origin_key: &str,
+        blob: &StoredBlob,
+        etag: Option<String>,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+    ) -> Result<(), CacheError> {
+        let etag = etag.unwrap_or_else(|| format!("\"{}\"", blob.md5));
+        let mut meta = CacheMetadata::synced(
+            origin_bucket,
+            origin_key,
+            etag,
+            None,
+            blob.size,
+            content_type,
+            content_encoding,
+            unix_now(),
+        );
+        meta.checksum.clone_from(&blob.checksum);
+        self.put_meta(self.cache_bucket(), &blob.cache_key, &meta)
+            .await?;
+        let key = (origin_bucket.to_owned(), origin_key.to_owned());
+        let previous = {
+            let mut pending = lock(&self.pending);
+            pending.remove(&key)
+        };
+        if let Some(previous) = previous {
+            let _ = self
+                .delete_object(self.cache_bucket(), &previous.journal_key)
+                .await;
+        }
+        lock(&self.tombstones).remove(&key);
+        self.index_upsert(&blob.cache_key, &meta).await
+    }
+
+    /// Delete a best-effort cache blob for a failed write-through.
+    pub async fn discard_blob(&self, origin_bucket: &str, origin_key: &str) {
+        let cache_key = blob_key(
+            &self.config.cache.prefix,
+            &self.config.cache.node_id,
+            origin_bucket,
+            origin_key,
+        );
+        let _ = self
+            .delete_object(self.cache_bucket(), &meta_key(&cache_key))
+            .await;
+        let _ = self.delete_object(self.cache_bucket(), &cache_key).await;
+        self.index_remove(&cache_key);
     }
 
     async fn put_journal(
@@ -1594,6 +1633,14 @@ impl SyncFailure {
             retryable,
         }
     }
+}
+
+/// A blob written to the cache for a write-through request.
+pub struct StoredBlob {
+    cache_key: String,
+    size: u64,
+    checksum: String,
+    md5: String,
 }
 
 struct HashResult {

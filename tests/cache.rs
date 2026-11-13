@@ -56,6 +56,7 @@ struct OriginState {
 #[derive(Clone)]
 struct CacheState {
     objects: Arc<Mutex<HashMap<String, Stored>>>,
+    put_status: Arc<Mutex<Option<StatusCode>>>,
 }
 
 #[derive(Clone)]
@@ -69,6 +70,7 @@ struct OriginHandle {
 #[derive(Clone)]
 struct CacheHandle {
     objects: Arc<Mutex<HashMap<String, Stored>>>,
+    put_status: Arc<Mutex<Option<StatusCode>>>,
 }
 
 impl OriginHandle {
@@ -121,6 +123,10 @@ impl CacheHandle {
 
     fn has(&self, key: &str) -> bool {
         self.objects.lock().unwrap().contains_key(key)
+    }
+
+    fn fail_puts(&self) {
+        *self.put_status.lock().unwrap() = Some(StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
 
@@ -268,16 +274,25 @@ async fn spawn_cache() -> (String, CacheHandle) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let objects = Arc::new(Mutex::new(HashMap::new()));
+    let put_status = Arc::new(Mutex::new(None));
     let state = CacheState {
         objects: Arc::clone(&objects),
+        put_status: Arc::clone(&put_status),
     };
     let app = Router::new().fallback(cache_handler).with_state(state);
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (format!("http://{address}"), CacheHandle { objects })
+    (
+        format!("http://{address}"),
+        CacheHandle {
+            objects,
+            put_status,
+        },
+    )
 }
 
+#[allow(clippy::too_many_lines)]
 async fn cache_handler(
     State(state): State<CacheState>,
     method: Method,
@@ -350,6 +365,9 @@ async fn cache_handler(
             response
         }
         Method::PUT => {
+            if let Some(status) = *state.put_status.lock().unwrap() {
+                return xml(status, "<Error><Code>InternalError</Code></Error>");
+            }
             let etag = format!("\"{}\"", body.len());
             let stored = Stored {
                 body,
@@ -1180,6 +1198,124 @@ async fn read_mode_put_invalidates_the_cache() {
     .unwrap();
     assert_eq!(body_text(second).await, "new");
     assert_eq!(origin.get_count(), 2);
+}
+
+#[tokio::test]
+async fn write_through_tees_to_cache_without_origin_get() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteThrough,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/through", sidecar.url),
+        Some(b"through body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_eq!(origin.body("media/through").unwrap(), b"through body");
+    let blob = blob_key("cache", "node-a", "media", "through");
+    wait_for(Duration::from_secs(2), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { cache.has(&blob) && cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/through", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(body_text(get).await, "through body");
+    assert_eq!(origin.get_count(), 0);
+}
+
+#[tokio::test]
+async fn write_through_cache_failure_still_writes_origin() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, cache) = spawn_cache().await;
+    cache.fail_puts();
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteThrough,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/cache-down", sidecar.url),
+        Some(b"origin body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_eq!(origin.body("media/cache-down").unwrap(), b"origin body");
+    let blob = blob_key("cache", "node-a", "media", "cache-down");
+    assert!(!cache.has(&blob));
+}
+
+#[tokio::test]
+async fn write_through_origin_failure_discards_cache() {
+    let (origin_url, origin) = spawn_origin().await;
+    *origin.put_status.lock().unwrap() = Some(StatusCode::SERVICE_UNAVAILABLE);
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteThrough,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/origin-down", sidecar.url),
+        Some(b"lost body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(!put.status().is_success());
+    let blob = blob_key("cache", "node-a", "media", "origin-down");
+    wait_for(Duration::from_secs(2), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { !cache.has(&blob) && !cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
 }
 
 #[tokio::test]

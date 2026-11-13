@@ -14,6 +14,7 @@ use axum::routing::get;
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, TryStreamExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::auth::body::{BodyFailure, BodyStream, failure, failure_flag, verify_hash};
@@ -771,18 +772,16 @@ async fn write_put(
 ) -> Result<Response, S3Error> {
     let policy = cache.write_policy_for(bucket);
     if policy == WritePolicy::WriteThrough {
-        let response = proxy_request(
+        return write_through_put(
             state,
-            &Method::PUT,
+            cache,
             credential,
             prepared,
-            path_and_query.to_owned(),
+            bucket,
+            key,
+            path_and_query,
         )
-        .await?;
-        if response.status().is_success() {
-            cache.spawn_fill_from_origin(bucket.to_owned(), key.to_owned());
-        }
-        return Ok(response);
+        .await;
     }
 
     let Some(length) = prepared.content_length else {
@@ -865,6 +864,116 @@ async fn write_put(
     }
     let _ = headers;
     Ok(response)
+}
+
+// The write-through path tees one client body to origin and cache.
+#[allow(clippy::too_many_arguments)]
+async fn write_through_put(
+    state: &AppState,
+    cache: &Arc<Cache>,
+    credential: &Arc<ClientCredential>,
+    prepared: PreparedRequest,
+    bucket: &str,
+    key: &str,
+    path_and_query: &str,
+) -> Result<Response, S3Error> {
+    let length = prepared.content_length;
+    if length.is_some_and(|length| length > cache.max_object_bytes()) {
+        return proxy_request(
+            state,
+            &Method::PUT,
+            credential,
+            prepared,
+            path_and_query.to_owned(),
+        )
+        .await;
+    }
+
+    let content_type = header_string(&prepared.headers, header::CONTENT_TYPE);
+    let content_encoding = header_string(&prepared.headers, header::CONTENT_ENCODING);
+    let failure_flag = prepared.failure.clone();
+    let body = prepared.body.unwrap_or_else(empty_body);
+    let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(2);
+    let cache_writer = Arc::clone(cache);
+    let writer_bucket = bucket.to_owned();
+    let writer_key = key.to_owned();
+    let cache_task = tokio::spawn(async move {
+        cache_writer
+            .write_blob_from_receiver(&writer_bucket, &writer_key, receiver, length)
+            .await
+    });
+
+    let origin_body = tee_body(body, sender);
+    let request = ForwardRequest {
+        method: Method::PUT,
+        path_and_query: path_and_query.to_owned(),
+        headers: prepared.headers,
+        body: Some(origin_body),
+        content_length: length,
+    };
+    let result = state.client.execute(credential, request).await;
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            cache_task.abort();
+            let _ = cache_task.await;
+            cache.discard_blob(bucket, key).await;
+            return Err(map_storage_error(error, failure_flag.as_ref()));
+        }
+    };
+
+    if !response.status().is_success() {
+        cache_task.abort();
+        let _ = cache_task.await;
+        cache.discard_blob(bucket, key).await;
+        return forward_response(&Method::PUT, response).await;
+    }
+
+    let etag = response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let blob = match cache_task.await {
+        Ok(Ok(blob)) => Some(blob),
+        Ok(Err(error)) => {
+            warn!(%error, "write-through cache write failed");
+            None
+        }
+        Err(error) => {
+            warn!(%error, "write-through cache task failed");
+            None
+        }
+    };
+    if let Some(blob) = blob {
+        if let Err(error) = cache
+            .commit_synced_blob(bucket, key, &blob, etag, content_type, content_encoding)
+            .await
+        {
+            warn!(%error, "write-through cache metadata failed");
+            cache.discard_blob(bucket, key).await;
+        }
+    } else {
+        cache.discard_blob(bucket, key).await;
+    }
+    forward_response(&Method::PUT, response).await
+}
+
+fn tee_body(body: BodyStream, sender: mpsc::Sender<Result<Bytes, io::Error>>) -> BodyStream {
+    let stream = async_stream::try_stream! {
+        let mut body = body;
+        let mut sender = Some(sender);
+        while let Some(chunk) = body.next().await {
+            let bytes = chunk?;
+            if let Some(tx) = sender.clone()
+                && tx.send(Ok(bytes.clone())).await.is_err()
+            {
+                sender = None;
+            }
+            yield bytes;
+        }
+    };
+    Box::pin(stream)
 }
 
 // The delete path needs the request context and the cache policy.
