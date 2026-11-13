@@ -180,7 +180,7 @@ impl ConsulCoordinator {
         }
         let prefix = bucket_prefix(bucket);
         let result = self.api.list(&prefix, true).await.map_err(map_consul)?;
-        self.reconcile_bucket(bucket, &result.entries)
+        self.reconcile_bucket(bucket, &result.entries, result.index)
     }
 
     /// Delete expired tombstones from Consul. Only the leader writes.
@@ -571,6 +571,17 @@ impl ConsulCoordinator {
         let path = bucket_key(bucket);
         for _attempt in 0..MAX_CAS_ATTEMPTS {
             let current = self.api.get(&path, true).await.map_err(map_consul)?;
+            if let Some(entry) = &current
+                && let Ok(stored) = serde_json::from_slice::<BucketConfigRecord>(&entry.value)
+            {
+                self.store.materialize_bucket_config(bucket, &stored)?;
+                self.note_applied(entry.modify_index);
+                return Ok(Applied {
+                    index: entry.modify_index,
+                    term: self.term(),
+                    result: ApplyResult::BucketConfig(stored),
+                });
+            }
             let cas = current.as_ref().map_or(0, |entry| entry.modify_index);
             let value = serde_json::to_vec(&config)
                 .map_err(|error| CoordError::Storage(error.to_string()))?;
@@ -629,7 +640,7 @@ impl ConsulCoordinator {
         );
     }
 
-    fn reconcile_all_metadata(&self, entries: &[KvEntry]) -> Result<(), CoordError> {
+    fn reconcile_all_metadata(&self, entries: &[KvEntry], index: u64) -> Result<(), CoordError> {
         let mut present = std::collections::HashSet::new();
         for entry in entries {
             if let Some((bucket, key, metadata)) = decode_metadata_entry(entry)? {
@@ -638,7 +649,7 @@ impl ConsulCoordinator {
             }
         }
         for (bucket, key, metadata) in self.store.scan_all()? {
-            if metadata.state == ObjectState::Pending {
+            if metadata.state == ObjectState::Pending || metadata.version > index {
                 continue;
             }
             if !present.contains(&(bucket.clone(), key.clone())) {
@@ -648,7 +659,12 @@ impl ConsulCoordinator {
         Ok(())
     }
 
-    fn reconcile_bucket(&self, bucket: &str, entries: &[KvEntry]) -> Result<(), CoordError> {
+    fn reconcile_bucket(
+        &self,
+        bucket: &str,
+        entries: &[KvEntry],
+        index: u64,
+    ) -> Result<(), CoordError> {
         let mut present = std::collections::HashSet::new();
         for entry in entries {
             if let Some((entry_bucket, key, metadata)) = decode_metadata_entry(entry)? {
@@ -660,7 +676,7 @@ impl ConsulCoordinator {
             }
         }
         for (key, metadata) in self.store.scan_bucket(bucket)? {
-            if metadata.state == ObjectState::Pending {
+            if metadata.state == ObjectState::Pending || metadata.version > index {
                 continue;
             }
             if !present.contains(&key) {
@@ -697,6 +713,13 @@ impl ConsulCoordinator {
         let Some((bucket, key, _)) = decode_metadata_entry(entry)? else {
             return Ok(());
         };
+        if self
+            .store
+            .get_metadata(&bucket, &key)?
+            .is_some_and(|local| local.version > entry.modify_index)
+        {
+            return Ok(());
+        }
         let mut metadata = metadata.clone();
         metadata.version = entry.modify_index;
         self.store.materialize_metadata(&bucket, &key, &metadata)
@@ -795,7 +818,10 @@ async fn watch_loop(coordinator: Arc<ConsulCoordinator>) {
                 {
                     warn!(%error, "consul bucket config sync failed");
                 }
-                match coordinator.reconcile_all_metadata(&result.entries) {
+                match coordinator.reconcile_all_metadata(
+                    &result.entries,
+                    if index == 0 { u64::MAX } else { result.index },
+                ) {
                     Ok(()) => coordinator.materialized.store(true, Ordering::Release),
                     Err(error) => warn!(%error, "consul metadata sync failed"),
                 }
@@ -982,4 +1008,143 @@ fn decode_bucket_key(key: &str) -> Option<String> {
 fn decode_hex(value: &str) -> Option<String> {
     let bytes = hex::decode(value).ok()?;
     String::from_utf8(bytes).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::BTreeMap;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::cluster::state::MetadataStore;
+    use crate::metrics::Metrics;
+
+    fn sample_metadata(version: u64, blob: &str) -> Metadata {
+        Metadata {
+            state: ObjectState::Committed,
+            version,
+            blob: blob.to_owned(),
+            size: 1,
+            checksum: String::new(),
+            content_type: None,
+            etag: "etag".to_owned(),
+            user_metadata: BTreeMap::new(),
+            owner: "a".to_owned(),
+            replicas: Vec::new(),
+            created_at: 1,
+            committed_at: Some(1),
+            deleted_at: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+        }
+    }
+
+    fn coordinator() -> (
+        tempfile::TempDir,
+        ConsulCoordinator,
+        Arc<crate::cluster::consul::memory::MemoryConsul>,
+    ) {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(MetadataStore::open(&dir.path().join("meta.redb")).unwrap());
+        let memory = Arc::new(crate::cluster::consul::memory::MemoryConsul::new());
+        let coordinator = ConsulCoordinator::new(
+            store,
+            Arc::new(Metrics::default()),
+            ConsulConfig::default(),
+            Arc::clone(&memory) as Arc<dyn ConsulApi>,
+        );
+        (dir, coordinator, memory)
+    }
+
+    #[test]
+    fn an_older_snapshot_keeps_a_newer_local_row() {
+        let (_dir, coordinator, _memory) = coordinator();
+        coordinator
+            .store
+            .materialize_metadata("media", "key", &sample_metadata(10, "new"))
+            .unwrap();
+        coordinator.reconcile_all_metadata(&[], 5).unwrap();
+        assert_eq!(
+            coordinator
+                .store
+                .get_metadata("media", "key")
+                .unwrap()
+                .unwrap()
+                .blob,
+            "new"
+        );
+        coordinator.reconcile_all_metadata(&[], 20).unwrap();
+        assert!(
+            coordinator
+                .store
+                .get_metadata("media", "key")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_older_entry_does_not_replace_a_newer_row() {
+        let (_dir, coordinator, _memory) = coordinator();
+        coordinator
+            .store
+            .materialize_metadata("media", "key", &sample_metadata(10, "new"))
+            .unwrap();
+        let entry = KvEntry {
+            key: metadata_key("media", "key"),
+            value: serde_json::to_vec(&sample_metadata(5, "old")).unwrap(),
+            modify_index: 5,
+            session: None,
+        };
+        coordinator.materialize_entry(&entry).unwrap();
+        assert_eq!(
+            coordinator
+                .store
+                .get_metadata("media", "key")
+                .unwrap()
+                .unwrap()
+                .blob,
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_bucket_config_is_not_overwritten() {
+        use crate::config::{ReadMode, WriteAck};
+
+        let (_dir, coordinator, memory) = coordinator();
+        let stored = BucketConfigRecord {
+            write_ack: WriteAck::Leader,
+            read: ReadMode::Leader,
+            replicas: 3,
+            min_replicas: 2,
+        };
+        memory
+            .put_cas(
+                &bucket_key("media"),
+                serde_json::to_vec(&stored).unwrap(),
+                0,
+            )
+            .await
+            .unwrap();
+        let from_file = BucketConfigRecord {
+            write_ack: WriteAck::Leader,
+            read: ReadMode::Local,
+            replicas: 1,
+            min_replicas: 1,
+        };
+        let applied = coordinator
+            .apply_bucket_config("media", from_file)
+            .await
+            .unwrap();
+        let ApplyResult::BucketConfig(record) = applied.result else {
+            panic!("the entry did not store a bucket config");
+        };
+        assert_eq!(record.read, ReadMode::Leader);
+        assert_eq!(record.replicas, 3);
+    }
 }

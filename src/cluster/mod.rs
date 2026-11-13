@@ -1110,9 +1110,11 @@ impl Cluster {
                     report.orphan_blobs_removed += 1;
                     self.metrics.gc_deleted();
                 }
-                self.state
-                    .remove_metadata(&bucket, &key)
-                    .map_err(map_coord_error)?;
+                if self.consul.is_none() {
+                    self.state
+                        .remove_metadata(&bucket, &key)
+                        .map_err(map_coord_error)?;
+                }
                 report.tombstones_removed += 1;
             }
         }
