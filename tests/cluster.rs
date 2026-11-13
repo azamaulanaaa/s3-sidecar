@@ -504,6 +504,7 @@ fn cluster_config(
             orphan_ttl: HumanDuration::new(Duration::from_secs(orphan_ttl)),
             gc_interval: HumanDuration::new(Duration::from_hours(1)),
             metadata_path: metadata_path.display().to_string(),
+            ..ClusterConfig::default()
         },
         buckets: vec![BucketConfig {
             name: "media".to_owned(),
