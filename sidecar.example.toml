@@ -63,8 +63,9 @@ backend = "single"             # single | raft | consul
 # peers = ["a"]
 # The raft backend requires a shared secret and one bootstrap node.
 # bootstrap = false
+# Prefer S3_SIDECAR_CONSENSUS__RAFT__SECRET_FILE or
+# --consensus-raft-secret-file in production.
 # secret = "replace-me"
-# addr = "http://127.0.0.1:9000"
 # rpc_timeout = "5s"
 # [[consensus.raft.nodes]]
 # id = "a"

@@ -377,8 +377,9 @@ backend = "raft"
 [consensus.raft]
 node_id = "a"
 bootstrap = false
+# Prefer S3_SIDECAR_CONSENSUS__RAFT__SECRET_FILE or
+# --consensus-raft-secret-file in production.
 secret = "replace-me"
-addr = "http://127.0.0.1:9000"
 rpc_timeout = "5s"
 
 [[consensus.raft.nodes]]
@@ -406,8 +407,14 @@ Rules:
   competing cluster. A single-node cluster bootstraps without the flag.
 - The raft log, vote, committed index, applied index, membership, and snapshot
   share `cluster.metadata_path` with the metadata tables.
-- `consensus.raft.addr` must be an `http://` or `https://` URL.
+- This node uses the address from the `[[consensus.raft.nodes]]` entry whose
+  `id` equals `node_id`. Every node address must be an absolute `http://` or
+  `https://` URL.
 - `consensus.raft.rpc_timeout` bounds each internal HTTP request.
+- `consensus.raft.secret` also accepts
+  `S3_SIDECAR_CONSENSUS__RAFT__SECRET_FILE` and
+  `S3_SIDECAR_CONSENSUS__RAFT__SECRET`, or `--consensus-raft-secret-file` and
+  `--consensus-raft-secret-stdin`.
 
 A write on a follower writes the blob to the local backing S3 endpoint, then
 forwards the proposal to the leader. The leader appends the entry to the raft
@@ -424,6 +431,18 @@ Raft metrics include `s3_sidecar_raft_term`, `s3_sidecar_raft_leader`,
 `s3_sidecar_raft_snapshot_index`, and `s3_sidecar_raft_elections_total`.
 `/readyz` returns `503` with a reason until the node has a leader and has
 applied at least one entry.
+
+#### Raft limits
+
+- Blob replication, peer fetch, read repair, and `write_ack = quorum|all` are
+  M3 work.
+- Multipart upload records and pending rows are node-local.
+- Tombstone removal is local. Visibility is unchanged because tombstones are
+  hidden.
+- The snapshot threshold is fixed at 64 log entries.
+- A forwarded proposal has no idempotency key. A commit-then-timeout retry can
+  return an error while the write is visible.
+- Metadata replicates. Blobs stay on the owner node.
 
 Blobs live in `backing.bucket` under `objects/`:
 
