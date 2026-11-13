@@ -228,6 +228,42 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
     push_row(
         &mut rows,
         sources,
+        "consensus.consul.node_id",
+        config.consensus.consul.node_id.clone(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "consensus.consul.address",
+        config.consensus.consul.address.clone(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "consensus.consul.advertise_addr",
+        config.consensus.consul.advertise_addr.clone(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "consensus.consul.token",
+        config.consensus.consul.token.redacted().to_owned(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "consensus.consul.session_ttl",
+        config.consensus.consul.session_ttl.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "consensus.consul.secret",
+        config.consensus.consul.secret.redacted().to_owned(),
+    );
+    push_row(
+        &mut rows,
+        sources,
         "cluster.staging_ttl",
         config.cluster.staging_ttl.to_string(),
     );

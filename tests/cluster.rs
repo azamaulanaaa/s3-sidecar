@@ -497,6 +497,7 @@ fn cluster_config(
                 peers: vec![node_id.to_owned()],
                 ..RaftConfig::default()
             },
+            ..ConsensusConfig::default()
         },
         cluster: ClusterConfig {
             staging_ttl: HumanDuration::new(Duration::from_secs(staging_ttl)),

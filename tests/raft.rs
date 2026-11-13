@@ -49,6 +49,7 @@ fn raft_config(ids: &[&str], node_id: &str, bootstrap: bool, path: &std::path::P
         },
         consensus: ConsensusConfig {
             backend: ConsensusBackend::Raft,
+            consul: s3_sidecar::config::ConsulConfig::default(),
             raft: RaftConfig {
                 node_id: node_id.to_owned(),
                 bootstrap,
@@ -477,6 +478,7 @@ async fn single_node_raft_serves_put_get_list_and_delete() {
         },
         consensus: ConsensusConfig {
             backend: ConsensusBackend::Raft,
+            consul: s3_sidecar::config::ConsulConfig::default(),
             raft: RaftConfig {
                 node_id: "a".to_owned(),
                 secret: SecretString::new("token"),
@@ -600,6 +602,7 @@ async fn http_transport_replicates_and_serves_owner_headers() {
             },
             consensus: ConsensusConfig {
                 backend: ConsensusBackend::Raft,
+                consul: s3_sidecar::config::ConsulConfig::default(),
                 raft: RaftConfig {
                     node_id: ids[index].to_owned(),
                     bootstrap: index == 0,

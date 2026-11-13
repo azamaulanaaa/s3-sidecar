@@ -190,6 +190,30 @@ pub struct ConfigFlags {
     /// Read the raft internal token from stdin.
     #[arg(long = "consensus-raft-secret-stdin")]
     pub consensus_raft_secret_stdin: bool,
+    /// Consul node name.
+    #[arg(long = "consensus-consul-node-id", value_name = "ID")]
+    pub consensus_consul_node_id: Option<String>,
+    /// Consul HTTP API base URL.
+    #[arg(long = "consensus-consul-address", value_name = "URL")]
+    pub consensus_consul_address: Option<String>,
+    /// Base URL that peers use to reach this sidecar.
+    #[arg(long = "consensus-consul-advertise-addr", value_name = "URL")]
+    pub consensus_consul_advertise_addr: Option<String>,
+    /// File that contains the Consul ACL token.
+    #[arg(long = "consensus-consul-token-file", value_name = "PATH")]
+    pub consensus_consul_token_file: Option<PathBuf>,
+    /// Read the Consul ACL token from stdin.
+    #[arg(long = "consensus-consul-token-stdin")]
+    pub consensus_consul_token_stdin: bool,
+    /// Consul session time to live.
+    #[arg(long = "consensus-consul-session-ttl", value_name = "DURATION")]
+    pub consensus_consul_session_ttl: Option<String>,
+    /// File that contains the Consul proposal token.
+    #[arg(long = "consensus-consul-secret-file", value_name = "PATH")]
+    pub consensus_consul_secret_file: Option<PathBuf>,
+    /// Read the Consul proposal token from stdin.
+    #[arg(long = "consensus-consul-secret-stdin")]
+    pub consensus_consul_secret_stdin: bool,
     /// Age at which a staged blob with no commit is an orphan.
     #[arg(long = "cluster-staging-ttl", value_name = "DURATION")]
     pub cluster_staging_ttl: Option<String>,
@@ -225,6 +249,11 @@ impl ConfigFlags {
             (self.cache_secret_access_key_stdin, StdinTarget::Cache),
             (self.backing_secret_access_key_stdin, StdinTarget::Backing),
             (self.consensus_raft_secret_stdin, StdinTarget::Raft),
+            (self.consensus_consul_token_stdin, StdinTarget::ConsulToken),
+            (
+                self.consensus_consul_secret_stdin,
+                StdinTarget::ConsulSecret,
+            ),
         ];
         let mut selected = targets
             .into_iter()
@@ -505,6 +534,50 @@ impl ConfigFlags {
                 Value::String(secret.expose_secret().to_owned()),
             );
         }
+        if let Some(value) = &self.consensus_consul_node_id {
+            set(
+                &mut object,
+                &["consensus", "consul", "node_id"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.consensus_consul_address {
+            set(
+                &mut object,
+                &["consensus", "consul", "address"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.consensus_consul_advertise_addr {
+            set(
+                &mut object,
+                &["consensus", "consul", "advertise_addr"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(path) = &self.consensus_consul_token_file {
+            let secret = read_secret_file(path)?;
+            set(
+                &mut object,
+                &["consensus", "consul", "token"],
+                Value::String(secret.expose_secret().to_owned()),
+            );
+        }
+        if let Some(value) = &self.consensus_consul_session_ttl {
+            set(
+                &mut object,
+                &["consensus", "consul", "session_ttl"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(path) = &self.consensus_consul_secret_file {
+            let secret = read_secret_file(path)?;
+            set(
+                &mut object,
+                &["consensus", "consul", "secret"],
+                Value::String(secret.expose_secret().to_owned()),
+            );
+        }
         if let Some(value) = &self.cluster_staging_ttl {
             set(
                 &mut object,
@@ -563,6 +636,8 @@ impl ConfigFlags {
                 StdinTarget::Cache => &["cache", "secret_access_key"],
                 StdinTarget::Backing => &["backing", "secret_access_key"],
                 StdinTarget::Raft => &["consensus", "raft", "secret"],
+                StdinTarget::ConsulToken => &["consensus", "consul", "token"],
+                StdinTarget::ConsulSecret => &["consensus", "consul", "secret"],
             };
             set(
                 &mut object,
@@ -586,6 +661,10 @@ pub enum StdinTarget {
     Backing,
     /// Raft internal token.
     Raft,
+    /// Consul ACL token.
+    ConsulToken,
+    /// Consul proposal token.
+    ConsulSecret,
 }
 
 fn parse_json_array(name: &str, value: &str) -> Result<Value, ConfigError> {
@@ -642,6 +721,8 @@ impl std::fmt::Display for StdinTarget {
             Self::Cache => f.write_str("cache"),
             Self::Backing => f.write_str("backing"),
             Self::Raft => f.write_str("raft"),
+            Self::ConsulToken => f.write_str("consul token"),
+            Self::ConsulSecret => f.write_str("consul secret"),
         }
     }
 }
@@ -667,5 +748,22 @@ mod tests {
         };
         let layer = flags.to_layer(None).unwrap();
         assert_eq!(layer["consensus"]["raft"]["secret"], "file-token");
+    }
+
+    #[test]
+    fn consul_secret_file_flags_set_both_tokens() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("consul-token");
+        let secret_path = dir.path().join("consul-secret");
+        fs::write(&token_path, "acl-token\n").unwrap();
+        fs::write(&secret_path, "proposal-token\n").unwrap();
+        let flags = ConfigFlags {
+            consensus_consul_token_file: Some(token_path),
+            consensus_consul_secret_file: Some(secret_path),
+            ..ConfigFlags::default()
+        };
+        let layer = flags.to_layer(None).unwrap();
+        assert_eq!(layer["consensus"]["consul"]["token"], "acl-token");
+        assert_eq!(layer["consensus"]["consul"]["secret"], "proposal-token");
     }
 }

@@ -295,6 +295,16 @@ fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
         "CONSENSUS__RAFT__SECRET" => (EnvKind::Text, vec!["consensus", "raft", "secret"]),
         "CONSENSUS__RAFT__RPC_TIMEOUT" => (EnvKind::Text, vec!["consensus", "raft", "rpc_timeout"]),
         "CONSENSUS__RAFT__NODES" => (EnvKind::Json, vec!["consensus", "raft", "nodes"]),
+        "CONSENSUS__CONSUL__NODE_ID" => (EnvKind::Text, vec!["consensus", "consul", "node_id"]),
+        "CONSENSUS__CONSUL__ADDRESS" => (EnvKind::Text, vec!["consensus", "consul", "address"]),
+        "CONSENSUS__CONSUL__ADVERTISE_ADDR" => {
+            (EnvKind::Text, vec!["consensus", "consul", "advertise_addr"])
+        }
+        "CONSENSUS__CONSUL__TOKEN" => (EnvKind::Text, vec!["consensus", "consul", "token"]),
+        "CONSENSUS__CONSUL__SESSION_TTL" => {
+            (EnvKind::Text, vec!["consensus", "consul", "session_ttl"])
+        }
+        "CONSENSUS__CONSUL__SECRET" => (EnvKind::Text, vec!["consensus", "consul", "secret"]),
         "CLUSTER__STAGING_TTL" => (EnvKind::Text, vec!["cluster", "staging_ttl"]),
         "CLUSTER__ORPHAN_TTL" => (EnvKind::Text, vec!["cluster", "orphan_ttl"]),
         "CLUSTER__GC_INTERVAL" => (EnvKind::Text, vec!["cluster", "gc_interval"]),
@@ -312,6 +322,8 @@ fn secret_env_key(key: &str) -> Option<SecretEnv> {
         "CACHE__SECRET_ACCESS_KEY_FILE" => vec!["cache", "secret_access_key"],
         "BACKING__SECRET_ACCESS_KEY_FILE" => vec!["backing", "secret_access_key"],
         "CONSENSUS__RAFT__SECRET_FILE" => vec!["consensus", "raft", "secret"],
+        "CONSENSUS__CONSUL__TOKEN_FILE" => vec!["consensus", "consul", "token"],
+        "CONSENSUS__CONSUL__SECRET_FILE" => vec!["consensus", "consul", "secret"],
         _ => return None,
     };
     Some(SecretEnv { path })
@@ -551,6 +563,47 @@ addr = "http://127.0.0.1:9000"
         assert_eq!(
             loaded.config.consensus.raft.secret.expose_secret(),
             "raft-file-secret"
+        );
+    }
+
+    #[test]
+    fn consul_secret_files_are_read() {
+        let dir = tempdir().unwrap();
+        let token_path = dir.path().join("consul-token");
+        let secret_path = dir.path().join("consul-secret");
+        std::fs::write(&token_path, "acl-token\n").unwrap();
+        std::fs::write(&secret_path, "proposal-token\n").unwrap();
+        let file = r#"
+mode = "cluster"
+[backing]
+endpoint = "http://127.0.0.1:9002"
+bucket = "data"
+[consensus]
+backend = "consul"
+[consensus.consul]
+node_id = "a"
+address = "http://127.0.0.1:8500"
+advertise_addr = "http://127.0.0.1:9000"
+session_ttl = "15s"
+"#;
+        let env = vec![
+            (
+                "S3_SIDECAR_CONSENSUS__CONSUL__TOKEN_FILE".to_owned(),
+                token_path.display().to_string(),
+            ),
+            (
+                "S3_SIDECAR_CONSENSUS__CONSUL__SECRET_FILE".to_owned(),
+                secret_path.display().to_string(),
+            ),
+        ];
+        let loaded = load_with(dir.path(), Some(file), env, json!({})).unwrap();
+        assert_eq!(
+            loaded.config.consensus.consul.token.expose_secret(),
+            "acl-token"
+        );
+        assert_eq!(
+            loaded.config.consensus.consul.secret.expose_secret(),
+            "proposal-token"
         );
     }
 

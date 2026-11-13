@@ -363,6 +363,37 @@ impl RaftConfig {
     }
 }
 
+/// Consul settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConsulConfig {
+    /// Node name. It identifies this sidecar in the leader record.
+    pub node_id: String,
+    /// Base URL of the Consul HTTP API, for example `http://127.0.0.1:8500`.
+    pub address: String,
+    /// Base URL that peers use to reach this sidecar.
+    pub advertise_addr: String,
+    /// Optional Consul ACL token.
+    pub token: SecretString,
+    /// Consul session time to live.
+    pub session_ttl: HumanDuration,
+    /// Shared token for internal proposal requests.
+    pub secret: SecretString,
+}
+
+impl Default for ConsulConfig {
+    fn default() -> Self {
+        Self {
+            node_id: String::new(),
+            address: String::new(),
+            advertise_addr: String::new(),
+            token: SecretString::default(),
+            session_ttl: HumanDuration::new(Duration::from_secs(15)),
+            secret: SecretString::default(),
+        }
+    }
+}
+
 /// Coordination settings.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -371,6 +402,8 @@ pub struct ConsensusConfig {
     pub backend: ConsensusBackend,
     /// Raft settings.
     pub raft: RaftConfig,
+    /// Consul settings.
+    pub consul: ConsulConfig,
 }
 
 /// Garbage collection and metadata settings for cluster mode.
@@ -677,15 +710,16 @@ fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
             "cache.mode must be \"off\" when mode is \"cluster\"",
         ));
     }
-    if config.consensus.raft.node_id.trim().is_empty() {
-        return Err(ConfigError::invalid(
-            "consensus.raft.node_id is required in cluster mode",
-        ));
-    }
     match config.consensus.backend {
-        ConsensusBackend::Single => validate_single_backend(config)?,
-        ConsensusBackend::Raft => validate_raft_backend(config)?,
-        ConsensusBackend::Consul => {}
+        ConsensusBackend::Single => {
+            require_raft_node_id(config)?;
+            validate_single_backend(config)?;
+        }
+        ConsensusBackend::Raft => {
+            require_raft_node_id(config)?;
+            validate_raft_backend(config)?;
+        }
+        ConsensusBackend::Consul => validate_consul_backend(config)?,
     }
     if config.backing.endpoint.trim().is_empty() {
         return Err(ConfigError::invalid(
@@ -724,6 +758,55 @@ fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
                 bucket.name
             )));
         }
+    }
+    Ok(())
+}
+
+fn require_raft_node_id(config: &Config) -> Result<(), ConfigError> {
+    if config.consensus.raft.node_id.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.raft.node_id is required in cluster mode",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_consul_backend(config: &Config) -> Result<(), ConfigError> {
+    let consul = &config.consensus.consul;
+    if consul.node_id.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.consul.node_id is required with the consul consensus backend",
+        ));
+    }
+    if consul.address.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.consul.address is required with the consul consensus backend",
+        ));
+    }
+    if !is_http_url(&consul.address) {
+        return Err(ConfigError::invalid(
+            "consensus.consul.address must start with http:// or https://",
+        ));
+    }
+    if consul.advertise_addr.trim().is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.consul.advertise_addr is required with the consul consensus backend",
+        ));
+    }
+    if !is_http_url(&consul.advertise_addr) {
+        return Err(ConfigError::invalid(
+            "consensus.consul.advertise_addr must start with http:// or https://",
+        ));
+    }
+    if consul.secret.expose_secret().is_empty() {
+        return Err(ConfigError::invalid(
+            "consensus.consul.secret is required with the consul consensus backend",
+        ));
+    }
+    if consul.session_ttl.as_duration() < Duration::from_secs(10) {
+        return Err(ConfigError::invalid(
+            "consensus.consul.session_ttl must be at least 10s, the Consul minimum",
+        ));
     }
     Ok(())
 }
@@ -1058,11 +1141,57 @@ mod tests {
         assert!(error.to_string().contains("nodes"));
     }
 
-    #[test]
-    fn consul_backend_loads() {
+    fn consul_base() -> Config {
         let mut config = cluster_base();
         config.consensus.backend = ConsensusBackend::Consul;
+        config.consensus.consul.node_id = "a".to_owned();
+        config.consensus.consul.address = "http://127.0.0.1:8500".to_owned();
+        config.consensus.consul.advertise_addr = "http://127.0.0.1:9000".to_owned();
+        config.consensus.consul.secret = secret::SecretString::new("proposal-token");
+        config
+    }
+
+    #[test]
+    fn consul_backend_loads() {
+        let config = consul_base();
         assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn consul_backend_requires_address() {
+        let mut config = consul_base();
+        config.consensus.consul.address.clear();
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("address"));
+    }
+
+    #[test]
+    fn consul_backend_requires_an_advertise_address() {
+        let mut config = consul_base();
+        config.consensus.consul.advertise_addr.clear();
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("advertise_addr"));
+    }
+
+    #[test]
+    fn consul_backend_requires_a_secret() {
+        let mut config = consul_base();
+        config.consensus.consul.secret = secret::SecretString::new("");
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn consul_secrets_are_redacted() {
+        let mut config = consul_base();
+        config.consensus.consul.token = secret::SecretString::new("consul-acl-token");
+        config.consensus.consul.secret = secret::SecretString::new("proposal-secret-value");
+        let table = show_table(&config, &SourceMap::new());
+        assert!(!table.contains("consul-acl-token"));
+        assert!(!table.contains("proposal-secret-value"));
+        assert!(table.contains("consensus.consul.token"));
+        assert!(table.contains("consensus.consul.secret"));
+        assert!(table.contains("****"));
     }
 
     #[test]
