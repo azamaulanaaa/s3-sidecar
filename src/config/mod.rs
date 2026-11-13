@@ -168,18 +168,68 @@ impl fmt::Display for ReadMode {
     }
 }
 
+/// TLS listener settings.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TlsConfig {
+    /// PEM certificate chain file.
+    pub cert_file: String,
+    /// PEM private key file.
+    pub key_file: String,
+}
+
 /// HTTP listener settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     /// Listen address, for example `127.0.0.1:9000`.
     pub bind: String,
+    /// Optional TLS settings. Plain HTTP is used when the section is absent.
+    pub tls: Option<TlsConfig>,
+    /// Maximum request body size in bytes.
+    pub max_body_bytes: u64,
+    /// Timeout for a non-streaming control request.
+    pub request_timeout: HumanDuration,
+    /// Idle timeout between stream reads.
+    pub idle_timeout: HumanDuration,
+    /// Maximum number of concurrent S3 requests.
+    pub max_connections: usize,
+    /// Bound for draining in-flight requests during shutdown.
+    pub shutdown_timeout: HumanDuration,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:9000".to_owned(),
+            tls: None,
+            max_body_bytes: 5_368_709_120,
+            request_timeout: HumanDuration::new(Duration::from_mins(5)),
+            idle_timeout: HumanDuration::new(Duration::from_secs(60)),
+            max_connections: 1024,
+            shutdown_timeout: HumanDuration::new(Duration::from_secs(30)),
+        }
+    }
+}
+
+/// Upstream S3 connection settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UpstreamConfig {
+    /// Timeout for the upstream connection phase.
+    pub connect_timeout: HumanDuration,
+    /// Timeout for upstream response headers on a control request.
+    pub request_timeout: HumanDuration,
+    /// Number of retries after the first attempt for an idempotent request.
+    pub retry_attempts: u32,
+}
+
+impl Default for UpstreamConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: HumanDuration::new(Duration::from_secs(10)),
+            request_timeout: HumanDuration::new(Duration::from_mins(5)),
+            retry_attempts: 2,
         }
     }
 }
@@ -527,6 +577,8 @@ pub struct Config {
     pub mode: Mode,
     /// Listener settings.
     pub server: ServerConfig,
+    /// Upstream connection and retry settings.
+    pub upstream: UpstreamConfig,
     /// Origin S3 endpoint.
     pub origin: EndpointConfig,
     /// Cache settings.
@@ -624,12 +676,53 @@ impl ConfigError {
 /// Returns an error when a setting violates a rule.
 pub fn validate(config: &Config) -> Result<Vec<String>, ConfigError> {
     let mut warnings = Vec::new();
+    validate_server(config)?;
     validate_cache(config, &mut warnings)?;
     validate_endpoints(config)?;
     validate_cluster(config)?;
     validate_buckets(config)?;
     validate_clients(config)?;
     Ok(warnings)
+}
+
+fn validate_server(config: &Config) -> Result<(), ConfigError> {
+    let server = &config.server;
+    if server.max_body_bytes == 0 {
+        return Err(ConfigError::invalid(
+            "server.max_body_bytes must be greater than 0",
+        ));
+    }
+    if server.max_connections == 0 {
+        return Err(ConfigError::invalid(
+            "server.max_connections must be greater than 0",
+        ));
+    }
+    for (name, duration) in [
+        ("server.request_timeout", server.request_timeout),
+        ("server.idle_timeout", server.idle_timeout),
+        ("server.shutdown_timeout", server.shutdown_timeout),
+        ("upstream.connect_timeout", config.upstream.connect_timeout),
+        ("upstream.request_timeout", config.upstream.request_timeout),
+    ] {
+        if duration.as_duration() == Duration::ZERO {
+            return Err(ConfigError::invalid(format!(
+                "{name} must be greater than 0"
+            )));
+        }
+    }
+    if let Some(tls) = &server.tls {
+        if tls.cert_file.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "server.tls.cert_file must not be empty",
+            ));
+        }
+        if tls.key_file.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "server.tls.key_file must not be empty",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_cache(config: &Config, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
@@ -1166,6 +1259,42 @@ mod tests {
         config.cache.high_watermark = 0.9;
         let error = validate(&config).unwrap_err();
         assert!(error.to_string().contains("low_watermark"));
+    }
+
+    #[test]
+    fn server_limits_must_be_positive() {
+        let mut config = base();
+        config.server.max_connections = 0;
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("max_connections"));
+
+        let mut config = base();
+        config.server.request_timeout = HumanDuration::new(Duration::ZERO);
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("request_timeout"));
+
+        let mut config = base();
+        config.upstream.retry_attempts = 0;
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn tls_requires_both_files() {
+        let mut config = base();
+        config.server.tls = Some(TlsConfig {
+            cert_file: String::new(),
+            key_file: "key.pem".to_owned(),
+        });
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("cert_file"));
+
+        let mut config = base();
+        config.server.tls = Some(TlsConfig {
+            cert_file: "cert.pem".to_owned(),
+            key_file: String::new(),
+        });
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("key_file"));
     }
 
     #[test]

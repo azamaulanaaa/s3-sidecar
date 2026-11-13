@@ -274,6 +274,7 @@ fn cluster_base(
         mode: Mode::Cluster,
         server: ServerConfig {
             bind: url.trim_start_matches("http://").to_owned(),
+            ..ServerConfig::default()
         },
         backing: EndpointConfig {
             endpoint: backing.to_owned(),

@@ -591,6 +591,7 @@ async fn http_transport_replicates_and_serves_owner_headers() {
             mode: Mode::Cluster,
             server: s3_sidecar::config::ServerConfig {
                 bind: urls[index].trim_start_matches("http://").to_owned(),
+                ..s3_sidecar::config::ServerConfig::default()
             },
             backing: EndpointConfig {
                 endpoint: backings[index].0.clone(),

@@ -17,6 +17,74 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         "server.bind",
         config.server.bind.clone(),
     );
+    push_optional(
+        &mut rows,
+        sources,
+        "server.tls.cert_file",
+        config
+            .server
+            .tls
+            .as_ref()
+            .map_or_else(String::new, |tls| tls.cert_file.clone()),
+    );
+    push_optional(
+        &mut rows,
+        sources,
+        "server.tls.key_file",
+        config
+            .server
+            .tls
+            .as_ref()
+            .map_or_else(String::new, |tls| tls.key_file.clone()),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "server.max_body_bytes",
+        config.server.max_body_bytes.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "server.request_timeout",
+        config.server.request_timeout.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "server.idle_timeout",
+        config.server.idle_timeout.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "server.max_connections",
+        config.server.max_connections.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "server.shutdown_timeout",
+        config.server.shutdown_timeout.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "upstream.connect_timeout",
+        config.upstream.connect_timeout.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "upstream.request_timeout",
+        config.upstream.request_timeout.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "upstream.retry_attempts",
+        config.upstream.retry_attempts.to_string(),
+    );
 
     push_endpoint(&mut rows, sources, "origin", &config.origin);
 
