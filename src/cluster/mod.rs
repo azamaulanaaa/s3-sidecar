@@ -484,6 +484,9 @@ impl Cluster {
             blob: blob.clone(),
             content_type: header_string(headers, header::CONTENT_TYPE),
             user_metadata: user_metadata(headers),
+            cache_control: header_string(headers, header::CACHE_CONTROL),
+            content_encoding: header_string(headers, header::CONTENT_ENCODING),
+            content_disposition: header_string(headers, header::CONTENT_DISPOSITION),
             created_at: state::unix_now(),
         };
         self.state.put_upload(&record).map_err(map_coord_error)?;
@@ -609,9 +612,9 @@ impl Cluster {
             replicas: vec![self.node_id.clone()],
             if_none_match: false,
             if_match: None,
-            cache_control: None,
-            content_encoding: None,
-            content_disposition: None,
+            cache_control: record.cache_control.clone(),
+            content_encoding: record.content_encoding.clone(),
+            content_disposition: record.content_disposition.clone(),
         };
         let started = Instant::now();
         let applied = self

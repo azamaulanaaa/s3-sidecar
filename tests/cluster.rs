@@ -835,6 +835,7 @@ async fn metadata_survives_restart() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn multipart_create_upload_complete_and_abort() {
     let (backing, _) = spawn_backing().await;
     let dir = tempfile::tempdir().unwrap();
@@ -849,10 +850,20 @@ async fn multipart_create_upload_complete_and_abort() {
     .await;
     let client = reqwest::Client::new();
     let create_url = format!("{}/media/big?uploads", sidecar.url);
-    let response = signed_request(&client, Method::POST, &create_url, Some(Vec::new()), &[])
-        .send()
-        .await
-        .unwrap();
+    let response = signed_request(
+        &client,
+        Method::POST,
+        &create_url,
+        Some(Vec::new()),
+        &[
+            ("content-type", "text/plain"),
+            ("cache-control", "max-age=60"),
+            ("x-amz-meta-kind", "demo"),
+        ],
+    )
+    .send()
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let upload_id = extract(&body_text(response).await, "UploadId");
 
@@ -896,6 +907,15 @@ async fn multipart_create_upload_complete_and_abort() {
     .await
     .unwrap();
     let etag = response.headers().get(header::ETAG).unwrap().to_owned();
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/plain"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "max-age=60"
+    );
+    assert_eq!(response.headers().get("x-amz-meta-kind").unwrap(), "demo");
     assert_eq!(body_text(response).await, "hello world");
     let expected = format!(
         "\"{}-2\"",

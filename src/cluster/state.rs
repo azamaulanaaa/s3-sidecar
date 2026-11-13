@@ -131,6 +131,15 @@ pub struct UploadRecord {
     pub content_type: Option<String>,
     /// User metadata for the final object.
     pub user_metadata: BTreeMap<String, String>,
+    /// Cache-Control for the final object.
+    #[serde(default)]
+    pub cache_control: Option<String>,
+    /// Content-Encoding for the final object.
+    #[serde(default)]
+    pub content_encoding: Option<String>,
+    /// Content-Disposition for the final object.
+    #[serde(default)]
+    pub content_disposition: Option<String>,
     /// Creation time in Unix seconds.
     pub created_at: i64,
 }
