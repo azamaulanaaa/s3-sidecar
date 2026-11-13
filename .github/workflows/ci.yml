@@ -1,0 +1,79 @@
+name: CI
+
+# These jobs only read the repository.
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The weekly run finds new advisories when the code did not change.
+  schedule:
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Cancel a superseded run, but never a tag run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+# mise installs the tool versions from mise.toml, so CI matches local development.
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - name: Run the test suite
+        run: cargo test --all-targets --all-features --locked
+
+  doc:
+    name: Doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - name: Build the documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  release-config:
+    name: Release config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      # Fail here when the release config does not resolve, not at tag time.
+      - name: Check the release plan
+        run: dist plan --output-format=human > /dev/null
+
+  deny:
+    name: Deny (${{ matrix.check }})
+    runs-on: ubuntu-latest
+    # Each check fails on its own, so one breach does not hide another.
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [advisories, bans, licenses, sources]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - name: Check ${{ matrix.check }}
+        run: cargo deny check ${{ matrix.check }}
