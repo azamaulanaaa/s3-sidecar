@@ -383,6 +383,16 @@ impl TestCluster {
 }
 
 async fn spawn_cluster(read: ReadMode, replicas: u32, read_repair: bool) -> TestCluster {
+    spawn_cluster_ack(read, replicas, 1, WriteAck::Leader, read_repair).await
+}
+
+async fn spawn_cluster_ack(
+    read: ReadMode,
+    replicas: u32,
+    min_replicas: u32,
+    write_ack: WriteAck,
+    read_repair: bool,
+) -> TestCluster {
     let dir = TempDir::new().unwrap();
     let ids = ["a", "b", "c"];
     let mut listeners = Vec::new();
@@ -397,7 +407,7 @@ async fn spawn_cluster(read: ReadMode, replicas: u32, read_repair: bool) -> Test
         .collect();
     let mut nodes = Vec::new();
     for (index, id) in ids.iter().enumerate() {
-        let config = raft_config(
+        let mut config = raft_config(
             id,
             index,
             &ids,
@@ -408,6 +418,8 @@ async fn spawn_cluster(read: ReadMode, replicas: u32, read_repair: bool) -> Test
             replicas,
             read_repair,
         );
+        config.buckets[0].min_replicas = Some(min_replicas);
+        config.buckets[0].write_ack = Some(write_ack);
         let listener = listeners.remove(0);
         let state = Arc::new(AppState::new(config).unwrap());
         let app = router(Arc::clone(&state));
@@ -928,6 +940,102 @@ async fn blob_transport_requires_the_token_and_checks_references() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn quorum_write_survives_leader_loss_when_a_quorum_remains() {
+    let cluster = spawn_cluster_ack(ReadMode::LocalThenPeer, 3, 2, WriteAck::Quorum, false).await;
+    let leader = cluster
+        .nodes
+        .iter()
+        .find(|node| {
+            node.state
+                .cluster()
+                .and_then(|cluster| cluster.raft_node())
+                .is_some_and(|raft| raft.is_leader())
+        })
+        .unwrap()
+        .id
+        .clone();
+    stop_raft(cluster.node(&leader)).await;
+    let new_leader = wait_any_leader(&cluster, &[leader.as_str()], Duration::from_secs(20)).await;
+    let client = client_request();
+    let url = format!("{}/media/after-leader-loss", cluster.node(&new_leader).url);
+    assert_eq!(
+        put(&client, &url, b"leader-loss").await.status(),
+        StatusCode::OK
+    );
+    let metadata = metadata(&cluster, &new_leader, "after-leader-loss");
+    assert!(metadata.is_committed());
+    assert!(metadata.replicas.iter().any(|node| node == &new_leader));
+}
+
+#[tokio::test]
+async fn quorum_write_without_a_metadata_quorum_returns_503() {
+    let cluster = spawn_cluster_ack(ReadMode::Local, 1, 1, WriteAck::Quorum, false).await;
+    let writer = cluster.nodes[0].id.clone();
+    for node in cluster.nodes.iter().filter(|node| node.id != writer) {
+        stop_raft(node).await;
+    }
+    shutdown_raft(cluster.node(&writer)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let client = client_request();
+    let url = format!("{}/media/no-metadata-quorum", cluster.node(&writer).url);
+    let response = put(&client, &url, b"no-quorum").await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        cluster
+            .node(&writer)
+            .state
+            .cluster()
+            .unwrap()
+            .state()
+            .get_metadata("media", "no-metadata-quorum")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        cluster.node(&writer).backing.objects.lock().unwrap().len(),
+        0
+    );
+}
+
+async fn shutdown_raft(node: &Node) {
+    if let Some(cluster) = node.state.cluster()
+        && let Some(raft) = cluster.raft_node()
+    {
+        let _ = raft.raft().shutdown().await;
+    }
+}
+
+#[allow(clippy::used_underscore_binding)]
+async fn stop_raft(node: &Node) {
+    shutdown_raft(node).await;
+    node._task.abort();
+}
+
+async fn wait_any_leader(cluster: &TestCluster, skip: &[&str], timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    loop {
+        for node in &cluster.nodes {
+            if skip.contains(&node.id.as_str()) {
+                continue;
+            }
+            if node
+                .state
+                .cluster()
+                .and_then(|cluster| cluster.raft_node())
+                .is_some_and(|raft| raft.is_leader() && raft.is_ready())
+            {
+                return node.id.clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no raft leader was elected after the loss"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[test]
