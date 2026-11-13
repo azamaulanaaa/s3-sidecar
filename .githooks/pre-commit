@@ -1,0 +1,6 @@
+#!/bin/sh
+# Run the fast local CI checks before a commit.
+set -eu
+
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$hook_dir/ci-check.sh" commit
