@@ -160,11 +160,21 @@ Do not use it without TLS.
 - The sidecar decodes `aws-chunked` bodies. The HTTP client cannot send trailer
   checksums, so the sidecar drops `x-amz-checksum-algorithm` on
   `CreateMultipartUpload` and removes trailer checksum headers. The object
-  bytes are unchanged.
+  bytes are unchanged. A client that sends part checksums in
+  `CompleteMultipartUpload` can fail, because the origin did not receive the
+  part checksums.
 - A plain payload hash is checked while the body streams. A mismatch aborts
   the upstream request, but the upstream can receive the full body first.
 - The readiness endpoint reports the sidecar process, not the origin.
 - `ListBuckets` is not supported.
+
+## Design choices
+
+- The upstream client is `reqwest` plus the local `SigV4` implementation.
+- The sidecar streams request and response bodies, passes XML through byte
+  for byte, and must verify `SigV4` locally in any case.
+- `aws-sdk-s3` and `s3s` were considered. `s3s` would replace the pass-through
+  request and response path, so it was not adopted.
 
 ## End-to-end tests
 
