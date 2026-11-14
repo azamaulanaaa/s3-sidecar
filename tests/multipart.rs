@@ -4,6 +4,7 @@
 
 mod support;
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -518,6 +519,288 @@ fn cache_config(origin: &str, cache: &str, index: &Path) -> Config {
         }],
         ..Config::default()
     }
+}
+
+fn multipart_cache_config(
+    origin: &str,
+    cache: &str,
+    index: &Path,
+    mode: CacheMode,
+    policy: WritePolicy,
+) -> Config {
+    let mut config = cache_config(origin, cache, index);
+    config.cache.mode = mode;
+    config.cache.write_policy = policy;
+    config
+}
+
+fn xml_value(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)?.saturating_add(open.len());
+    let rest = xml.get(start..)?;
+    let end = rest.find(&close)?;
+    rest.get(..end).map(str::to_owned)
+}
+
+fn complete_xml(parts: &[(u32, String)]) -> Vec<u8> {
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (number, etag) in parts {
+        let _ = write!(
+            xml,
+            "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+        );
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml.into_bytes()
+}
+
+async fn client_create_upload(client: &reqwest::Client, url: &str) -> String {
+    let response = signed_request(
+        client,
+        Method::POST,
+        &format!("{url}/media/item?uploads"),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(response.status().is_success());
+    let body = response.text().await.unwrap();
+    xml_value(&body, "UploadId").expect("the create response has an upload id")
+}
+
+async fn client_upload_part(
+    client: &reqwest::Client,
+    url: &str,
+    upload_id: &str,
+    number: u32,
+    body: Vec<u8>,
+) -> String {
+    let response = signed_request(
+        client,
+        Method::PUT,
+        &format!("{url}/media/item?partNumber={number}&uploadId={upload_id}"),
+        Some(body),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(response.status().is_success());
+    response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .expect("the part response has an ETag")
+        .to_owned()
+}
+
+fn cache_has_body(cache: &support::fake_s3::FakeS3, body: &[u8]) -> bool {
+    cache
+        .keys()
+        .iter()
+        .any(|key| cache.object(key).as_deref() == Some(body))
+}
+
+fn cache_metadata(cache: &support::fake_s3::FakeS3) -> Option<s3_sidecar::cache::Metadata> {
+    cache
+        .keys()
+        .into_iter()
+        .find(|key| is_meta_key(key))
+        .and_then(|key| cache.object(&key))
+        .and_then(|body| serde_json::from_slice(&body).ok())
+}
+
+fn is_meta_key(key: &str) -> bool {
+    Path::new(key)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("meta"))
+}
+
+#[tokio::test]
+async fn client_multipart_read_mode_fills_cache_after_origin() {
+    let (origin_url, origin) = support::fake_s3::spawn().await;
+    let (cache_url, cache) = support::fake_s3::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(multipart_cache_config(
+        &origin_url,
+        &cache_url,
+        &dir.path().join("index.redb"),
+        CacheMode::Read,
+        WritePolicy::WriteBack,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let upload_id = client_create_upload(&client, &sidecar.url).await;
+    let etag_one = client_upload_part(&client, &sidecar.url, &upload_id, 1, vec![1_u8; 40]).await;
+    let etag_two = client_upload_part(&client, &sidecar.url, &upload_id, 2, vec![2_u8; 60]).await;
+    let body = [vec![1_u8; 40], vec![2_u8; 60]].concat();
+    let complete = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media/item?uploadId={upload_id}", sidecar.url),
+        Some(complete_xml(&[(1, etag_one), (2, etag_two)])),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(complete.status().is_success());
+    assert_eq!(
+        origin.object("media/item").as_deref(),
+        Some(body.as_slice())
+    );
+    assert_eq!(origin.parts(), 2);
+    assert!(cache_has_body(&cache, &body));
+    assert!(cache.keys().iter().any(|key| is_meta_key(key)));
+
+    let origin_gets = origin.gets();
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/item", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(get.status().is_success());
+    assert_eq!(get.bytes().await.unwrap(), Bytes::from(body));
+    assert_eq!(origin.gets(), origin_gets);
+    sidecar.stop().await;
+}
+
+#[tokio::test]
+async fn client_multipart_write_back_completes_in_cache_then_syncs() {
+    let (origin_url, origin) = support::fake_s3::spawn().await;
+    let (cache_url, cache) = support::fake_s3::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(multipart_cache_config(
+        &origin_url,
+        &cache_url,
+        &dir.path().join("index.redb"),
+        CacheMode::ReadWrite,
+        WritePolicy::WriteBack,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let upload_id = client_create_upload(&client, &sidecar.url).await;
+    let etag_one = client_upload_part(&client, &sidecar.url, &upload_id, 1, vec![3_u8; 50]).await;
+    let etag_two = client_upload_part(&client, &sidecar.url, &upload_id, 2, vec![4_u8; 70]).await;
+    let body = [vec![3_u8; 50], vec![4_u8; 70]].concat();
+    let complete = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media/item?uploadId={upload_id}", sidecar.url),
+        Some(complete_xml(&[(1, etag_one), (2, etag_two)])),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(complete.status().is_success());
+    assert_eq!(cache.uploads(), 1);
+    assert_eq!(cache.parts(), 2);
+    assert_eq!(cache.completes(), 1);
+    assert_eq!(origin.uploads(), 0);
+    wait_for(Duration::from_secs(10), || {
+        let origin = origin.clone();
+        let body = body.clone();
+        async move { origin.object("media/item").as_deref() == Some(body.as_slice()) }
+    })
+    .await;
+    let meta = cache_metadata(&cache).expect("the cache has metadata");
+    assert!(matches!(
+        meta.state,
+        s3_sidecar::cache::meta::EntryState::Pending | s3_sidecar::cache::meta::EntryState::Synced
+    ));
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/item", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(get.status().is_success());
+    assert_eq!(get.bytes().await.unwrap(), Bytes::from(body));
+    sidecar.stop().await;
+}
+
+#[tokio::test]
+async fn client_multipart_write_through_uses_origin_then_cache() {
+    let (origin_url, origin) = support::fake_s3::spawn().await;
+    let (cache_url, cache) = support::fake_s3::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(multipart_cache_config(
+        &origin_url,
+        &cache_url,
+        &dir.path().join("index.redb"),
+        CacheMode::ReadWrite,
+        WritePolicy::WriteThrough,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let upload_id = client_create_upload(&client, &sidecar.url).await;
+    let etag_one = client_upload_part(&client, &sidecar.url, &upload_id, 1, vec![5_u8; 30]).await;
+    let etag_two = client_upload_part(&client, &sidecar.url, &upload_id, 2, vec![6_u8; 90]).await;
+    let body = [vec![5_u8; 30], vec![6_u8; 90]].concat();
+    let complete = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media/item?uploadId={upload_id}", sidecar.url),
+        Some(complete_xml(&[(1, etag_one), (2, etag_two)])),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(complete.status().is_success());
+    assert_eq!(origin.completes(), 1);
+    assert_eq!(
+        origin.object("media/item").as_deref(),
+        Some(body.as_slice())
+    );
+    assert!(cache_has_body(&cache, &body));
+    sidecar.stop().await;
+}
+
+#[tokio::test]
+async fn client_multipart_abort_removes_cache_state() {
+    let (origin_url, _origin) = support::fake_s3::spawn().await;
+    let (cache_url, cache) = support::fake_s3::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(multipart_cache_config(
+        &origin_url,
+        &cache_url,
+        &dir.path().join("index.redb"),
+        CacheMode::ReadWrite,
+        WritePolicy::WriteBack,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let upload_id = client_create_upload(&client, &sidecar.url).await;
+    let etag_one = client_upload_part(&client, &sidecar.url, &upload_id, 1, vec![7_u8; 20]).await;
+    let abort = signed_request(
+        &client,
+        Method::DELETE,
+        &format!("{}/media/item?uploadId={upload_id}", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(abort.status().is_success());
+    assert_eq!(cache.aborts(), 1);
+    let complete = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media/item?uploadId={upload_id}", sidecar.url),
+        Some(complete_xml(&[(1, etag_one)])),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(!complete.status().is_success());
+    sidecar.stop().await;
 }
 
 #[tokio::test]
