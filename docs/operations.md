@@ -142,6 +142,19 @@ A cached `GET` or `HEAD` evaluates conditional headers against the cached entry.
 The cache does not evaluate `If-Range`. A conditional range request can return
 `206 PartialContent` when the validator does not match.
 
+## Bucket operations
+
+Cache mode answers `ListBuckets` from the client allow list. It does not send
+the request to origin. `CreateBucket`, `DeleteBucket`, `HeadBucket`,
+`ListObjects` V1, `ListObjects` V2, and bucket sub-resources go to origin. A
+successful `DeleteBucket` does not remove cached objects.
+
+Cluster mode answers `ListBuckets` from the client allow list. `HeadBucket`
+returns `200` for an allowed bucket. `ListObjects` V1 and V2 read committed
+metadata. `CreateBucket` and `DeleteBucket` return `501 NotImplemented` because
+the bucket set comes from configuration. Other bucket sub-resources also return
+`501 NotImplemented`.
+
 ## OpenTelemetry
 
 The sidecar exports metrics, traces, and logs with OpenTelemetry over OTLP.
@@ -691,8 +704,9 @@ S3 client was available.
   several passes.
 - The real-service end-to-end tests are ignored by default. They run only when
   the S3 binaries and the AWS CLI are present.
-- `ListBuckets` and bucket operations that need a real bucket view return
-  `NotImplemented` in cluster mode.
+- Cluster mode does not support `CreateBucket` or `DeleteBucket`. The bucket set
+  comes from configuration.
+- Cache mode `DeleteBucket` does not purge cached objects.
 - Path-style bucket addressing only.
 - One origin endpoint and one cache endpoint.
 - Replication retries have no maximum attempt count. A permanent target outage

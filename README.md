@@ -484,6 +484,16 @@ it returns. A delete of a pending write makes no origin call. A tombstone hides
 the key from reads. In `read` mode and `off` mode the delete goes to origin
 first.
 
+### Bucket operations
+
+Cache mode answers `ListBuckets` from the client allow list. It does not send
+this request to origin. `CreateBucket`, `DeleteBucket`, `HeadBucket`,
+`ListObjects` V1, `ListObjects` V2, and bucket sub-resource requests go to
+origin. The cache does not store bucket responses.
+
+A successful `DeleteBucket` does not purge cached objects for that bucket. The
+cache can still serve an entry until its TTL expires or an eviction removes it.
+
 ### Failure policy
 
 The sync worker retries `5xx`, timeouts, and throttling with exponential
@@ -858,11 +868,17 @@ A committed key with no reachable replica returns `404 NoSuchKey` with an
 `x-s3-sidecar-owner` header and a metric. A tombstone or absent key returns `404
 NoSuchKey`.
 
-ListObjectsV2 reads committed metadata only. It supports prefix, delimiter,
-continuation token, and max-keys. It never reads the raw backing key space.
-Staging blobs, upload records, tombstones, and non-committed rows are hidden.
-`ListBuckets` and bucket operations that need a real bucket view return
-`NotImplemented` in cluster mode.
+`ListObjects` V1 and `ListObjects` V2 read committed metadata only.
+`ListObjects` V1 supports prefix, delimiter, marker, and max-keys.
+`ListObjects` V2 supports prefix, delimiter, continuation token, and max-keys.
+Neither operation reads the raw backing key space. Staging blobs, upload
+records, tombstones, and non-committed rows are hidden.
+
+`ListBuckets` returns the allowed bucket names from the client allow list. It
+does not ask the backing S3 endpoint for a bucket list. `HeadBucket` returns
+`200` for an allowed bucket. `CreateBucket` and `DeleteBucket` return
+`NotImplemented` because the bucket set comes from configuration. Other bucket
+sub-resources also return `NotImplemented`.
 
 CopyObject requires a committed source on this node. It copies the backing blob,
 then commits the destination key. `x-amz-metadata-directive = "COPY"` keeps the
@@ -1074,7 +1090,9 @@ and is not part of the pull request gate.
 - A plain payload hash is checked while the body streams. A mismatch aborts
   the upstream request, but the upstream can receive the full body first.
 - The readiness endpoint reports the sidecar process, not the origin.
-- `ListBuckets` is not supported.
+- Cluster mode does not support `CreateBucket` or `DeleteBucket`. The bucket set
+  comes from configuration.
+- Cache mode `DeleteBucket` does not purge cached objects.
 - A cache entry is two S3 objects: a blob and a metadata object. There is no
   atomic switch between them. A different sidecar that reads the shared cache
   bucket during a write can observe old metadata with new bytes. The accepting
