@@ -308,12 +308,24 @@ use that prefix once per table.
 | `cluster.replica_acks` | counter | `1` | | Peer copies that acknowledged the blob. |
 | `cluster.replica_ack_failures` | counter | `1` | | Peer copies that failed or timed out. |
 
+### Multipart writes
+
+| Metric | Type | Unit | Attributes | Meaning |
+|---|---|---|---|---|
+| `multipart.uploads` | counter | `1` | | Multipart uploads that started. |
+| `multipart.parts` | counter | `1` | | Parts uploaded by a multipart write. |
+| `multipart.aborts` | counter | `1` | | Multipart uploads that were aborted. |
+| `multipart.failures` | counter | `1` | `reason` | Multipart writes that failed. |
+| `multipart.part.duration` | histogram | `ms` | | Duration of one part upload. |
+
+The `reason` attribute is one of `start`, `start_body`, `part_size`, `body`,
+`part`, `part_etag`, or `complete`.
+
 ### Raft
 
 | Metric | Type | Unit | Attributes | Meaning |
 |---|---|---|---|---|
-| `raft.term` | gauge | `1` | | Current raft term. |
-| `raft.leader` | gauge | `1` | `id` | One for the current leader. Zero with `id=""` when there is no leader. |
+| `raft.term` | gauge | `1` | | Current raft term. || `raft.leader` | gauge | `1` | `id` | One for the current leader. Zero with `id=""` when there is no leader. |
 | `raft.last_log_index` | gauge | `1` | | Last raft log index. |
 | `raft.last_applied` | gauge | `1` | | Last applied raft log index. |
 | `raft.snapshot_index` | gauge | `1` | | Last snapshot raft log index. |
@@ -331,6 +343,50 @@ use that prefix once per table.
 
 The exporter logs a warning when an export fails. Export failure does not stop
 the sidecar. Shutdown flushes pending metrics before the process exits.
+
+## Multipart writes
+
+The sidecar writes its own large objects with multipart. This applies to cache
+fills, cache write-through, cache write-back sync, cluster staging, replication
+receives, and read repair. Small metadata, journal, manifest, and bucket-config
+objects still use one `PUT`.
+
+```toml
+[multipart]
+enabled = true
+threshold = "64MiB"
+chunk_size = "16MiB"
+min_chunk_size = "5MiB"
+max_parts = 10000
+concurrency = 4
+```
+
+- `threshold` is the smallest object size that uses multipart. A smaller object
+  uses one `PUT`. `0` makes every non-empty object use multipart.
+- `chunk_size` is the target part size. The sidecar reads the body one part at a
+  time. The last part can be smaller.
+- `min_chunk_size` is the smallest part size. S3 requires at least 5 MiB for
+  every part except the last part. The default is the S3 minimum.
+- `max_parts` is the largest part count. S3 accepts at most 10,000 parts. When
+  an object needs more parts, the sidecar raises the part size to the next whole
+  MiB. If that part size is above 5 GiB, the write fails.
+- `concurrency` is the largest number of part uploads in flight. A higher value
+  can increase throughput. It also increases memory use.
+
+Memory use is bounded by `concurrency * chunk_size` plus one part. The sidecar
+does not load the full object into memory. A larger part size lowers the part
+count and the number of requests. A smaller part size lowers the peak memory.
+Do not set `chunk_size` so high that `concurrency * chunk_size` is above the
+memory you can reserve.
+
+Every failed multipart write aborts the upload before it returns the error. A
+failed abort logs a warning. The original error is the error that the caller
+sees.
+
+Client-driven multipart requests are not affected. A client that sends
+`CreateMultipartUpload`, `UploadPart`, and `CompleteMultipartUpload` still
+reaches the upstream server as before. The `[multipart]` values apply only to
+writes that the sidecar starts.
 
 ## Sizing
 
@@ -351,6 +407,12 @@ the sidecar. Shutdown flushes pending metrics before the process exits.
 | `upstream.retry_attempts` | 2 | Retries after the first attempt for an idempotent request. |
 | `upstream.connect_timeout` | 10s | Bound for the upstream connection phase. |
 | `upstream.request_timeout` | 5m | Bound for upstream response headers on a control request. |
+| `multipart.enabled` | true | Use multipart for sidecar-owned object writes. |
+| `multipart.threshold` | 64MiB | Smallest object that uses multipart. `0` always uses multipart. |
+| `multipart.chunk_size` | 16MiB | Target part size. |
+| `multipart.min_chunk_size` | 5MiB | Smallest part size, the S3 minimum. Must be at most `chunk_size`. |
+| `multipart.max_parts` | 10000 | Largest part count, the S3 maximum. A higher need raises the part size. |
+| `multipart.concurrency` | 4 | Parallel part uploads. Memory is about `concurrency * chunk_size`. |
 
 Set `cache.max_bytes` to the working set plus headroom. Do not set it below
 `cache.max_object_bytes` times the expected concurrent object count.
@@ -542,6 +604,7 @@ S3 client was available.
 - No `Select`.
 - Multipart checksum headers are dropped. A client that sends part checksums
   in `CompleteMultipartUpload` can fail.
+- Sidecar-owned multipart writes do not send per-part checksum headers.
 - No negative cache. A missing key returns to origin on each read.
 - Multipart upload records are node-local. A request must reach the same node
   for the whole upload.
