@@ -2169,6 +2169,13 @@ fn map_storage_error(
     let kind = error.kind();
     match error {
         StorageError::Sign(error) => error,
+        StorageError::Status(status) => {
+            warn!(kind, status = status.as_u16(), "upstream request failed");
+            body_failure_error(failure_flag).unwrap_or_else(|| S3Error::from_status(status))
+        }
+        StorageError::Body => body_failure_error(failure_flag)
+            .unwrap_or_else(|| S3Error::invalid_request("The request body is not valid.")),
+        StorageError::TooLarge => S3Error::entity_too_large(),
         StorageError::Timeout => {
             warn!(kind, "upstream request timed out");
             body_failure_error(failure_flag).unwrap_or_else(S3Error::request_timeout)

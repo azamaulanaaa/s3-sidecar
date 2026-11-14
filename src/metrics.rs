@@ -13,6 +13,11 @@ pub struct Metrics {
     bytes_served: Counter<u64>,
     origin_bytes: Counter<u64>,
     revalidations: Counter<u64>,
+    multipart_uploads: Counter<u64>,
+    multipart_parts: Counter<u64>,
+    multipart_aborts: Counter<u64>,
+    multipart_failures: Counter<u64>,
+    multipart_part_duration: Histogram<f64>,
     sync_success: Counter<u64>,
     sync_failure: Counter<u64>,
     quarantine: Counter<u64>,
@@ -91,6 +96,31 @@ impl Metrics {
                 meter,
                 "s3_sidecar.cache.revalidations",
                 "Conditional origin requests that returned 304.",
+            ),
+            multipart_uploads: counter(
+                meter,
+                "s3_sidecar.multipart.uploads",
+                "Multipart uploads that started.",
+            ),
+            multipart_parts: counter(
+                meter,
+                "s3_sidecar.multipart.parts",
+                "Parts uploaded by multipart writes.",
+            ),
+            multipart_aborts: counter(
+                meter,
+                "s3_sidecar.multipart.aborts",
+                "Multipart uploads that were aborted.",
+            ),
+            multipart_failures: counter(
+                meter,
+                "s3_sidecar.multipart.failures",
+                "Multipart writes that failed by reason.",
+            ),
+            multipart_part_duration: histogram(
+                meter,
+                "s3_sidecar.multipart.part.duration",
+                "Duration of one part upload.",
             ),
             sync_success: counter(
                 meter,
@@ -370,6 +400,32 @@ impl Metrics {
     /// Record one revalidation.
     pub fn revalidated(&self) {
         self.revalidations.add(1, &[]);
+    }
+
+    /// Record one started multipart upload.
+    pub fn multipart_started(&self) {
+        self.multipart_uploads.add(1, &[]);
+    }
+
+    /// Record one uploaded part.
+    pub fn multipart_part(&self) {
+        self.multipart_parts.add(1, &[]);
+    }
+
+    /// Record one aborted multipart upload.
+    pub fn multipart_aborted(&self) {
+        self.multipart_aborts.add(1, &[]);
+    }
+
+    /// Record one multipart failure by reason.
+    pub fn multipart_failed(&self, reason: &str) {
+        self.multipart_failures
+            .add(1, &[KeyValue::new("reason", reason.to_owned())]);
+    }
+
+    /// Record the latency of one part upload.
+    pub fn multipart_part_latency(&self, elapsed: Duration) {
+        self.multipart_part_duration.record(millis(elapsed), &[]);
     }
 
     /// Record one sync success.
@@ -782,6 +838,11 @@ mod tests {
         metrics.add_served_bytes(1);
         metrics.add_origin_bytes(1);
         metrics.revalidated();
+        metrics.multipart_started();
+        metrics.multipart_part();
+        metrics.multipart_aborted();
+        metrics.multipart_failed("part");
+        metrics.multipart_part_latency(Duration::from_millis(1));
         metrics.synced();
         metrics.sync_failed();
         metrics.quarantined();

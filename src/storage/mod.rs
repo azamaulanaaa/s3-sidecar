@@ -33,6 +33,12 @@ pub struct ForwardRequest {
 pub enum StorageError {
     /// The request could not be signed.
     Sign(S3Error),
+    /// The upstream returned a non-success status.
+    Status(StatusCode),
+    /// The request body ended before or after the declared length.
+    Body,
+    /// The object needs a part size above the S3 limit.
+    TooLarge,
     /// The request did not finish within the configured timeout.
     Timeout,
     /// The transport failed.
@@ -45,6 +51,9 @@ impl StorageError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Sign(_) => "sign",
+            Self::Status(_) => "status",
+            Self::Body => "body",
+            Self::TooLarge => "too_large",
             Self::Timeout => "timeout",
             Self::Transport(error) if error.is_timeout() => "timeout",
             Self::Transport(error) if error.is_connect() => "connect",
