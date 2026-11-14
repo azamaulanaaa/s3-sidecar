@@ -123,6 +123,34 @@ async fn body_at_threshold_uses_parts_of_the_chunk_size() {
 }
 
 #[tokio::test]
+async fn complete_etag_is_taken_from_the_body() {
+    let (url, s3) = support::fake_s3::spawn().await;
+    let response = put_object(
+        &client_for(&url),
+        &credential(),
+        "media",
+        "item",
+        HeaderMap::new(),
+        body_stream(vec![4_u8; 200]),
+        Some(200),
+        &multipart_config(100, 100),
+        &Metrics::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(s3.completes(), 1);
+    let etag = response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .unwrap();
+    assert!(etag.starts_with('"'));
+    assert!(etag.ends_with("-2\""));
+    assert!(response.bytes().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn unknown_length_uses_one_put() {
     let (url, s3) = support::fake_s3::spawn().await;
     let body = vec![9_u8; 500];
