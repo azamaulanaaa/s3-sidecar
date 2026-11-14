@@ -47,6 +47,37 @@ pub type SnapshotOf = openraft::type_config::alias::SnapshotOf<TypeConfig, Vec<u
 /// Alias for one raft handle.
 pub type RaftHandle = Raft<TypeConfig, RaftStore>;
 
+/// Smallest election timeout in milliseconds.
+const MIN_ELECTION_TIMEOUT_MS: u64 = 300;
+
+/// Smallest heartbeat interval in milliseconds.
+const MIN_HEARTBEAT_INTERVAL_MS: u64 = 50;
+
+/// Timer settings for one raft node, in milliseconds.
+#[derive(Debug, Clone, Copy)]
+struct RaftTimers {
+    election_min: u64,
+    election_max: u64,
+    heartbeat: u64,
+}
+
+/// Return the timer settings for one RPC timeout.
+///
+/// The leader lease equals the maximum election timeout. The lease must not be
+/// shorter than the RPC timeout, or a slow but valid request can let the lease
+/// expire.
+fn raft_timers(rpc_timeout: Duration) -> RaftTimers {
+    let rpc_ms = u64::try_from(rpc_timeout.as_millis()).unwrap_or(u64::MAX);
+    let election_max = rpc_ms.max(MIN_ELECTION_TIMEOUT_MS);
+    let election_min = (election_max / 2).max(MIN_ELECTION_TIMEOUT_MS / 2);
+    let heartbeat = (election_min / 3).max(MIN_HEARTBEAT_INTERVAL_MS);
+    RaftTimers {
+        election_min,
+        election_max,
+        heartbeat,
+    }
+}
+
 /// A running raft node.
 pub struct RaftNode {
     raft: RaftHandle,
@@ -99,6 +130,7 @@ impl RaftNode {
         N::Network: NetSnapshot<TypeConfig, SnapshotData = Vec<u8>>,
     {
         let raft_config = &config.consensus.raft;
+        let timers = raft_timers(raft_config.rpc_timeout.as_duration());
         let nodes: BTreeMap<String, BasicNode> = raft_config
             .nodes
             .iter()
@@ -113,9 +145,9 @@ impl RaftNode {
             .collect();
         let settings = RaftSettings {
             cluster_name: "s3-sidecar".to_owned(),
-            election_timeout_min: 300,
-            election_timeout_max: 700,
-            heartbeat_interval: 100,
+            election_timeout_min: timers.election_min,
+            election_timeout_max: timers.election_max,
+            heartbeat_interval: timers.heartbeat,
             snapshot_policy: SnapshotPolicy::LogsSinceLast(64),
             ..RaftSettings::default()
         };
@@ -282,6 +314,9 @@ impl RaftNode {
             Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
                 Err(CoordError::Unavailable)
             }
+            Err(RaftError::APIError(ClientWriteError::LogEntryDiscarded(error))) => {
+                Err(CoordError::Indeterminate(error.to_string()))
+            }
             Err(RaftError::Fatal(Fatal::StorageError(error))) => {
                 Err(CoordError::Storage(error.to_string()))
             }
@@ -313,5 +348,28 @@ impl RaftNode {
         self.metrics.set_raft_leader(raft.current_leader.as_deref());
         self.metrics
             .set_cluster_state(applied, term, self.store.tombstone_count().unwrap_or(0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn raft_timers_keep_the_lease_above_the_rpc_timeout() {
+        let timers = raft_timers(Duration::from_secs(2));
+        assert_eq!(timers.election_max, 2_000);
+        assert!(timers.election_min < timers.election_max);
+        assert!(timers.heartbeat < timers.election_min);
+    }
+
+    #[test]
+    fn raft_timers_keep_a_floor_for_a_small_timeout() {
+        let timers = raft_timers(Duration::ZERO);
+        assert_eq!(timers.election_max, MIN_ELECTION_TIMEOUT_MS);
+        assert_eq!(timers.election_min, MIN_ELECTION_TIMEOUT_MS / 2);
+        assert_eq!(timers.heartbeat, MIN_HEARTBEAT_INTERVAL_MS);
     }
 }

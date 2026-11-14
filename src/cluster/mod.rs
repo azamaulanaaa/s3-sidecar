@@ -377,7 +377,7 @@ impl Cluster {
                     .await
                 {
                     Ok(_) => {}
-                    Err(CoordError::Unavailable)
+                    Err(CoordError::Unavailable | CoordError::Indeterminate(_))
                         if self.raft.is_some() || self.consul.is_some() =>
                     {
                         pending = true;
@@ -1927,7 +1927,9 @@ fn map_coord_error(error: CoordError) -> S3Error {
             "Conflict",
             "The object changed during the write.",
         ),
-        CoordError::StaleTerm { .. } | CoordError::Unavailable => S3Error::no_leader(),
+        CoordError::StaleTerm { .. } | CoordError::Unavailable | CoordError::Indeterminate(_) => {
+            S3Error::no_leader()
+        }
         CoordError::Storage(message) => {
             warn!(error = %message, "cluster metadata operation failed");
             S3Error::internal()
