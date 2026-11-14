@@ -1940,3 +1940,73 @@ async fn delete_with_a_wrong_if_match_is_rejected() {
     assert_eq!(origin.delete_count(), 0);
     drop(permit);
 }
+
+#[tokio::test]
+async fn write_mode_rejects_sse_c() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Write,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/sse-c", sidecar.url),
+        Some(b"body".to_vec()),
+        &[
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", "customer-key"),
+            ("x-amz-server-side-encryption-customer-key-md5", "key-md5"),
+        ],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(origin.put_count(), 0);
+}
+
+#[tokio::test]
+async fn read_mode_forwards_sse_c_to_origin() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/sse-c-read", b"hello", "\"etag-sse\"");
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let get = signed_request_with_headers(
+            &client,
+            Method::GET,
+            &format!("{}/media/sse-c-read", sidecar.url),
+            None,
+            &[("x-amz-server-side-encryption-customer-algorithm", "AES256")],
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(body_text(get).await, "hello");
+    }
+    assert_eq!(origin.get_count(), 2);
+}

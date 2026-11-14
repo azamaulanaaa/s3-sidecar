@@ -816,6 +816,24 @@ async fn forward(
         return proxy_request(state, method, &credential, prepared, path_and_query).await;
     };
 
+    if has_sse_c(headers) {
+        match cache.mode() {
+            CacheMode::Write | CacheMode::ReadWrite => {
+                return Err(unsupported_sse_c());
+            }
+            CacheMode::Read => {
+                let response =
+                    proxy_request(state, method, &credential, prepared, path_and_query.clone())
+                        .await?;
+                if method == Method::PUT && response.status().is_success() && !key.is_empty() {
+                    cache.invalidate(&bucket, &key).await;
+                }
+                return Ok(response);
+            }
+            CacheMode::Off => {}
+        }
+    }
+
     if !object || multipart {
         let response = proxy_request(state, method, &credential, prepared, path_and_query).await?;
         if method == Method::POST && query.contains("uploadId") && response.status().is_success() {
