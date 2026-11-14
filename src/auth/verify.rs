@@ -4,9 +4,10 @@ use axum::http::{HeaderMap, HeaderValue, Method, Uri, header::HOST};
 use time::OffsetDateTime;
 
 use super::{
-    ALGORITHM, AuthContext, CredentialStore, MAX_CLOCK_SKEW_SECONDS, MAX_PRESIGN_SECONDS,
-    PayloadKind, SigningKey, StreamingContext, canonical_query, canonical_uri, constant_time_eq,
-    credential_scope, format_scope_date, hmac_sha256, parse_amz_date, sha256_hex, signing_key,
+    ALGORITHM, AuthContext, ClientCredential, CredentialStore, MAX_CLOCK_SKEW_SECONDS,
+    MAX_PRESIGN_SECONDS, PayloadKind, SigningKey, StreamingContext, canonical_query, canonical_uri,
+    constant_time_eq, credential_scope, format_scope_date, hmac_sha256, parse_amz_date, sha256_hex,
+    signing_key,
 };
 use crate::errors::S3Error;
 
@@ -90,6 +91,11 @@ fn verify_header(
     if !constant_time_eq(&expected, parsed.signature) {
         return Err(S3Error::signature_mismatch());
     }
+
+    let session_token = headers
+        .get("x-amz-security-token")
+        .and_then(|value| value.to_str().ok());
+    verify_session_token(&credential, session_token)?;
 
     let payload = payload_kind(
         payload_hash,
@@ -190,7 +196,33 @@ fn verify_presigned(
         return Err(S3Error::signature_mismatch());
     }
 
+    let session_token = parameters
+        .iter()
+        .find(|(key, _)| key == "X-Amz-Security-Token")
+        .map(|(_, value)| value.as_str());
+    verify_session_token(&credential, session_token)?;
+
     Ok(AuthContext::new(credential, PayloadKind::Unsigned))
+}
+
+/// Check the configured session token against the token in the request.
+///
+/// A credential with no configured token ignores the request token.
+fn verify_session_token(
+    credential: &ClientCredential,
+    supplied: Option<&str>,
+) -> Result<(), S3Error> {
+    let Some(expected) = credential.session_token() else {
+        return Ok(());
+    };
+    match supplied {
+        Some(supplied) if constant_time_eq(expected, supplied) => Ok(()),
+        _ => Err(S3Error::new(
+            axum::http::StatusCode::FORBIDDEN,
+            "InvalidToken",
+            "The session token is missing or not valid.",
+        )),
+    }
 }
 
 fn check_clock_skew(timestamp: OffsetDateTime, now: OffsetDateTime) -> Result<(), S3Error> {
@@ -530,14 +562,20 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use axum::http::{HeaderMap, HeaderValue, Method, Uri, header::HOST};
+    use reqwest::Url;
 
-    use super::authenticate;
-    use crate::auth::{CredentialStore, EMPTY_SHA256, parse_amz_date};
+    use super::{authenticate, build_canonical_headers, build_canonical_request, string_to_sign};
+    use crate::auth::sign::sign_request;
+    use crate::auth::{
+        ClientCredential, CredentialStore, EMPTY_SHA256, credential_scope, hmac_sha256,
+        parse_amz_date, signing_key, uri_encode,
+    };
     use crate::config::ClientConfig;
     use crate::config::secret::SecretString;
 
     const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
     const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    const SESSION_TOKEN: &str = "FQoDYXdzEJr/token+example=";
 
     fn store() -> CredentialStore {
         CredentialStore::new(&[ClientConfig {
@@ -546,6 +584,41 @@ mod tests {
             session_token: None,
             buckets: vec!["media".to_owned()],
         }])
+    }
+
+    fn store_with_token() -> CredentialStore {
+        CredentialStore::new(&[ClientConfig {
+            access_key_id: ACCESS_KEY.to_owned(),
+            secret_access_key: SecretString::new(SECRET_KEY),
+            session_token: Some(SecretString::new(SESSION_TOKEN)),
+            buckets: vec!["media".to_owned()],
+        }])
+    }
+
+    fn credential(token: Option<&str>) -> ClientCredential {
+        ClientCredential::new(
+            ACCESS_KEY,
+            SecretString::new(SECRET_KEY),
+            token.map(SecretString::new),
+            vec!["media".to_owned()],
+        )
+    }
+
+    fn signed_header_request(token: Option<&str>) -> (Method, Uri, HeaderMap) {
+        let uri: Uri = "/test.txt".parse().unwrap();
+        let url = Url::parse("https://examplebucket.s3.amazonaws.com/test.txt").unwrap();
+        let mut headers = HeaderMap::new();
+        sign_request(
+            &Method::GET,
+            &url,
+            &mut headers,
+            EMPTY_SHA256,
+            &credential(token),
+            "us-east-1",
+            now(),
+        )
+        .unwrap();
+        (Method::GET, uri, headers)
     }
 
     fn header_request() -> (Method, Uri, HeaderMap) {
@@ -583,6 +656,66 @@ mod tests {
         let auth = authenticate(&method, &uri, &headers, &store(), "us-east-1", now()).unwrap();
         assert_eq!(auth.credential().access_key_id(), ACCESS_KEY);
         assert!(auth.allows_bucket("media"));
+    }
+
+    #[test]
+    fn header_session_token_verifies() {
+        let (method, uri, headers) = signed_header_request(Some(SESSION_TOKEN));
+        let auth = authenticate(
+            &method,
+            &uri,
+            &headers,
+            &store_with_token(),
+            "us-east-1",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(auth.credential().access_key_id(), ACCESS_KEY);
+    }
+
+    #[test]
+    fn missing_header_session_token_is_rejected() {
+        let (method, uri, headers) = signed_header_request(None);
+        let error = authenticate(
+            &method,
+            &uri,
+            &headers,
+            &store_with_token(),
+            "us-east-1",
+            now(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "InvalidToken");
+    }
+
+    #[test]
+    fn wrong_header_session_token_is_rejected() {
+        let (method, uri, headers) = signed_header_request(Some("wrong-token"));
+        let error = authenticate(
+            &method,
+            &uri,
+            &headers,
+            &store_with_token(),
+            "us-east-1",
+            now(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "InvalidToken");
+    }
+
+    #[test]
+    fn extra_header_session_token_is_ignored_without_config() {
+        let (method, uri, mut headers) = signed_header_request(None);
+        headers.insert(
+            "x-amz-security-token",
+            HeaderValue::from_static("unexpected-token"),
+        );
+        let auth = authenticate(&method, &uri, &headers, &store(), "us-east-1", now()).unwrap();
+        assert_eq!(auth.credential().access_key_id(), ACCESS_KEY);
     }
 
     #[test]
@@ -644,6 +777,51 @@ mod tests {
         headers
     }
 
+    fn presigned_uri_with_token(token: Option<&str>) -> Uri {
+        let mut parameters = vec![
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_owned()),
+            (
+                "X-Amz-Credential",
+                format!("{ACCESS_KEY}/20130524/us-east-1/s3/aws4_request"),
+            ),
+            ("X-Amz-Date", "20130524T000000Z".to_owned()),
+            ("X-Amz-Expires", "86400".to_owned()),
+            ("X-Amz-SignedHeaders", "host".to_owned()),
+        ];
+        if let Some(token) = token {
+            parameters.push(("X-Amz-Security-Token", token.to_owned()));
+        }
+        let query = parameters
+            .iter()
+            .map(|(name, value)| {
+                let name = uri_encode(name);
+                let value = uri_encode(value);
+                format!("{name}={value}")
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let uri: Uri = format!("/test.txt?{query}").parse().unwrap();
+
+        let headers = presigned_headers();
+        let canonical_headers = build_canonical_headers(&headers, &uri, "host").unwrap();
+        let canonical_request = build_canonical_request(
+            &Method::GET,
+            &uri,
+            &canonical_headers,
+            "host",
+            "UNSIGNED-PAYLOAD",
+            Some("X-Amz-Signature"),
+        );
+        let scope = credential_scope("20130524", "us-east-1", "s3");
+        let to_sign = string_to_sign("20130524T000000Z", &scope, &canonical_request);
+        let key = signing_key(SECRET_KEY, "20130524", "us-east-1", "s3");
+        let signature = hex::encode(hmac_sha256(&key, to_sign.as_bytes()));
+
+        format!("/test.txt?{query}&X-Amz-Signature={signature}")
+            .parse()
+            .unwrap()
+    }
+
     #[test]
     fn aws_presigned_vector_verifies() {
         let uri = presigned_uri();
@@ -651,6 +829,40 @@ mod tests {
         let auth =
             authenticate(&Method::GET, &uri, &headers, &store(), "us-east-1", now()).unwrap();
         assert_eq!(auth.credential().access_key_id(), ACCESS_KEY);
+    }
+
+    #[test]
+    fn presigned_session_token_verifies() {
+        let uri = presigned_uri_with_token(Some(SESSION_TOKEN));
+        let headers = presigned_headers();
+        let auth = authenticate(
+            &Method::GET,
+            &uri,
+            &headers,
+            &store_with_token(),
+            "us-east-1",
+            now(),
+        )
+        .unwrap();
+        assert_eq!(auth.credential().access_key_id(), ACCESS_KEY);
+    }
+
+    #[test]
+    fn missing_presigned_session_token_is_rejected() {
+        let uri = presigned_uri_with_token(None);
+        let headers = presigned_headers();
+        let error = authenticate(
+            &Method::GET,
+            &uri,
+            &headers,
+            &store_with_token(),
+            "us-east-1",
+            now(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(error.code, "InvalidToken");
     }
 
     #[test]
