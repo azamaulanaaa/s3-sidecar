@@ -18,8 +18,10 @@ A release candidate uses the `vX.Y.Z-rc.N` form. A prerelease must not update th
 ## Pre-tag checks
 
 Run these commands from the repository root. All commands must pass.
+`git status --short` must show no output.
 
 ```bash
+git status --short
 cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
@@ -30,8 +32,8 @@ dist plan --output-format=human
 
 `dist plan --output-format=human` must show version `0.2.0`.
 
-Run `mise exec -- <command>` when `mise.toml` supplies the tool. Do not run a
-locked command before you update `Cargo.lock`.
+Run `mise exec -- <command>` when `mise.toml` supplies the tool. Do not use
+`--locked` before you update `Cargo.lock`.
 
 ## Release candidate
 
