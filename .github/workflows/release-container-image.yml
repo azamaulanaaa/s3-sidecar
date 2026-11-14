@@ -170,15 +170,31 @@ jobs:
           echo "Moved $BINARY_NAME to the project root."
 
       - name: Build and push the architecture image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: .github/Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.tag }}-${{ matrix.arch }}
-          build-args: |
-            BINARY_NAME=${{ env.BINARY_NAME }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.tag }}-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          attempt=1
+          max_attempts=3
+          while true; do
+            if docker buildx build \
+              --file .github/Dockerfile \
+              --platform "$PLATFORM" \
+              --tag "$IMAGE" \
+              --build-arg "BINARY_NAME=$BINARY_NAME" \
+              --push .; then
+              echo "Pushed $IMAGE."
+              exit 0
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::Cannot push $IMAGE. The push failed $max_attempts times. The token may have no package write access. The package may not be linked to this repository. A human must grant this repository write access to the package in the package settings."
+              exit 1
+            fi
+            echo "Push attempt $attempt failed. Retry the push."
+            sleep $((attempt * 5))
+            attempt=$((attempt + 1))
+          done
 
   create-manifest:
     name: Create the multi-arch manifest
