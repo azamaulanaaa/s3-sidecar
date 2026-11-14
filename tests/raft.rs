@@ -85,6 +85,9 @@ fn commit(key: &str, blob: &str) -> CommitRequest {
         cache_control: None,
         content_encoding: None,
         content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: None,
         committed_at: 100,
     }
 }

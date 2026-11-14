@@ -777,6 +777,9 @@ async fn commit_rejection_after_peer_replication_removes_every_blob() {
         cache_control: None,
         content_encoding: None,
         content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: None,
     };
     let cluster = spawn_consul_cluster(
         &["a", "b"],

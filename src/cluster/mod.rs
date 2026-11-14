@@ -426,6 +426,7 @@ impl Cluster {
         headers: &HeaderMap,
         input: WriteBody,
     ) -> Result<Response, S3Error> {
+        reject_encryption_headers(headers)?;
         let current = self
             .state
             .get_metadata(bucket, key)
@@ -476,6 +477,9 @@ impl Cluster {
             cache_control: header_string(headers, header::CACHE_CONTROL),
             content_encoding: header_string(headers, header::CONTENT_ENCODING),
             content_disposition: header_string(headers, header::CONTENT_DISPOSITION),
+            content_language: header_string(headers, header::CONTENT_LANGUAGE),
+            expires: header_string(headers, header::EXPIRES),
+            storage_class: storage_class(headers),
             committed_at: state::unix_now(),
         };
         let metadata = self
@@ -611,6 +615,7 @@ impl Cluster {
         key: &str,
         headers: &HeaderMap,
     ) -> Result<Response, S3Error> {
+        reject_encryption_headers(headers)?;
         let source_value = header_text(headers, "x-amz-copy-source")
             .ok_or_else(|| S3Error::invalid_request("The copy source header is required."))?;
         let (source_bucket, source_key) = parse_copy_source(&source_value)
@@ -649,24 +654,11 @@ impl Cluster {
                 "The metadata directive must be COPY or REPLACE.",
             ));
         };
-        let (content_type, user_metadata, cache_control, content_encoding, content_disposition) =
-            if replace {
-                (
-                    header_string(headers, header::CONTENT_TYPE),
-                    user_metadata(headers),
-                    header_string(headers, header::CACHE_CONTROL),
-                    header_string(headers, header::CONTENT_ENCODING),
-                    header_string(headers, header::CONTENT_DISPOSITION),
-                )
-            } else {
-                (
-                    source.content_type.clone(),
-                    source.user_metadata.clone(),
-                    source.cache_control.clone(),
-                    source.content_encoding.clone(),
-                    source.content_disposition.clone(),
-                )
-            };
+        let object = if replace {
+            ObjectMetadata::from_headers(headers)
+        } else {
+            ObjectMetadata::from_metadata(&source)
+        };
         let blob = next_id();
         let source_path = format!("/{}/objects/{}", self.blob_bucket(), source.blob);
         let mut copy_headers = HeaderMap::new();
@@ -703,16 +695,19 @@ impl Cluster {
             blob: blob.clone(),
             size: source.size,
             checksum: source.checksum.clone(),
-            content_type,
+            content_type: object.content_type,
             etag: source.etag.clone(),
-            user_metadata,
+            user_metadata: object.user_metadata,
             owner: self.node_id.clone(),
             replicas,
             if_none_match,
             if_match,
-            cache_control,
-            content_encoding,
-            content_disposition,
+            cache_control: object.cache_control,
+            content_encoding: object.content_encoding,
+            content_disposition: object.content_disposition,
+            content_language: object.content_language,
+            expires: object.expires,
+            storage_class: object.storage_class,
             committed_at: state::unix_now(),
         };
         let metadata = self
@@ -964,6 +959,8 @@ impl Cluster {
         key: &str,
         headers: &HeaderMap,
     ) -> Result<Response, S3Error> {
+        reject_encryption_headers(headers)?;
+        let object = ObjectMetadata::from_headers(headers);
         let blob = next_id();
         let upload_id = format!("{}-{}", hex::encode(self.node_id.as_bytes()), next_id());
         let response = self
@@ -998,11 +995,14 @@ impl Cluster {
             key: key.to_owned(),
             node_id: self.node_id.clone(),
             blob: blob.clone(),
-            content_type: header_string(headers, header::CONTENT_TYPE),
-            user_metadata: user_metadata(headers),
-            cache_control: header_string(headers, header::CACHE_CONTROL),
-            content_encoding: header_string(headers, header::CONTENT_ENCODING),
-            content_disposition: header_string(headers, header::CONTENT_DISPOSITION),
+            content_type: object.content_type,
+            user_metadata: object.user_metadata,
+            cache_control: object.cache_control,
+            content_encoding: object.content_encoding,
+            content_disposition: object.content_disposition,
+            content_language: object.content_language,
+            expires: object.expires,
+            storage_class: object.storage_class,
             created_at: state::unix_now(),
         };
         self.state.put_upload(&record).map_err(map_coord_error)?;
@@ -1135,6 +1135,9 @@ impl Cluster {
             cache_control: record.cache_control.clone(),
             content_encoding: record.content_encoding.clone(),
             content_disposition: record.content_disposition.clone(),
+            content_language: record.content_language.clone(),
+            expires: record.expires.clone(),
+            storage_class: record.storage_class.clone(),
             committed_at: state::unix_now(),
         };
         let result = self
@@ -1594,6 +1597,74 @@ fn stream_response(response: reqwest::Response, metadata: &Metadata) -> Response
     output
 }
 
+/// Headers that select server-side encryption for a request.
+const ENCRYPTION_HEADERS: [&str; 7] = [
+    "x-amz-server-side-encryption",
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-context",
+    "x-amz-server-side-encryption-bucket-key-enabled",
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key",
+    "x-amz-server-side-encryption-customer-key-md5",
+];
+
+/// Reject encryption headers that cluster mode cannot honor.
+///
+/// # Errors
+///
+/// Returns `NotImplemented` when the request carries an encryption header.
+fn reject_encryption_headers(headers: &HeaderMap) -> Result<(), S3Error> {
+    for name in ENCRYPTION_HEADERS {
+        if headers.contains_key(name) {
+            return Err(S3Error::not_implemented(
+                "Cluster mode cannot honor server-side encryption headers. \
+                 The backing bucket must use default encryption.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Object metadata values that a write can set.
+struct ObjectMetadata {
+    content_type: Option<String>,
+    user_metadata: BTreeMap<String, String>,
+    cache_control: Option<String>,
+    content_encoding: Option<String>,
+    content_disposition: Option<String>,
+    content_language: Option<String>,
+    expires: Option<String>,
+    storage_class: Option<String>,
+}
+
+impl ObjectMetadata {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            content_type: header_string(headers, header::CONTENT_TYPE),
+            user_metadata: user_metadata(headers),
+            cache_control: header_string(headers, header::CACHE_CONTROL),
+            content_encoding: header_string(headers, header::CONTENT_ENCODING),
+            content_disposition: header_string(headers, header::CONTENT_DISPOSITION),
+            content_language: header_string(headers, header::CONTENT_LANGUAGE),
+            expires: header_string(headers, header::EXPIRES),
+            storage_class: storage_class(headers),
+        }
+    }
+
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            content_type: metadata.content_type.clone(),
+            user_metadata: metadata.user_metadata.clone(),
+            cache_control: metadata.cache_control.clone(),
+            content_encoding: metadata.content_encoding.clone(),
+            content_disposition: metadata.content_disposition.clone(),
+            content_language: metadata.content_language.clone(),
+            expires: metadata.expires.clone(),
+            storage_class: metadata.storage_class.clone(),
+        }
+    }
+}
+
 fn set_metadata_headers(metadata: &Metadata, headers: &mut HeaderMap) {
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     if !metadata.etag.is_empty()
@@ -1609,12 +1680,23 @@ fn set_metadata_headers(metadata: &Metadata, headers: &mut HeaderMap) {
             header::CONTENT_DISPOSITION,
             metadata.content_disposition.as_ref(),
         ),
+        (header::CONTENT_LANGUAGE, metadata.content_language.as_ref()),
+        (header::EXPIRES, metadata.expires.as_ref()),
     ] {
         if let Some(value) = value
             && let Ok(value) = HeaderValue::from_str(value)
         {
             headers.insert(name, value);
         }
+    }
+    if let Some(value) = &metadata.storage_class
+        && !value.eq_ignore_ascii_case("STANDARD")
+        && let Ok(value) = HeaderValue::from_str(value)
+    {
+        headers.insert(
+            axum::http::HeaderName::from_static("x-amz-storage-class"),
+            value,
+        );
     }
     for (name, value) in &metadata.user_metadata {
         let name = format!("x-amz-meta-{name}");
@@ -1740,6 +1822,10 @@ fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+fn storage_class(headers: &HeaderMap) -> Option<String> {
+    header_text(headers, "x-amz-storage-class").filter(|value| !value.is_empty())
 }
 
 fn parse_copy_source(value: &str) -> Option<(String, String)> {
@@ -2083,6 +2169,9 @@ mod tests {
             cache_control: None,
             content_encoding: None,
             content_disposition: None,
+            content_language: None,
+            expires: None,
+            storage_class: None,
         };
         assert!(condition_failed(Some(&metadata), true, None));
         assert!(!condition_failed(Some(&metadata), false, Some("\"abc\"")));

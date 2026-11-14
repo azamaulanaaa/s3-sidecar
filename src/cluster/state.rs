@@ -86,6 +86,15 @@ pub struct Metadata {
     pub content_encoding: Option<String>,
     /// Content-Disposition value.
     pub content_disposition: Option<String>,
+    /// Content-Language value.
+    #[serde(default)]
+    pub content_language: Option<String>,
+    /// Expires value.
+    #[serde(default)]
+    pub expires: Option<String>,
+    /// Storage class value.
+    #[serde(default)]
+    pub storage_class: Option<String>,
 }
 
 impl Metadata {
@@ -153,6 +162,15 @@ pub struct UploadRecord {
     /// Content-Disposition for the final object.
     #[serde(default)]
     pub content_disposition: Option<String>,
+    /// Content-Language for the final object.
+    #[serde(default)]
+    pub content_language: Option<String>,
+    /// Expires for the final object.
+    #[serde(default)]
+    pub expires: Option<String>,
+    /// Storage class for the final object.
+    #[serde(default)]
+    pub storage_class: Option<String>,
     /// Creation time in Unix seconds.
     pub created_at: i64,
 }
@@ -580,6 +598,9 @@ impl MetadataStore {
             cache_control: request.cache_control.clone(),
             content_encoding: request.content_encoding.clone(),
             content_disposition: request.content_disposition.clone(),
+            content_language: request.content_language.clone(),
+            expires: request.expires.clone(),
+            storage_class: request.storage_class.clone(),
         };
         write_metadata(write, &key, &metadata)?;
         Ok(ApplyOutcome::Applied(ApplyResult::Commit(metadata)))
@@ -618,6 +639,9 @@ impl MetadataStore {
             cache_control: None,
             content_encoding: None,
             content_disposition: None,
+            content_language: None,
+            expires: None,
+            storage_class: None,
         };
         write_metadata(write, &encoded, &metadata)?;
         Ok(ApplyOutcome::Applied(ApplyResult::Delete(metadata)))
@@ -1108,6 +1132,9 @@ impl MetadataStore {
             cache_control: None,
             content_encoding: None,
             content_disposition: None,
+            content_language: None,
+            expires: None,
+            storage_class: None,
         };
         write_metadata(&write, &encoded, &metadata)?;
         write
@@ -1891,6 +1918,9 @@ mod tests {
             cache_control: None,
             content_encoding: None,
             content_disposition: None,
+            content_language: None,
+            expires: None,
+            storage_class: None,
             committed_at: 10,
         }
     }
@@ -2039,6 +2069,33 @@ mod tests {
         ));
         let metadata = state.get_metadata("media", "a").unwrap().unwrap();
         assert_eq!(metadata.version, 1);
+    }
+
+    #[test]
+    fn old_metadata_rows_decode_without_the_new_headers() {
+        let value = serde_json::json!({
+            "state": "committed",
+            "version": 1,
+            "blob": "blob-a",
+            "size": 1,
+            "checksum": String::new(),
+            "content_type": null,
+            "etag": "etag",
+            "user_metadata": {},
+            "owner": "a",
+            "replicas": [],
+            "created_at": 1,
+            "committed_at": 1,
+            "deleted_at": null,
+            "cache_control": null,
+            "content_encoding": null,
+            "content_disposition": null
+        });
+        let metadata: Metadata = serde_json::from_value(value).unwrap();
+        assert!(metadata.is_committed());
+        assert!(metadata.content_language.is_none());
+        assert!(metadata.expires.is_none());
+        assert!(metadata.storage_class.is_none());
     }
 
     #[test]

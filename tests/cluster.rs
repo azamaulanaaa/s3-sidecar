@@ -863,6 +863,336 @@ async fn copy_object_preserves_and_replaces_metadata() {
 }
 
 #[tokio::test]
+async fn put_get_and_head_return_object_headers() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/media/headers", sidecar.url);
+    let response = put(
+        &client,
+        &url,
+        b"body",
+        &[
+            ("content-language", "en-US"),
+            ("expires", "Wed, 21 Oct 2026 07:28:00 GMT"),
+            ("x-amz-storage-class", "INTELLIGENT_TIERING"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for method in [Method::GET, Method::HEAD] {
+        let response = signed_request(&client, method, &url, None, &[])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
+            "en-US"
+        );
+        assert_eq!(
+            response.headers().get(header::EXPIRES).unwrap(),
+            "Wed, 21 Oct 2026 07:28:00 GMT"
+        );
+        assert_eq!(
+            response.headers().get("x-amz-storage-class").unwrap(),
+            "INTELLIGENT_TIERING"
+        );
+    }
+
+    let default_url = format!("{}/media/default-class", sidecar.url);
+    let response = put(
+        &client,
+        &default_url,
+        b"body",
+        &[("x-amz-storage-class", "STANDARD")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    for method in [Method::GET, Method::HEAD] {
+        let response = signed_request(&client, method, &default_url, None, &[])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-amz-storage-class").is_none());
+    }
+}
+
+#[tokio::test]
+async fn copy_object_preserves_and_replaces_object_headers() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let source_url = format!("{}/media/source-headers", sidecar.url);
+    let response = put(
+        &client,
+        &source_url,
+        b"copy-body",
+        &[
+            ("content-language", "en-US"),
+            ("expires", "Wed, 21 Oct 2026 07:28:00 GMT"),
+            ("x-amz-storage-class", "GLACIER"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let copied_url = format!("{}/media/copied-headers", sidecar.url);
+    let response = signed_request(
+        &client,
+        Method::PUT,
+        &copied_url,
+        None,
+        &[
+            ("x-amz-copy-source", "/media/source-headers"),
+            ("x-amz-metadata-directive", "COPY"),
+        ],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = signed_request(&client, Method::GET, &copied_url, None, &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
+        "en-US"
+    );
+    assert_eq!(
+        response.headers().get(header::EXPIRES).unwrap(),
+        "Wed, 21 Oct 2026 07:28:00 GMT"
+    );
+    assert_eq!(
+        response.headers().get("x-amz-storage-class").unwrap(),
+        "GLACIER"
+    );
+
+    let replaced_url = format!("{}/media/replaced-headers", sidecar.url);
+    let response = signed_request(
+        &client,
+        Method::PUT,
+        &replaced_url,
+        None,
+        &[
+            ("x-amz-copy-source", "/media/source-headers"),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("content-language", "fr"),
+            ("expires", "Thu, 22 Oct 2026 07:28:00 GMT"),
+            ("x-amz-storage-class", "STANDARD_IA"),
+        ],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for method in [Method::GET, Method::HEAD] {
+        let response = signed_request(&client, method, &replaced_url, None, &[])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
+            "fr"
+        );
+        assert_eq!(
+            response.headers().get(header::EXPIRES).unwrap(),
+            "Thu, 22 Oct 2026 07:28:00 GMT"
+        );
+        assert_eq!(
+            response.headers().get("x-amz-storage-class").unwrap(),
+            "STANDARD_IA"
+        );
+    }
+}
+
+#[tokio::test]
+async fn multipart_upload_preserves_object_headers() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let create_url = format!("{}/media/header-parts?uploads", sidecar.url);
+    let response = signed_request(
+        &client,
+        Method::POST,
+        &create_url,
+        Some(Vec::new()),
+        &[
+            ("content-language", "en-GB"),
+            ("expires", "Fri, 23 Oct 2026 07:28:00 GMT"),
+            ("x-amz-storage-class", "ONEZONE_IA"),
+        ],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let upload_id = extract(&body_text(response).await, "UploadId");
+
+    let part_url = format!(
+        "{}/media/header-parts?partNumber=1&uploadId={upload_id}",
+        sidecar.url
+    );
+    let response = put(&client, &part_url, b"part-body", &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let complete_url = format!("{}/media/header-parts?uploadId={upload_id}", sidecar.url);
+    let complete_body = "<CompleteMultipartUpload>\
+        <Part><PartNumber>1</PartNumber><ETag>\"part-etag\"</ETag></Part>\
+        </CompleteMultipartUpload>"
+        .as_bytes()
+        .to_vec();
+    let response = signed_request(
+        &client,
+        Method::POST,
+        &complete_url,
+        Some(complete_body),
+        &[("content-type", "application/xml")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let url = format!("{}/media/header-parts", sidecar.url);
+    for method in [Method::GET, Method::HEAD] {
+        let response = signed_request(&client, method, &url, None, &[])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_LANGUAGE).unwrap(),
+            "en-GB"
+        );
+        assert_eq!(
+            response.headers().get(header::EXPIRES).unwrap(),
+            "Fri, 23 Oct 2026 07:28:00 GMT"
+        );
+        assert_eq!(
+            response.headers().get("x-amz-storage-class").unwrap(),
+            "ONEZONE_IA"
+        );
+    }
+}
+
+#[tokio::test]
+async fn encryption_headers_return_not_implemented() {
+    let (backing, handle) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let sse_customer = [
+        ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ("x-amz-server-side-encryption-customer-key", "c2VjcmV0"),
+        ("x-amz-server-side-encryption-customer-key-md5", "bWQ1"),
+    ];
+
+    let before = handle.put_count();
+    let response = put(
+        &client,
+        &format!("{}/media/sse-put", sidecar.url),
+        b"body",
+        &sse_customer,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let text = body_text(response).await;
+    assert!(text.contains("NotImplemented"));
+    assert!(text.contains("default encryption"));
+    assert_eq!(handle.put_count(), before);
+
+    let response = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/sse-copy", sidecar.url),
+        None,
+        &[
+            ("x-amz-copy-source", "/media/sse-put"),
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let response = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media/sse-multipart?uploads", sidecar.url),
+        Some(Vec::new()),
+        &[("x-amz-server-side-encryption-customer-algorithm", "AES256")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        sidecar
+            .state
+            .cluster()
+            .unwrap()
+            .state()
+            .uploads()
+            .unwrap()
+            .is_empty()
+    );
+
+    let response = put(
+        &client,
+        &format!("{}/media/sse-managed", sidecar.url),
+        b"body",
+        &[("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(handle.put_count(), before);
+}
+
+#[tokio::test]
 async fn list_hides_staging_and_upload_objects() {
     let (backing, handle) = spawn_backing().await;
     handle.insert("staged-orphan", b"x", "2000-01-01T00:00:00Z");
