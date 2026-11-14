@@ -134,7 +134,7 @@ pub struct ConfigFlags {
     /// Cache node name. It is part of the cache key and journal path.
     #[arg(long = "cache-node-id", value_name = "ID")]
     pub cache_node_id: Option<String>,
-    /// Cache mode: `off`, `read`, `write`, or `read_write`.
+    /// Cache mode: `read`, `write`, or `read_write`.
     #[arg(long = "cache-mode", value_name = "MODE")]
     pub cache_mode: Option<String>,
     /// Maximum cache size in bytes. 0 means unlimited.

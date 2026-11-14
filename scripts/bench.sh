@@ -23,14 +23,12 @@ REGION=us-east-1
 
 ORIGIN_PORT=19101
 CACHE_PORT=19102
-PROXY_PORT=19103
 CACHE_PROXY_PORT=19104
 CLUSTER_PORT=19105
 RAFT_PORTS=(19201 19202 19203)
 
 ORIGIN="http://127.0.0.1:${ORIGIN_PORT}"
 CACHE="http://127.0.0.1:${CACHE_PORT}"
-PROXY="http://127.0.0.1:${PROXY_PORT}"
 CACHE_PROXY="http://127.0.0.1:${CACHE_PROXY_PORT}"
 CLUSTER="http://127.0.0.1:${CLUSTER_PORT}"
 
@@ -241,33 +239,6 @@ run_seed() {
 	"$LOADGEN" "$@" >/dev/null
 }
 
-write_proxy_config() {
-	cat >"$TMP/proxy.toml" <<EOF
-mode = "cache"
-
-[server]
-bind = "127.0.0.1:${PROXY_PORT}"
-
-[origin]
-endpoint = "${ORIGIN}"
-region = "${REGION}"
-access_key_id = "${ACCESS_KEY}"
-secret_access_key = "${SECRET_KEY}"
-
-[cache]
-mode = "off"
-
-[[clients]]
-access_key_id = "${ACCESS_KEY}"
-secret_access_key = "${SECRET_KEY}"
-buckets = ["${BUCKET_ORIGIN}"]
-
-[[buckets]]
-name = "${BUCKET_ORIGIN}"
-ttl = "1h"
-EOF
-}
-
 write_cache_config() {
 	cat >"$TMP/cache.toml" <<EOF
 mode = "cache"
@@ -465,22 +436,6 @@ s3_mb "$CACHE" "$BUCKET_CACHE"
 s3_mb "$ORIGIN" "$BUCKET_A"
 s3_mb "$ORIGIN" "$BUCKET_B"
 s3_mb "$ORIGIN" "$BUCKET_C"
-
-write_proxy_config
-printf '==> proxy scenario\n'
-start_sidecar "$TMP/proxy.toml" "$TMP/proxy.log"
-PROXY_PID=$STARTED_PID
-wait_ready "$PROXY" "$TMP/proxy.log"
-run_load proxy-put --endpoint "$PROXY" --bucket "$BUCKET_ORIGIN" --key bench/proxy-put \
-	--requests "$REQUESTS" --concurrency 8 --size 4096 --mode put \
-	--access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" --region "$REGION"
-run_seed --endpoint "$PROXY" --bucket "$BUCKET_ORIGIN" --key bench/proxy-get \
-	--requests "$REQUESTS" --concurrency 8 --size 4096 --mode put \
-	--access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" --region "$REGION"
-run_load proxy-get --endpoint "$PROXY" --bucket "$BUCKET_ORIGIN" --key bench/proxy-get \
-	--requests "$REQUESTS" --concurrency 8 --size 4096 --mode get \
-	--access-key "$ACCESS_KEY" --secret-key "$SECRET_KEY" --region "$REGION"
-stop_pid "$PROXY_PID"
 
 write_cache_config
 printf '==> cache scenario\n'

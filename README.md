@@ -102,9 +102,9 @@ secret_access_key = "minioadmin"
 buckets = ["media"]
 ```
 
-Set `cache.mode = "off"` to use the sidecar as a pure proxy. When
-`cache.mode` is not `off`, `cache.max_bytes` is required: a byte count, or `0`
-for unlimited.
+Cache mode always uses a cache. `cache.endpoint`, `cache.bucket`, and
+`cache.max_bytes` are required. Set `cache.max_bytes` to a byte count, or `0`
+for unlimited. Cluster mode has no cache.
 
 Check the merged configuration:
 
@@ -362,7 +362,7 @@ every origin bucket. The sidecar stores cache objects under this path:
 <prefix>/journal/<node-id>/<uuid>.json
 ```
 
-`cache.bucket` is required when `cache.mode` is not `off`.
+`cache.bucket` is required in cache mode.
 `cache.prefix` defaults to `cache`. Set `cache.node_id` to a stable name for
 each sidecar. The node id is part of the key and the journal path. Sidecars do
 not process each other's journals.
@@ -371,7 +371,6 @@ not process each other's journals.
 
 | Mode | GET and HEAD | PUT and DELETE |
 |---|---|---|
-| `off` | origin | origin |
 | `read` | cache, then revalidate | origin, then invalidate |
 | `write` | pending entry, else origin | cache first, sync origin later |
 | `read_write` | pending entry, else cache, then revalidate | cache first, sync origin later |
@@ -383,9 +382,8 @@ not process each other's journals.
 
 Cache mode `write` and `read_write` reject a request that carries SSE-C headers
 with `501 NotImplemented`. The sidecar cannot store the customer key safely.
-Cache mode `read` keeps the cache out of the path and forwards the request to
-origin. Cache mode `off` forwards the request unchanged. Pure proxy mode is the
-supported way to use SSE-C.
+Cache mode `read` is the supported mode for SSE-C. It keeps the cache out of
+the path and forwards the request to origin.
 
 ### Read path
 
@@ -971,7 +969,6 @@ first. The request index is appended to `--key`.
 `scripts/bench.sh` builds the release binary and runs the repeatable scenarios.
 It starts a local origin S3 and a local cache S3, then runs:
 
-- `proxy-put` and `proxy-get` with `cache.mode = "off"`.
 - `cache-miss` then `cache-hit` with `cache.mode = "read_write"`.
 - `cluster-leader` on a single-node cluster with `write_ack = "leader"`.
 - `cluster-quorum` on a three-node raft cluster with `write_ack = "quorum"`.
@@ -1084,8 +1081,8 @@ and is not part of the pull request gate.
   return `206 PartialContent` when the validator does not match.
 - The cache header allowlist is fixed. The cache does not preserve object tags,
   object lock headers, website redirect headers, or encryption headers.
-- SSE-C works only in pure proxy mode, or in cache mode `read` where the cache
-  is bypassed. Cache write modes return `501 NotImplemented`.
+- SSE-C works only in cache mode `read` where the cache is bypassed. Cache
+  write modes return `501 NotImplemented`.
 - Cluster mode requires default encryption on the backing bucket. Client
   encryption headers are not supported.
 - Cluster mode rejects encryption headers on `PutObject`, `CopyObject`,

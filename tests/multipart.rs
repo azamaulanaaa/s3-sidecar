@@ -359,7 +359,12 @@ fn invalid_multipart_config_is_rejected() {
 fn multipart_settings_load_from_file_env_and_flags() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sidecar.toml");
-    std::fs::write(&path, "[multipart]\nthreshold = \"32MiB\"\n").unwrap();
+    std::fs::write(
+        &path,
+        "[multipart]\nthreshold = \"32MiB\"\n[cache]\nendpoint = \"http://127.0.0.1:9002\"\n\
+         bucket = \"cache\"\nmode = \"read_write\"\nmax_bytes = 0\n",
+    )
+    .unwrap();
     let loaded = load(&LoadOptions {
         config_flag: Some(path),
         env: vec![(

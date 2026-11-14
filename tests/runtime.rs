@@ -15,8 +15,8 @@ use s3_sidecar::auth::sign::sign_request;
 use s3_sidecar::auth::{ClientCredential, CredentialStore, EMPTY_SHA256};
 use s3_sidecar::config::secret::SecretString;
 use s3_sidecar::config::{
-    CacheConfig, CacheMode, ClientConfig, Config, EndpointConfig, ServerConfig, TlsConfig,
-    UpstreamConfig,
+    CacheConfig, CacheMode, ClientConfig, Config, EndpointConfig, OnCacheError, ServerConfig,
+    TlsConfig, UpstreamConfig,
 };
 use s3_sidecar::server::{ServeError, Server, start};
 use time::OffsetDateTime;
@@ -124,7 +124,11 @@ fn config(origin: String) -> Config {
         },
         upstream: UpstreamConfig::default(),
         cache: CacheConfig {
-            mode: CacheMode::Off,
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            bucket: "cachebucket".to_owned(),
+            mode: CacheMode::Read,
+            max_bytes: Some(0),
+            on_cache_error: OnCacheError::Origin,
             ..CacheConfig::default()
         },
         origin: EndpointConfig {

@@ -510,6 +510,28 @@ pub fn trim_line_end(value: &str) -> &str {
 }
 
 #[cfg(test)]
+fn test_cache_flags(mut flags: Value) -> Value {
+    let Value::Object(map) = &mut flags else {
+        return flags;
+    };
+    let cache = map
+        .entry("cache".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Value::Object(cache) = cache {
+        cache
+            .entry("endpoint".to_owned())
+            .or_insert_with(|| Value::String("http://127.0.0.1:9002".to_owned()));
+        cache
+            .entry("bucket".to_owned())
+            .or_insert_with(|| Value::String("cache".to_owned()));
+        cache
+            .entry("max_bytes".to_owned())
+            .or_insert_with(|| json!(0));
+    }
+    flags
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -518,7 +540,7 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{LoadOptions, Source, load};
+    use super::{LoadOptions, Source, load, test_cache_flags};
     use crate::config::secret::SecretString;
 
     fn load_with(
@@ -535,7 +557,7 @@ mod tests {
         load(&LoadOptions {
             config_flag,
             env,
-            flags,
+            flags: test_cache_flags(flags),
             cwd: dir.to_path_buf(),
             default_paths: Vec::new(),
         })
@@ -546,7 +568,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let loaded = load_with(dir.path(), None, Vec::new(), json!({})).unwrap();
         assert_eq!(loaded.config.server.bind, "127.0.0.1:9000");
-        assert_eq!(loaded.config.cache.mode, super::super::CacheMode::Off);
+        assert_eq!(loaded.config.cache.mode, super::super::CacheMode::ReadWrite);
         assert_eq!(loaded.sources.get("server.bind"), None);
     }
 
@@ -737,7 +759,7 @@ session_ttl = "15s"
         let loaded = load(&LoadOptions {
             config_flag: None,
             env: Vec::new(),
-            flags: json!({}),
+            flags: test_cache_flags(json!({})),
             cwd: dir.path().to_path_buf(),
             default_paths: vec![PathBuf::from("sidecar.toml")],
         })
@@ -749,8 +771,6 @@ session_ttl = "15s"
     fn secret_is_redacted_in_the_table() {
         let dir = tempdir().unwrap();
         let file = r#"
-[cache]
-mode = "off"
 [origin]
 endpoint = "http://127.0.0.1:9001"
 secret_access_key = "do-not-show-this"
@@ -870,7 +890,7 @@ mod provenance_tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{LoadOptions, load};
+    use super::{LoadOptions, load, test_cache_flags};
     use crate::config::show_table;
 
     fn line<'a>(table: &'a str, field: &str) -> &'a str {
@@ -903,7 +923,7 @@ name = "media"
         let loaded = load(&LoadOptions {
             config_flag: Some(path),
             env,
-            flags,
+            flags: test_cache_flags(flags),
             cwd: dir.path().to_path_buf(),
             default_paths: Vec::new(),
         })
@@ -919,7 +939,7 @@ name = "media"
         assert!(line(&table, "cache.prefix").contains("default"));
         assert!(line(&table, "origin.session_token").contains("(unset)"));
         assert!(line(&table, "origin.session_token").contains("unset"));
-        assert!(line(&table, "cache.max_bytes").contains("(unset)"));
+        assert!(line(&table, "cache.max_bytes").contains("0 (unlimited)"));
         assert!(line(&table, "clients[0].session_token").contains("(unset)"));
         assert!(line(&table, "buckets[0].ttl").contains("(unset)"));
     }
@@ -949,7 +969,7 @@ region = "us-east-1"
         let loaded = load(&LoadOptions {
             config_flag: Some(path),
             env,
-            flags,
+            flags: test_cache_flags(flags),
             cwd: dir.path().to_path_buf(),
             default_paths: Vec::new(),
         })

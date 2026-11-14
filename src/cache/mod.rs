@@ -30,7 +30,7 @@ use self::meta::{
 };
 use crate::auth::body::BodyStream;
 use crate::auth::{ClientCredential, now};
-use crate::config::{CacheMode, Config, EndpointConfig, OnCacheError, WritePolicy};
+use crate::config::{CacheMode, Config, EndpointConfig, Mode, OnCacheError, WritePolicy};
 use crate::errors::S3Error;
 use crate::metrics::Metrics;
 use crate::storage::{ForwardRequest, S3Client, StorageError};
@@ -128,13 +128,13 @@ pub struct Cache {
 }
 
 impl Cache {
-    /// Build the cache when the mode is not `off`.
+    /// Build the cache for cache mode.
     ///
     /// # Errors
     ///
     /// Returns an error when an endpoint URL or the index file is not valid.
     pub fn new(config: Arc<Config>, metrics: Arc<Metrics>) -> Result<Option<Arc<Self>>, S3Error> {
-        if config.cache.mode == CacheMode::Off {
+        if config.mode == Mode::Cluster {
             return Ok(None);
         }
         let cache_endpoint = EndpointConfig {
