@@ -172,7 +172,7 @@ resource_attributes = { "deployment.environment.name" = "production" }
 | `otel.log_schedule_delay` | `5s` | Delay between log exports. |
 | `otel.export_timeout` | `10s` | Bound for the final flush at shutdown. |
 | `otel.resource_attributes` | empty | Extra resource attributes. |
-| `otel.record_object_keys` | `false` | Add `s3.object.key` to server spans. |
+| `otel.record_object_keys` | `false` | Add `s3.object.key` and keep the object key in `url.path`. |
 
 Environment fallbacks apply when a setting is unset:
 
@@ -234,9 +234,13 @@ Span names are fixed. Object keys, UUIDs, and free-form error strings are never
 part of a span name. Bounded values belong in attributes.
 
 `record_object_keys = false` is the default. Object keys can identify private
-data, so the sidecar does not add `s3.object.key` unless the operator turns it
-on. `url.path` always contains the request path and may contain an object key.
-Treat exported traces as sensitive when keys are private.
+data. The flag gates both `s3.object.key` and the object part of `url.path`.
+When it is false, an object path uses `/{bucket}/[redacted]` on the server span
+and on every upstream span. The bucket name stays because it has low
+cardinality. Bucket-level paths stay unchanged. Control paths such as
+`/healthz`, `/readyz`, `/_raft/...`, `/_coord/...`, and `/_blob/...` stay
+unchanged in both modes. When it is true, the full path and `s3.object.key` are
+kept. Treat exported traces as sensitive when keys are private.
 
 ### Logs
 

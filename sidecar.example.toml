@@ -131,7 +131,8 @@ enabled = false
 # traces = false               # Server and upstream spans.
 # logs = false                 # tracing events with trace correlation.
 # trace_sample_ratio = 1.0     # 0.0 disables root traces. 1.0 samples every root.
-# record_object_keys = false   # Add s3.object.key to server spans. Off for privacy.
+# record_object_keys = false   # Add s3.object.key and keep object keys in url.path.
+#                              # Off redacts object paths as /{bucket}/[redacted].
 # service_name = "s3-sidecar"
 # service_version = "0.1.0"
 # endpoint = "http://127.0.0.1:4317"

@@ -248,7 +248,7 @@ metrics = true
 traces = true
 logs = true
 trace_sample_ratio = 1.0        # 0.0 disables root traces.
-record_object_keys = false      # Off for privacy.
+record_object_keys = false      # Redact object keys in spans. Off for privacy.
 service_name = "s3-sidecar"
 service_version = "0.1.0"
 endpoint = "http://127.0.0.1:4317"
@@ -281,8 +281,10 @@ An unset `otel.endpoint` uses `OTEL_EXPORTER_OTLP_ENDPOINT`. An unset
 A trace starts at `s3.request`. The sidecar extracts W3C `traceparent` and
 `tracestate` from incoming requests and injects the context into every upstream
 S3, cache, peer, raft, and Consul request. Log records carry the trace and span
-ids of the current span. See the operations guide for the span and attribute
-list and the object-key privacy note.
+ids of the current span. `record_object_keys = false` redacts the object part
+of `url.path` as `/{bucket}/[redacted]` on server and upstream spans and omits
+`s3.object.key`. Control paths are unchanged. See the operations guide for the
+span and attribute list and the object-key privacy note.
 
 Use `otel.headers` or `otel.headers_file` for collector authentication. The
 headers file contains a JSON object. `check --show-config` redacts header values.
