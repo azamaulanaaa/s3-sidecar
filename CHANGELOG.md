@@ -45,6 +45,8 @@ This section lists behavior changes.
 - Invalid `/_blob/` identifiers could reach the backing S3 path.
 - `UploadPart` and `CompleteMultipartUpload` did not reject encryption headers in
   cluster mode.
+- The container image workflow did not start when the Release workflow published
+  the release.
 
 ### Security
 
