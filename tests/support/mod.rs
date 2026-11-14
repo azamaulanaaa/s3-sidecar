@@ -2,6 +2,8 @@
 
 //! In-memory OpenTelemetry metric helpers for integration tests.
 
+pub mod fake_s3;
+
 use std::sync::Arc;
 
 use opentelemetry::metrics::MeterProvider;

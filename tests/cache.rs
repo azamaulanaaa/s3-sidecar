@@ -59,7 +59,11 @@ struct OriginState {
 struct CacheState {
     objects: Arc<Mutex<HashMap<String, Stored>>>,
     put_status: Arc<Mutex<Option<StatusCode>>>,
+    uploads: CacheUploads,
+    next_upload: Arc<AtomicU64>,
 }
+
+type CacheUploads = Arc<Mutex<HashMap<String, (String, std::collections::BTreeMap<u32, Bytes>)>>>;
 
 #[derive(Clone)]
 struct OriginHandle {
@@ -280,6 +284,8 @@ async fn spawn_cache() -> (String, CacheHandle) {
     let state = CacheState {
         objects: Arc::clone(&objects),
         put_status: Arc::clone(&put_status),
+        uploads: Arc::new(Mutex::new(HashMap::new())),
+        next_upload: Arc::new(AtomicU64::new(0)),
     };
     let app = Router::new().fallback(cache_handler).with_state(state);
     tokio::spawn(async move {
@@ -324,6 +330,84 @@ async fn cache_handler(
         }
         return Response::builder()
             .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap();
+    }
+    let query = uri.query().unwrap_or_default();
+    if method == Method::POST && query.split('&').any(|pair| pair == "uploads") {
+        let id = state.next_upload.fetch_add(1, Ordering::Relaxed);
+        let upload_id = format!("cache-upload-{id}");
+        state
+            .uploads
+            .lock()
+            .unwrap()
+            .insert(upload_id.clone(), (key, std::collections::BTreeMap::new()));
+        return xml(
+            StatusCode::OK,
+            &format!(
+                "<InitiateMultipartUploadResult><UploadId>{upload_id}</UploadId>\
+                 </InitiateMultipartUploadResult>"
+            ),
+        );
+    }
+    if method == Method::PUT && query.contains("partNumber=") {
+        let upload_id = query_value(query, "uploadId").unwrap_or_default();
+        let number = query_value(query, "partNumber")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let mut uploads = state.uploads.lock().unwrap();
+        let Some((_, parts)) = uploads.get_mut(&upload_id) else {
+            return xml(
+                StatusCode::NOT_FOUND,
+                "<Error><Code>NoSuchUpload</Code></Error>",
+            );
+        };
+        parts.insert(number, body);
+        drop(uploads);
+        let mut response = Response::new(Body::empty());
+        response
+            .headers_mut()
+            .insert(header::ETAG, HeaderValue::from_static("\"part-etag\""));
+        return response;
+    }
+    if method == Method::POST && query.contains("uploadId=") {
+        let upload_id = query_value(query, "uploadId").unwrap_or_default();
+        let Some((key, parts)) = state.uploads.lock().unwrap().remove(&upload_id) else {
+            return xml(
+                StatusCode::NOT_FOUND,
+                "<Error><Code>NoSuchUpload</Code></Error>",
+            );
+        };
+        let mut bytes = Vec::new();
+        for part in parts.values() {
+            bytes.extend_from_slice(part);
+        }
+        let body = Bytes::from(bytes);
+        let etag = format!("\"{}\"", body.len());
+        state.objects.lock().unwrap().insert(
+            key,
+            Stored {
+                body,
+                etag: etag.clone(),
+                last_modified: "Tue, 24 May 2013 00:00:00 GMT".to_owned(),
+                content_type: None,
+                content_encoding: None,
+            },
+        );
+        return xml(
+            StatusCode::OK,
+            &format!(
+                "<CompleteMultipartUploadResult><ETag>{etag}</ETag>\
+                 </CompleteMultipartUploadResult>"
+            ),
+        );
+    }
+    if method == Method::DELETE && query.contains("uploadId=") {
+        if let Some(upload_id) = query_value(query, "uploadId") {
+            state.uploads.lock().unwrap().remove(&upload_id);
+        }
+        return Response::builder()
+            .status(StatusCode::NO_CONTENT)
             .body(Body::empty())
             .unwrap();
     }
