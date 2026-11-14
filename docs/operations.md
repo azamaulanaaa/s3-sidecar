@@ -165,7 +165,7 @@ trace_schedule_delay = "5s"
 log_schedule_delay = "5s"
 record_object_keys = false
 service_name = "s3-sidecar"
-service_version = "0.1.0"
+service_version = "0.2.0"
 endpoint = "http://127.0.0.1:4317"
 protocol = "grpc"                # grpc | http/protobuf
 headers = { "x-api-key" = "..." }
@@ -182,7 +182,7 @@ resource_attributes = { "deployment.environment.name" = "production" }
 | `otel.traces` | `false` | Export traces over OTLP. |
 | `otel.logs` | `false` | Export logs over OTLP. |
 | `otel.service_name` | `s3-sidecar` | The `service.name` resource attribute. |
-| `otel.service_version` | `0.1.0` | The `service.version` resource attribute. |
+| `otel.service_version` | `crate version` | The `service.version` resource attribute. |
 | `otel.endpoint` | unset | Collector URL for every enabled signal. |
 | `otel.trace_endpoint` | unset | Trace collector URL. Falls back to `otel.endpoint`. |
 | `otel.logs_endpoint` | unset | Log collector URL. Falls back to `otel.endpoint`. |

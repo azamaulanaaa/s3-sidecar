@@ -272,7 +272,7 @@ impl Default for OtelConfig {
             traces: false,
             logs: false,
             service_name: None,
-            service_version: "0.1.0".to_owned(),
+            service_version: env!("CARGO_PKG_VERSION").to_owned(),
             endpoint: None,
             trace_endpoint: None,
             logs_endpoint: None,
