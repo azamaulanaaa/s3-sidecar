@@ -1057,7 +1057,8 @@ impl Cache {
             meta.mark_synced(etag.unwrap_or_else(|| entry.etag.clone()), unix_now());
             let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
             let _ = self.index_upsert(&cache_key, &meta).await;
-            lock(&self.pending).remove(&(bucket.clone(), entry.key.clone()));
+            let mut pending = lock(&self.pending);
+            remove_pending_if_current(&mut pending, &(bucket.clone(), entry.key.clone()), &path);
         } else {
             lock(&self.tombstones).remove(&(entry.bucket.clone(), entry.key.clone()));
         }
@@ -1091,7 +1092,12 @@ impl Cache {
                 let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
                 self.index_remove(&cache_key);
             }
-            lock(&self.pending).remove(&(entry.bucket.clone(), entry.key.clone()));
+            let mut pending = lock(&self.pending);
+            remove_pending_if_current(
+                &mut pending,
+                &(entry.bucket.clone(), entry.key.clone()),
+                &path,
+            );
         } else {
             lock(&self.tombstones)
                 .insert((entry.bucket.clone(), entry.key.clone()), entry.created_at);
@@ -1825,13 +1831,30 @@ fn metadata_from_response(bucket: &str, key: &str, response: &reqwest::Response)
         content_type,
         content_encoding,
         unix_now(),
-    )
+    );
+    meta.headers = collect_headers(response.headers());
+    meta
 }
 
 fn is_meta_key(key: &str) -> bool {
     std::path::Path::new(key)
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("meta"))
+}
+
+/// Remove the pending entry only when it still names the finished journal.
+fn remove_pending_if_current(
+    pending: &mut HashMap<CacheKey, PendingEntry>,
+    key: &CacheKey,
+    journal: &str,
+) -> bool {
+    let current = pending
+        .get(key)
+        .is_some_and(|entry| entry.journal_key == journal);
+    if current {
+        pending.remove(key);
+    }
+    current
 }
 
 fn update_hash(state: &Mutex<HashState>, bytes: &[u8]) -> Result<(), CacheError> {
@@ -1944,5 +1967,41 @@ mod tests {
         assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(!is_retryable_status(StatusCode::FORBIDDEN));
         assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn pending_removal_keeps_a_newer_journal() {
+        let meta = CacheMetadata::synced(
+            "media",
+            "a.txt",
+            "\"etag\"".to_owned(),
+            None,
+            1,
+            None,
+            None,
+            1,
+        );
+        let key = ("media".to_owned(), "a.txt".to_owned());
+        let mut pending = HashMap::new();
+        pending.insert(
+            key.clone(),
+            PendingEntry {
+                meta: meta.clone(),
+                journal_key: "old".to_owned(),
+            },
+        );
+        assert!(!remove_pending_if_current(&mut pending, &key, "new"));
+        assert!(pending.contains_key(&key));
+        pending.insert(
+            key.clone(),
+            PendingEntry {
+                meta,
+                journal_key: "new".to_owned(),
+            },
+        );
+        assert!(!remove_pending_if_current(&mut pending, &key, "old"));
+        assert!(pending.contains_key(&key));
+        assert!(remove_pending_if_current(&mut pending, &key, "new"));
+        assert!(!pending.contains_key(&key));
     }
 }
