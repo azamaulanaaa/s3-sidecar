@@ -1128,18 +1128,19 @@ impl Cache {
         {
             headers.insert(header::CONTENT_ENCODING, value);
         }
-        let request = ForwardRequest {
-            method: Method::PUT,
-            path_and_query: object_path(&entry.bucket, &entry.key),
+        let response = crate::multipart::put_object(
+            &self.origin,
+            &self.origin_credential,
+            &entry.bucket,
+            &entry.key,
             headers,
-            body: Some(body),
-            content_length: Some(entry.size),
-        };
-        let response = self
-            .origin
-            .execute(&self.origin_credential, request)
-            .await
-            .map_err(|error| SyncFailure::new(format!("origin request failed: {error}"), true))?;
+            body,
+            Some(entry.size),
+            &self.config.multipart,
+            &self.metrics,
+        )
+        .await
+        .map_err(|error| SyncFailure::new(format!("origin request failed: {error}"), true))?;
         if response.status().is_success() {
             let etag = response
                 .headers()
@@ -1376,18 +1377,19 @@ impl Cache {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/octet-stream"),
         );
-        let request = ForwardRequest {
-            method: Method::PUT,
-            path_and_query: object_path(bucket, cache_key),
+        let response = crate::multipart::put_object(
+            &self.client,
+            &self.credential,
+            bucket,
+            cache_key,
             headers,
-            body: Some(Box::pin(hashing)),
-            content_length: length,
-        };
-        let response = self
-            .client
-            .execute(&self.credential, request)
-            .await
-            .map_err(storage_error)?;
+            Box::pin(hashing),
+            length,
+            &self.config.multipart,
+            &self.metrics,
+        )
+        .await
+        .map_err(storage_error)?;
         if !response.status().is_success() {
             return Err(CacheError::Status(response.status().as_u16()));
         }
@@ -1830,6 +1832,9 @@ fn receiver_stream(mut receiver: mpsc::Receiver<Result<Bytes, io::Error>>) -> Bo
 fn storage_error(error: StorageError) -> CacheError {
     match error {
         StorageError::Sign(_) => CacheError::Metadata,
+        StorageError::Status(status) => CacheError::Status(status.as_u16()),
+        StorageError::Body => CacheError::Body,
+        StorageError::TooLarge => CacheError::TooLarge,
         StorageError::Timeout | StorageError::Transport(_) => CacheError::Unavailable,
     }
 }
