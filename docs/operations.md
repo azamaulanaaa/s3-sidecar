@@ -19,10 +19,18 @@ client -> sidecar -> cache S3
 - The client sees one S3 endpoint.
 - A read is served from the cache when the entry is fresh.
 - A write is accepted by the cache and synced to origin.
+- The cache persists and replays a fixed set of object headers.
+- A cached read evaluates the `If-Match`, `If-None-Match`,
+  `If-Modified-Since`, and `If-Unmodified-Since` headers.
+- A write-back `PUT` and `DELETE` check their conditions against the cached
+  entry.
 - Set `cache.mode = "read"` for a pure read cache.
 - Set `cache.mode = "write"` for a write buffer.
 - Set `cache.mode = "read_write"` for both.
 - Set `cache.mode = "off"` for a pure proxy.
+- Cache `write` and `read_write` reject SSE-C with `501 NotImplemented`.
+- Cache `read` forwards SSE-C to origin and keeps the cache out of the path.
+- Pure proxy mode is the supported mode for SSE-C.
 - The cache needs its own bucket. Set `cache.bucket`.
 - The journal is under the cache bucket. All sidecars that share a cache bucket
   must use a different `cache.node_id`.
@@ -117,6 +125,22 @@ or all failure deletes the staged blob and returns `503 ServiceUnavailable`.
 A read that finds committed metadata but no reachable copy returns `404
 NoSuchKey` with `x-s3-sidecar-owner`. Do not treat this `404` as proof that the
 key never existed.
+
+### Cache mode
+
+The cluster matrix does not apply to cache mode. A cache entry is two S3
+objects: a blob and a metadata object. The sidecar writes the blob, then the
+journal record, then the metadata object. There is no atomic switch between the
+blob and the metadata object.
+
+A different sidecar that reads the shared cache bucket during a write can
+observe old metadata with new bytes. The accepting sidecar hides the window
+after it installs the pending entry. A read before that install can still
+observe the mix. Another sidecar sees the write after the sync completes.
+
+A cached `GET` or `HEAD` evaluates conditional headers against the cached entry.
+The cache does not evaluate `If-Range`. A conditional range request can return
+`206 PartialContent` when the validator does not match.
 
 ## OpenTelemetry
 
@@ -461,6 +485,7 @@ The `[[clients]]` map holds each client access key, secret, optional session
 token, and bucket allow-list.
 
 - The sidecar verifies the client signature locally.
+- A client entry with `session_token` requires a matching token on each request.
 - The sidecar re-signs each synchronous upstream request with the client
   secret.
 - The sidecar checks the bucket allow-list before the upstream call.
@@ -471,6 +496,39 @@ token, and bucket allow-list.
   an accepted risk for v1. The bucket allow-list is the mitigation.
 - The later option is one service credential with mutual TLS or a secret
   manager.
+
+### Encryption headers
+
+- Cache `write` and `read_write` return `501 NotImplemented` for SSE-C.
+- Cache `read` forwards SSE-C to origin and bypasses the cache.
+- Cache `off` and pure proxy mode forward SSE-C unchanged.
+- Cluster mode returns `501 NotImplemented` for SSE-C and SSE-S3 or SSE-KMS
+  headers on `PutObject`, `CopyObject`, `CreateMultipartUpload`, `UploadPart`,
+  and `CompleteMultipartUpload`.
+- Cluster mode needs default encryption on the backing bucket.
+- A client that needs client-supplied encryption keys must use pure proxy mode
+  or cache mode `read`.
+
+Do not add an encryption header to a cache write. The sidecar cannot store the
+customer key safely.
+
+### Session token errors
+
+A missing or wrong session token returns `403 Forbidden` with code
+`InvalidToken`.
+
+- Header authentication reads `x-amz-security-token`.
+- Presigned authentication reads `X-Amz-Security-Token` in the query.
+- A client entry with no configured token ignores a supplied token.
+- Rotate `clients[].session_token` and the client token together.
+- Do not put a session token in `argv`.
+
+### Object key privacy
+
+`otel.record_object_keys = false` redacts the object part of `url.path` on the
+server and upstream spans. It also omits the `s3.object.key` span attribute. The
+setting redacts the `path` field in the request log and the object key fields in
+the cache sync, orphan, eviction, journal, and quarantine logs.
 
 ## Backup and restore
 
@@ -599,9 +657,26 @@ S3 client was available.
 
 ## Known limits
 
-- No S3 versioning.
-- No ACLs, bucket policies, or object tagging.
-- No `Select`.
+- Object tagging, versioning, ACLs, bucket policies, and `Select` are not
+  supported.
+- A cache entry is two S3 objects: a blob and a metadata object. There is no
+  atomic switch between them. A different sidecar that reads the shared cache
+  bucket during a write can observe old metadata with new bytes. The accepting
+  sidecar hides the window after it installs the pending entry. A read before
+  that install can still observe the mix.
+- Cache mode does not evaluate `If-Range`. A conditional range request can
+  return `206 PartialContent` when the validator does not match.
+- The cache header allowlist is fixed. The cache does not preserve object tags,
+  object lock headers, website redirect headers, or encryption headers.
+- SSE-C works only in pure proxy mode, or in cache mode `read` where the cache
+  is bypassed. Cache write modes return `501 NotImplemented`.
+- Cluster mode requires default encryption on the backing bucket. Client
+  encryption headers are not supported.
+- Cluster mode rejects encryption headers on `PutObject`, `CopyObject`,
+  `CreateMultipartUpload`, `UploadPart`, and `CompleteMultipartUpload`.
+- There is no local metrics endpoint. Metrics export over OTLP only.
+- A slow client can hold a connection permit for a long time. The idle timeout
+  bounds only the gap between chunks. There is no total response deadline.
 - Multipart checksum headers are dropped. A client that sends part checksums
   in `CompleteMultipartUpload` can fail.
 - Sidecar-owned multipart writes do not send per-part checksum headers.

@@ -92,6 +92,31 @@ entry.
 5. Enable `cache.serve_quarantined` only when a stale body is better than a
    `404`.
 
+## `412 PreconditionFailed` on a cache write
+
+**Symptom**
+
+- A write-back `PUT` or `DELETE` returns `412 PreconditionFailed`.
+- The request has `If-Match` or `If-None-Match`.
+- The origin receives no request when the cache has an entry.
+
+**Check**
+
+1. Check whether the cache has an entry for the key.
+2. Compare the condition with the cached ETag.
+3. Use `x-s3-sidecar-request-id` to find the request log entry.
+4. Enable `otel.record_object_keys` when you need the object key in the log.
+5. Check the bucket `write_policy` value.
+
+**Action**
+
+1. Read the key and use its current ETag in `If-Match`.
+2. Remove `If-None-Match: *` when the key already exists in the cache.
+3. If the cache has no entry, origin checks the condition. Check the origin
+   status.
+4. Do not retry a failed condition with the same ETag.
+5. Set `otel.record_object_keys = false` after the diagnosis.
+
 ## Cache bucket full or eviction storms
 
 **Symptom**
@@ -201,6 +226,58 @@ entry.
 4. Check a client `HEAD` request through the listener.
 5. Do not disable TLS to work around an expired certificate.
 
+## `501 NotImplemented` with an encryption header
+
+**Symptom**
+
+- A write, copy, multipart start, part upload, or multipart complete returns
+  `501 NotImplemented`.
+- The S3 XML code is `NotImplemented`.
+- The request has an `x-amz-server-side-encryption` header.
+
+**Check**
+
+1. Read the request headers for `x-amz-server-side-encryption` and
+   `x-amz-server-side-encryption-customer-*`.
+2. Check `cache.mode` or `mode = "cluster"`.
+3. For cluster mode, check the default encryption setting on the backing
+   bucket.
+4. Read the S3 error message for `default encryption`.
+
+**Action**
+
+1. In cache `write` or `read_write`, remove the SSE-C headers.
+2. Use `cache.mode = "read"` or `cache.mode = "off"` for SSE-C.
+3. In cluster mode, remove the encryption headers from the write and copy
+   requests.
+4. In cluster mode, remove the encryption headers from `UploadPart` and
+   `CompleteMultipartUpload`.
+5. In cluster mode, enable default encryption on the backing bucket.
+6. Use pure proxy mode when the client must supply an encryption key.
+
+## `403 InvalidToken`
+
+**Symptom**
+
+- A request returns `403 Forbidden`.
+- The S3 XML code is `InvalidToken`.
+
+**Check**
+
+1. Find the `[[clients]]` entry for the request access key.
+2. Check whether `session_token` is set on the entry.
+3. For header authentication, check `x-amz-security-token`.
+4. For presigned authentication, check `X-Amz-Security-Token` in the query.
+5. Use `x-s3-sidecar-request-id` to match the request with the client
+   application.
+
+**Action**
+
+1. Send the same token that the client entry configures.
+2. Update `clients[].session_token` when the token rotates.
+3. Remove `session_token` from the entry only when the client sends no token.
+4. Do not put a session token in `argv`.
+
 ## Read 404 with x-s3-sidecar-owner
 
 **Symptom**
@@ -230,6 +307,30 @@ entry.
    backup point.
 6. A `read = local` miss also returns the owner header. Confirm that the key
    exists on another node before you treat the object as lost.
+
+## `400 Bad Request` on `/_blob/`
+
+**Symptom**
+
+- A peer request to `/_blob/<id>` returns `400 Bad Request`.
+- The request has a valid cluster token.
+
+**Check**
+
+1. Read the id in the request path.
+2. Confirm that the id has 48 characters.
+3. Confirm that the id uses lowercase hexadecimal characters only.
+4. Confirm that `x-s3-sidecar-cluster-token` matches `cluster.secret`.
+5. Confirm that the sender uses a blob id from metadata or a replication job.
+6. Confirm that no proxy rewrites the path.
+
+**Action**
+
+1. Use the blob id from the replication job or the metadata entry.
+2. Do not edit, shorten, or change the case of a blob id.
+3. Check the sidecar version on the sender and the receiver.
+4. A missing or wrong cluster token returns `401`, not `400`.
+5. A bad id is a sender defect. Do not retry the same id.
 
 ## Graceful shutdown timeout
 
