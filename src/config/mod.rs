@@ -441,10 +441,8 @@ pub struct CacheConfig {
     pub force_path_style: bool,
     /// Cache S3 bucket. All blobs, metadata, and journal entries live here.
     pub bucket: String,
-    /// Key prefix for this node.
+    /// Cache namespace. It is part of the cache key and journal path.
     pub prefix: String,
-    /// Name of this sidecar node. It is part of the cache key and journal path.
-    pub node_id: String,
     /// Cache behavior.
     pub mode: CacheMode,
     /// Maximum cache size in bytes. `0` means unlimited.
@@ -491,7 +489,6 @@ impl Default for CacheConfig {
             force_path_style: false,
             bucket: String::new(),
             prefix: "cache".to_owned(),
-            node_id: "node".to_owned(),
             mode: CacheMode::ReadWrite,
             max_bytes: None,
             max_object_bytes: 1_073_741_824,
@@ -1042,9 +1039,6 @@ fn validate_cache(config: &Config, warnings: &mut Vec<String>) -> Result<(), Con
     if config.cache.prefix.trim().is_empty() {
         return Err(ConfigError::invalid("cache.prefix must not be empty"));
     }
-    if config.cache.node_id.trim().is_empty() {
-        return Err(ConfigError::invalid("cache.node_id must not be empty"));
-    }
     if config.cache.sync_workers == 0 {
         return Err(ConfigError::invalid(
             "cache.sync_workers must be greater than 0",
@@ -1488,6 +1482,12 @@ mod tests {
     #[test]
     fn cache_off_mode_fails_to_deserialize() {
         assert!(serde_json::from_str::<CacheConfig>(r#"{"mode":"off"}"#).is_err());
+    }
+
+    #[test]
+    fn cache_node_id_fails_to_deserialize() {
+        let error = serde_json::from_str::<CacheConfig>(r#"{"node_id":"node-a"}"#).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]

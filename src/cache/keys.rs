@@ -47,11 +47,10 @@ pub fn bucket_hash(bucket: &str) -> String {
 
 /// Return the cache blob key for one origin object.
 #[must_use]
-pub fn blob_key(prefix: &str, node_id: &str, bucket: &str, key: &str) -> String {
+pub fn blob_key(prefix: &str, bucket: &str, key: &str) -> String {
     format!(
-        "{}/{}/{}/{}",
+        "{}/{}/{}",
         prefix.trim_matches('/'),
-        node_id.trim_matches('/'),
         bucket_hash(bucket),
         sha256_hex(key)
     )
@@ -63,30 +62,22 @@ pub fn meta_key(blob: &str) -> String {
     format!("{blob}.meta")
 }
 
-/// Return the journal prefix for one node.
+/// Return the journal prefix.
 #[must_use]
-pub fn journal_prefix(prefix: &str, node_id: &str) -> String {
-    format!(
-        "{}/journal/{}/",
-        prefix.trim_matches('/'),
-        node_id.trim_matches('/')
-    )
+pub fn journal_prefix(prefix: &str) -> String {
+    format!("{}/journal/", prefix.trim_matches('/'))
 }
 
 /// Return the journal key for one record.
 #[must_use]
-pub fn journal_key(prefix: &str, node_id: &str, id: &str) -> String {
-    format!("{}{}.json", journal_prefix(prefix, node_id), id)
+pub fn journal_key(prefix: &str, id: &str) -> String {
+    format!("{}{}.json", journal_prefix(prefix), id)
 }
 
-/// Return the blob prefix for one node.
+/// Return the cache blob prefix.
 #[must_use]
-pub fn node_prefix(prefix: &str, node_id: &str) -> String {
-    format!(
-        "{}/{}/",
-        prefix.trim_matches('/'),
-        node_id.trim_matches('/')
-    )
+pub fn blob_prefix(prefix: &str) -> String {
+    format!("{}/", prefix.trim_matches('/'))
 }
 
 /// Percent-encode one object key for a path. Slashes stay as separators.
@@ -130,11 +121,11 @@ mod tests {
 
     #[test]
     fn cache_key_uses_bucket_hash_and_key_hash() {
-        let key = blob_key("cache", "node-a", "media", "dir/file.txt");
+        let key = blob_key("cache", "media", "dir/file.txt");
         assert_eq!(
             key,
             format!(
-                "cache/node-a/{}/{}",
+                "cache/{}/{}",
                 bucket_hash("media"),
                 sha256_hex("dir/file.txt")
             )
@@ -148,9 +139,20 @@ mod tests {
     }
 
     #[test]
-    fn journal_keys_are_per_node() {
-        assert_eq!(journal_key("cache", "a", "id"), "cache/journal/a/id.json");
-        assert_eq!(journal_prefix("cache/", "a"), "cache/journal/a/");
+    fn journal_keys_use_the_prefix() {
+        assert_eq!(journal_key("cache", "id"), "cache/journal/id.json");
+        assert_eq!(journal_prefix("cache/"), "cache/journal/");
+    }
+
+    #[test]
+    fn key_helpers_trim_prefix_slashes() {
+        let key = blob_key("/cache/", "media", "item");
+        assert_eq!(
+            key,
+            format!("cache/{}/{}", bucket_hash("media"), sha256_hex("item"))
+        );
+        assert_eq!(journal_prefix("/cache/"), "cache/journal/");
+        assert_eq!(blob_prefix("/cache/"), "cache/");
     }
 
     #[test]

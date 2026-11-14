@@ -51,7 +51,6 @@ secret_access_key = "minioadmin"
 # force_path_style = true
 bucket = "s3-sidecar-cache"
 prefix = "cache"
-node_id = "node-a"
 mode = "read_write"            # read | write | read_write
 max_bytes = 0                  # Required in cache mode. 0 is unlimited.
 max_object_bytes = 1073741824

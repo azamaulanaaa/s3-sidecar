@@ -259,7 +259,6 @@ access_key_id = "${ACCESS_KEY}"
 secret_access_key = "${SECRET_KEY}"
 bucket = "${BUCKET_CACHE}"
 prefix = "cache"
-node_id = "bench"
 mode = "read_write"
 max_bytes = 0
 max_object_bytes = 1073741824

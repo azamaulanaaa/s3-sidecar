@@ -502,7 +502,6 @@ fn cache_config(origin: &str, cache: &str, index: &Path) -> Config {
             force_path_style: true,
             bucket: "cachebucket".to_owned(),
             prefix: "cache".to_owned(),
-            node_id: "node-a".to_owned(),
             mode: CacheMode::ReadWrite,
             max_bytes: Some(0),
             max_object_bytes: 1_048_576,

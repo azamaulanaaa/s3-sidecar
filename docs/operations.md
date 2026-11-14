@@ -32,7 +32,7 @@ client -> sidecar -> cache S3
   and keeps the cache out of the path.
 - The cache needs its own bucket. Set `cache.bucket`.
 - The journal is under the cache bucket. All sidecars that share a cache bucket
-  must use a different `cache.node_id`.
+  must use a different `cache.prefix`.
 
 ### Single-node cluster
 

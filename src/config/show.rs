@@ -175,12 +175,6 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
     push_row(
         &mut rows,
         sources,
-        "cache.node_id",
-        config.cache.node_id.clone(),
-    );
-    push_row(
-        &mut rows,
-        sources,
         "cache.mode",
         config.cache.mode.to_string(),
     );

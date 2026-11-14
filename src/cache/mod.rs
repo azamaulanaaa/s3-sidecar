@@ -22,7 +22,7 @@ use tracing::{Instrument, info, warn};
 
 use self::index::{CacheIndex, IndexEntry};
 use self::keys::{
-    blob_key, journal_key, journal_prefix, meta_key, next_id, node_prefix, object_path,
+    blob_key, blob_prefix, journal_key, journal_prefix, meta_key, next_id, object_path,
 };
 use self::meta::{
     CacheMetadata, EntryState, JournalEntry, JournalKind, collect_headers, is_persisted_header,
@@ -359,12 +359,7 @@ impl Cache {
         bucket: &str,
         key: &str,
     ) -> Result<Option<CacheMetadata>, CacheError> {
-        let cache_key = blob_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            bucket,
-            key,
-        );
+        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
         let Some(response) = self
             .get_object(self.cache_bucket(), &meta_key(&cache_key), None)
             .await?
@@ -387,12 +382,7 @@ impl Cache {
         key: &str,
         range: Option<&str>,
     ) -> Result<Option<reqwest::Response>, CacheError> {
-        let cache_key = blob_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            bucket,
-            key,
-        );
+        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
         self.get_object(self.cache_bucket(), &cache_key, range)
             .await
     }
@@ -408,24 +398,14 @@ impl Cache {
         key: &str,
         meta: &CacheMetadata,
     ) -> Result<(), CacheError> {
-        let cache_key = blob_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            bucket,
-            key,
-        );
+        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
         self.put_meta(self.cache_bucket(), &cache_key, meta).await
     }
 
     /// Update the LRU access time for an entry.
     pub fn touch(&self, bucket: &str, key: &str) {
         if let Some(index) = &self.index {
-            let cache_key = blob_key(
-                &self.config.cache.prefix,
-                &self.config.cache.node_id,
-                bucket,
-                key,
-            );
+            let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
             let index = lock(index);
             if let Err(error) = index.touch(&cache_key, unix_now()) {
                 warn!(%error, "cache index touch failed");
@@ -469,12 +449,7 @@ impl Cache {
 
     /// Invalidate one cache entry. Errors are logged and ignored.
     pub async fn invalidate(&self, bucket: &str, key: &str) {
-        let cache_key = blob_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            bucket,
-            key,
-        );
+        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
         if let Err(error) = self
             .delete_object(self.cache_bucket(), &meta_key(&cache_key))
             .await
@@ -510,12 +485,7 @@ impl Cache {
         body_started: Arc<AtomicBool>,
     ) -> Result<CacheMetadata, CacheError> {
         let id = next_id();
-        let cache_key = blob_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            bucket,
-            key,
-        );
+        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
         let mut meta = CacheMetadata::synced(
             bucket,
             key,
@@ -541,11 +511,7 @@ impl Cache {
         meta.checksum = hashes.sha256;
         meta.etag = format!("\"{}\"", hashes.md5);
         let journal = JournalEntry::put(id.clone(), cache_key.clone(), &meta);
-        let journal_key = journal_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            &journal.id,
-        );
+        let journal_key = journal_key(&self.config.cache.prefix, &journal.id);
         if let Err(error) = self
             .put_journal(self.cache_bucket(), &journal_key, &journal)
             .await
@@ -582,12 +548,7 @@ impl Cache {
     ///
     /// Returns an error when the journal cannot be removed.
     pub async fn delete_pending(&self, bucket: &str, key: &str) -> Result<(), CacheError> {
-        let cache_key = blob_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            bucket,
-            key,
-        );
+        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
         let pending = lock(&self.pending).remove(&(bucket.to_owned(), key.to_owned()));
         if let Some(entry) = pending {
             self.delete_object(self.cache_bucket(), &entry.journal_key)
@@ -609,12 +570,7 @@ impl Cache {
     /// Returns an error when the journal cannot be written.
     pub async fn stage_delete(self: &Arc<Self>, bucket: &str, key: &str) -> Result<(), CacheError> {
         let id = next_id();
-        let cache_key = blob_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            bucket,
-            key,
-        );
+        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
         let _ = self
             .delete_object(self.cache_bucket(), &meta_key(&cache_key))
             .await;
@@ -622,11 +578,7 @@ impl Cache {
         self.index_remove(&cache_key);
         lock(&self.pending).remove(&(bucket.to_owned(), key.to_owned()));
         let journal = JournalEntry::delete(id, bucket, key, cache_key, unix_now());
-        let journal_key = journal_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            &journal.id,
-        );
+        let journal_key = journal_key(&self.config.cache.prefix, &journal.id);
         self.put_journal(self.cache_bucket(), &journal_key, &journal)
             .await?;
         lock(&self.tombstones).insert((bucket.to_owned(), key.to_owned()), unix_now());
@@ -650,12 +602,7 @@ impl Cache {
         let meta_writer = meta.clone();
         let origin_bucket = meta.origin_bucket.clone();
         let origin_key = meta.origin_key.clone();
-        let cache_key_value = blob_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            &origin_bucket,
-            &origin_key,
-        );
+        let cache_key_value = blob_key(&self.config.cache.prefix, &origin_bucket, &origin_key);
         let tee_span = tracing::info_span!(
             "cache.tee",
             "s3.bucket.name" = meta.origin_bucket.as_str(),
@@ -754,7 +701,7 @@ impl Cache {
     }
 
     async fn gc_bucket(&self, bucket: &str) -> Result<(), CacheError> {
-        let prefix = node_prefix(&self.config.cache.prefix, &self.config.cache.node_id);
+        let prefix = blob_prefix(&self.config.cache.prefix);
         let listing = self.list_keys(bucket, &prefix).await?;
         let journals = self.journal_entries(bucket).await?;
         let referenced: HashSet<String> = journals
@@ -798,11 +745,7 @@ impl Cache {
             }
             let age = unix_now().saturating_sub(entry.created_at);
             if u64::try_from(age).unwrap_or(u64::MAX) > orphan.as_secs() {
-                let journal = journal_key(
-                    &self.config.cache.prefix,
-                    &self.config.cache.node_id,
-                    &entry.id,
-                );
+                let journal = journal_key(&self.config.cache.prefix, &entry.id);
                 let _ = self.delete_object(bucket, &journal).await;
             }
         }
@@ -813,7 +756,7 @@ impl Cache {
         &self,
         bucket: &str,
     ) -> Result<HashMap<CacheKey, JournalEntry>, CacheError> {
-        let prefix = journal_prefix(&self.config.cache.prefix, &self.config.cache.node_id);
+        let prefix = journal_prefix(&self.config.cache.prefix);
         let keys = self.list_keys(bucket, &prefix).await?;
         let mut entries = HashMap::new();
         for key in keys {
@@ -838,7 +781,7 @@ impl Cache {
 
     async fn recover(self: &Arc<Self>) -> Result<(), CacheError> {
         let bucket = self.cache_bucket().to_owned();
-        let prefix = journal_prefix(&self.config.cache.prefix, &self.config.cache.node_id);
+        let prefix = journal_prefix(&self.config.cache.prefix);
         let keys = match self.list_keys(&bucket, &prefix).await {
             Ok(keys) => keys,
             Err(error) => {
@@ -865,19 +808,11 @@ impl Cache {
             });
             if replace {
                 if let Some(previous) = by_key.insert(cache_key, entry) {
-                    let stale = journal_key(
-                        &self.config.cache.prefix,
-                        &self.config.cache.node_id,
-                        &previous.id,
-                    );
+                    let stale = journal_key(&self.config.cache.prefix, &previous.id);
                     let _ = self.delete_object(&bucket, &stale).await;
                 }
             } else {
-                let stale = journal_key(
-                    &self.config.cache.prefix,
-                    &self.config.cache.node_id,
-                    &entry.id,
-                );
+                let stale = journal_key(&self.config.cache.prefix, &entry.id);
                 let _ = self.delete_object(&bucket, &stale).await;
             }
         }
@@ -907,11 +842,7 @@ impl Cache {
                     );
                     let mut failed = entry.clone();
                     failed.state = EntryState::Failed;
-                    let path = journal_key(
-                        &self.config.cache.prefix,
-                        &self.config.cache.node_id,
-                        &entry.id,
-                    );
+                    let path = journal_key(&self.config.cache.prefix, &entry.id);
                     let _ = self.put_journal(bucket, &path, &failed).await;
                     self.metrics.quarantined();
                     return;
@@ -924,11 +855,7 @@ impl Cache {
                         cache_key.clone(),
                         PendingEntry {
                             meta: meta.clone(),
-                            journal_key: journal_key(
-                                &self.config.cache.prefix,
-                                &self.config.cache.node_id,
-                                &entry.id,
-                            ),
+                            journal_key: journal_key(&self.config.cache.prefix, &entry.id),
                         },
                     );
                     if self
@@ -938,12 +865,7 @@ impl Cache {
                         .flatten()
                         .is_none()
                     {
-                        let path = blob_key(
-                            &self.config.cache.prefix,
-                            &self.config.cache.node_id,
-                            &cache_key.0,
-                            &cache_key.1,
-                        );
+                        let path = blob_key(&self.config.cache.prefix, &cache_key.0, &cache_key.1);
                         let _ = self.put_meta_from_key(bucket, &path, &meta).await;
                     }
                 }
@@ -1005,11 +927,7 @@ impl Cache {
 
     async fn sync_entry_inner(self: &Arc<Self>, entry: &JournalEntry) {
         if entry.kind == JournalKind::Put && self.is_tombstoned(&entry.bucket, &entry.key) {
-            let path = journal_key(
-                &self.config.cache.prefix,
-                &self.config.cache.node_id,
-                &entry.id,
-            );
+            let path = journal_key(&self.config.cache.prefix, &entry.id);
             let _ = self.delete_object(self.cache_bucket(), &path).await;
             return;
         }
@@ -1029,11 +947,7 @@ impl Cache {
                     current.attempts = current.attempts.saturating_add(1);
                     self.metrics.sync_failed();
                     if failure.retryable && current.attempts < max_attempts {
-                        let path = journal_key(
-                            &self.config.cache.prefix,
-                            &self.config.cache.node_id,
-                            &current.id,
-                        );
+                        let path = journal_key(&self.config.cache.prefix, &current.id);
                         let _ = self.put_journal(self.cache_bucket(), &path, &current).await;
                         self.sleep_backoff(current.attempts).await;
                         continue;
@@ -1053,19 +967,10 @@ impl Cache {
     }
 
     async fn finish_sync(self: &Arc<Self>, entry: &JournalEntry, etag: Option<String>) {
-        let path = journal_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            &entry.id,
-        );
+        let path = journal_key(&self.config.cache.prefix, &entry.id);
         if entry.kind == JournalKind::Put {
             let bucket = &entry.bucket;
-            let cache_key = blob_key(
-                &self.config.cache.prefix,
-                &self.config.cache.node_id,
-                bucket,
-                &entry.key,
-            );
+            let cache_key = blob_key(&self.config.cache.prefix, bucket, &entry.key);
             let mut meta = self
                 .read_meta(bucket, &entry.key)
                 .await
@@ -1090,21 +995,12 @@ impl Cache {
     }
 
     async fn quarantine(&self, entry: &JournalEntry) {
-        let path = journal_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            &entry.id,
-        );
+        let path = journal_key(&self.config.cache.prefix, &entry.id);
         let mut failed = entry.clone();
         failed.state = EntryState::Failed;
         let _ = self.put_journal(self.cache_bucket(), &path, &failed).await;
         if entry.kind == JournalKind::Put {
-            let cache_key = blob_key(
-                &self.config.cache.prefix,
-                &self.config.cache.node_id,
-                &entry.bucket,
-                &entry.key,
-            );
+            let cache_key = blob_key(&self.config.cache.prefix, &entry.bucket, &entry.key);
             if let Ok(Some(mut meta)) = self.read_meta(&entry.bucket, &entry.key).await {
                 meta.mark_failed();
                 let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
@@ -1242,12 +1138,7 @@ impl Cache {
         receiver: mpsc::Receiver<Result<Bytes, io::Error>>,
         length: Option<u64>,
     ) -> Result<StoredBlob, CacheError> {
-        let cache_key = blob_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            origin_bucket,
-            origin_key,
-        );
+        let cache_key = blob_key(&self.config.cache.prefix, origin_bucket, origin_key);
         let body = receiver_stream(receiver);
         let hashes = self
             .put_blob_stream(self.cache_bucket(), &cache_key, body, length, None)
@@ -1307,12 +1198,7 @@ impl Cache {
 
     /// Delete a best-effort cache blob for a failed write-through.
     pub async fn discard_blob(&self, origin_bucket: &str, origin_key: &str) {
-        let cache_key = blob_key(
-            &self.config.cache.prefix,
-            &self.config.cache.node_id,
-            origin_bucket,
-            origin_key,
-        );
+        let cache_key = blob_key(&self.config.cache.prefix, origin_bucket, origin_key);
         let _ = self
             .delete_object(self.cache_bucket(), &meta_key(&cache_key))
             .await;
@@ -1661,7 +1547,7 @@ impl Cache {
         }
         let mut entries = Vec::new();
         let bucket = self.cache_bucket().to_owned();
-        let prefix = node_prefix(&self.config.cache.prefix, &self.config.cache.node_id);
+        let prefix = blob_prefix(&self.config.cache.prefix);
         let Ok(keys) = self.list_keys(&bucket, &prefix).await else {
             return;
         };

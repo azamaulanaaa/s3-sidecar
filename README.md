@@ -89,7 +89,6 @@ access_key_id = "minioadmin"
 secret_access_key = "minioadmin"
 bucket = "s3-sidecar-cache"
 prefix = "cache"
-node_id = "node-a"
 mode = "read_write"
 max_bytes = 0
 max_object_bytes = 1073741824
@@ -357,15 +356,15 @@ All cache blobs, metadata, and journal entries live in that bucket. The
 every origin bucket. The sidecar stores cache objects under this path:
 
 ```
-<prefix>/<node-id>/<bucket-hash>/<sha256(key)>
-<prefix>/<node-id>/<bucket-hash>/<sha256(key)>.meta
-<prefix>/journal/<node-id>/<uuid>.json
+<prefix>/<bucket-hash>/<sha256(key)>
+<prefix>/<bucket-hash>/<sha256(key)>.meta
+<prefix>/journal/<uuid>.json
 ```
 
 `cache.bucket` is required in cache mode.
-`cache.prefix` defaults to `cache`. Set `cache.node_id` to a stable name for
-each sidecar. The node id is part of the key and the journal path. Sidecars do
-not process each other's journals.
+`cache.prefix` defaults to `cache`. Set `cache.prefix` to a stable namespace
+for each sidecar. The prefix is part of the key and the journal path. Sidecars
+do not process each other's journals.
 
 ### Modes
 
