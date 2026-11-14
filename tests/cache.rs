@@ -53,6 +53,7 @@ struct OriginState {
     counts: Arc<Counts>,
     gate: Arc<Semaphore>,
     put_status: Arc<Mutex<Option<StatusCode>>>,
+    put_headers: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
 }
 
 #[derive(Clone)]
@@ -71,6 +72,7 @@ struct OriginHandle {
     counts: Arc<Counts>,
     gate: Arc<Semaphore>,
     put_status: Arc<Mutex<Option<StatusCode>>>,
+    put_headers: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
 }
 
 #[derive(Clone)]
@@ -120,6 +122,10 @@ impl OriginHandle {
     fn release_puts(&self) {
         self.gate.add_permits(1);
     }
+
+    fn put_headers(&self, key: &str) -> Option<HashMap<String, String>> {
+        self.put_headers.lock().unwrap().get(key).cloned()
+    }
 }
 
 impl CacheHandle {
@@ -143,11 +149,13 @@ async fn spawn_origin() -> (String, OriginHandle) {
     let counts = Arc::new(Counts::default());
     let gate = Arc::new(Semaphore::new(1));
     let put_status = Arc::new(Mutex::new(None));
+    let put_headers = Arc::new(Mutex::new(HashMap::new()));
     let state = OriginState {
         objects: Arc::clone(&objects),
         counts: Arc::clone(&counts),
         gate: Arc::clone(&gate),
         put_status: Arc::clone(&put_status),
+        put_headers: Arc::clone(&put_headers),
     };
     let app = Router::new().fallback(origin_handler).with_state(state);
     tokio::spawn(async move {
@@ -160,6 +168,7 @@ async fn spawn_origin() -> (String, OriginHandle) {
             counts,
             gate,
             put_status,
+            put_headers,
         },
     )
 }
@@ -239,6 +248,20 @@ async fn origin_handler(
                 return xml(status, "<Error><Code>AccessDenied</Code></Error>");
             }
             let etag = format!("\"etag-{}\"", state.counts.put.load(Ordering::Relaxed));
+            let recorded: HashMap<String, String> = headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                })
+                .collect();
+            state
+                .put_headers
+                .lock()
+                .unwrap()
+                .insert(object_key.clone(), recorded);
             state.objects.lock().unwrap().insert(
                 object_key,
                 Stored {
@@ -657,9 +680,25 @@ fn signed_request(
     url: &str,
     body: Option<Vec<u8>>,
 ) -> reqwest::RequestBuilder {
+    signed_request_with_headers(client, method, url, body, &[])
+}
+
+fn signed_request_with_headers(
+    client: &reqwest::Client,
+    method: Method,
+    url: &str,
+    body: Option<Vec<u8>>,
+    extra: &[(&str, &str)],
+) -> reqwest::RequestBuilder {
     let parsed = Url::parse(url).unwrap();
     let credential = credential();
     let mut headers = HeaderMap::new();
+    for (name, value) in extra {
+        headers.insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
     let payload_hash = if body.is_some() {
         "UNSIGNED-PAYLOAD"
     } else {
@@ -869,6 +908,7 @@ async fn crash_after_ack_resumes_on_restart() {
         checksum: String::new(),
         content_type: Some("text/plain".to_owned()),
         content_encoding: None,
+        headers: std::collections::BTreeMap::new(),
         state: EntryState::Pending,
         created_at: now,
     };
@@ -1446,4 +1486,527 @@ async fn otel_metrics_report_counters() {
     assert!(support::counter(&metrics, "s3_sidecar.cache.origin_bytes") >= 5);
     assert_eq!(support::gauge(&metrics, "s3_sidecar.cache.max_bytes"), 0);
     assert_eq!(support::gauge(&metrics, "s3_sidecar.cache.unlimited"), 1);
+}
+
+const OBJECT_HEADERS: [(&str, &str); 5] = [
+    ("x-amz-meta-color", "blue"),
+    ("content-disposition", "attachment; filename=\"report.txt\""),
+    ("cache-control", "max-age=60"),
+    ("content-language", "en-US"),
+    ("expires", "Wed, 21 Oct 2015 07:28:00 GMT"),
+];
+
+fn assert_object_headers(headers: &HeaderMap) {
+    for (name, value) in OBJECT_HEADERS {
+        assert_eq!(
+            headers.get(name).and_then(|value| value.to_str().ok()),
+            Some(value),
+            "header {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn write_back_preserves_object_headers() {
+    let (origin_url, origin) = spawn_origin().await;
+    let _permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/hdr-back", sidecar.url),
+        Some(b"body".to_vec()),
+        &OBJECT_HEADERS,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/hdr-back", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_object_headers(get.headers());
+    assert_eq!(body_text(get).await, "body");
+    assert_eq!(origin.get_count(), 0);
+    origin.release_puts();
+}
+
+#[tokio::test]
+async fn write_back_sync_sends_object_headers() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/hdr-sync", sidecar.url),
+        Some(b"body".to_vec()),
+        &OBJECT_HEADERS,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    wait_for(Duration::from_secs(3), || {
+        let origin = origin.clone();
+        async move { origin.body("media/hdr-sync").is_some() }
+    })
+    .await;
+    let recorded = origin.put_headers("media/hdr-sync").unwrap();
+    for (name, value) in OBJECT_HEADERS {
+        assert_eq!(
+            recorded.get(name).map(String::as_str),
+            Some(value),
+            "header {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn write_through_preserves_object_headers() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteThrough,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/hdr-through", sidecar.url),
+        Some(b"body".to_vec()),
+        &OBJECT_HEADERS,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let blob = blob_key("cache", "node-a", "media", "hdr-through");
+    wait_for(Duration::from_secs(3), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { cache.has(&blob) && cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
+    let recorded = origin.put_headers("media/hdr-through").unwrap();
+    for (name, value) in OBJECT_HEADERS {
+        assert_eq!(
+            recorded.get(name).map(String::as_str),
+            Some(value),
+            "header {name}"
+        );
+    }
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/hdr-through", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_object_headers(get.headers());
+    assert_eq!(body_text(get).await, "body");
+    assert_eq!(origin.get_count(), 0);
+}
+
+#[tokio::test]
+async fn write_back_if_none_match_rejects_an_existing_key() {
+    let (origin_url, origin) = spawn_origin().await;
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let first = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/create-only", sidecar.url),
+        Some(b"first".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/create-only", sidecar.url),
+        Some(b"second".to_vec()),
+        &[("if-none-match", "*")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(second.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(origin.put_count(), 0);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn write_back_if_match_checks_the_cached_etag() {
+    let (origin_url, origin) = spawn_origin().await;
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let first = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/conditional", sidecar.url),
+        Some(b"first".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let etag = first
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_owned();
+    let wrong = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/conditional", sidecar.url),
+        Some(b"wrong".to_vec()),
+        &[("if-match", "\"not-the-etag\"")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(wrong.status(), StatusCode::PRECONDITION_FAILED);
+    let correct = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/conditional", sidecar.url),
+        Some(b"correct".to_vec()),
+        &[("if-match", etag.as_str())],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(correct.status(), StatusCode::OK);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn cached_get_honors_if_none_match() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/cond-get", b"hello", "\"etag-get\"");
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let first = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/cond-get", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(body_text(first).await, "hello");
+    let blob = blob_key("cache", "node-a", "media", "cond-get");
+    wait_for(Duration::from_secs(2), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { cache.has(&blob) && cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
+    let cached = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/cond-get", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(cached.status(), StatusCode::OK);
+    let etag = cached
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_owned();
+    assert_eq!(body_text(cached).await, "hello");
+    let matched = signed_request_with_headers(
+        &client,
+        Method::GET,
+        &format!("{}/media/cond-get", sidecar.url),
+        None,
+        &[("if-none-match", etag.as_str())],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(matched.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(body_text(matched).await, "");
+    let other = signed_request_with_headers(
+        &client,
+        Method::GET,
+        &format!("{}/media/cond-get", sidecar.url),
+        None,
+        &[("if-none-match", "\"other\"")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(other.status(), StatusCode::OK);
+    assert_eq!(body_text(other).await, "hello");
+    assert_eq!(origin.get_count(), 1);
+}
+
+#[tokio::test]
+async fn cached_head_honors_if_none_match() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/cond-head", b"hello", "\"etag-head\"");
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let first = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/cond-head", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(body_text(first).await, "hello");
+    let blob = blob_key("cache", "node-a", "media", "cond-head");
+    wait_for(Duration::from_secs(2), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { cache.has(&blob) && cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
+    let cached = signed_request(
+        &client,
+        Method::HEAD,
+        &format!("{}/media/cond-head", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(cached.status(), StatusCode::OK);
+    let etag = cached
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_owned();
+    let matched = signed_request_with_headers(
+        &client,
+        Method::HEAD,
+        &format!("{}/media/cond-head", sidecar.url),
+        None,
+        &[("if-none-match", etag.as_str())],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(matched.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(origin.get_count(), 1);
+}
+
+#[tokio::test]
+async fn delete_with_a_wrong_if_match_is_rejected() {
+    let (origin_url, origin) = spawn_origin().await;
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/cond-delete", sidecar.url),
+        Some(b"body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let delete = signed_request_with_headers(
+        &client,
+        Method::DELETE,
+        &format!("{}/media/cond-delete", sidecar.url),
+        None,
+        &[("if-match", "\"not-the-etag\"")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(delete.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(origin.delete_count(), 0);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn write_mode_rejects_sse_c() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Write,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/sse-c", sidecar.url),
+        Some(b"body".to_vec()),
+        &[
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            ("x-amz-server-side-encryption-customer-key", "customer-key"),
+            ("x-amz-server-side-encryption-customer-key-md5", "key-md5"),
+        ],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(origin.put_count(), 0);
+}
+
+#[tokio::test]
+async fn read_mode_forwards_sse_c_to_origin() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/sse-c-read", b"hello", "\"etag-sse\"");
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let get = signed_request_with_headers(
+            &client,
+            Method::GET,
+            &format!("{}/media/sse-c-read", sidecar.url),
+            None,
+            &[("x-amz-server-side-encryption-customer-algorithm", "AES256")],
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(body_text(get).await, "hello");
+    }
+    assert_eq!(origin.get_count(), 2);
 }

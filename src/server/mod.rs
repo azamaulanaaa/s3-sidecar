@@ -28,7 +28,7 @@ use crate::auth::chunked::{ChunkMode, decode};
 use crate::auth::verify::authenticate;
 use crate::auth::{AuthContext, ClientCredential, CredentialStore, PayloadKind, now};
 use crate::cache::Cache;
-use crate::cache::meta::{CacheMetadata, EntryState};
+use crate::cache::meta::{CacheMetadata, EntryState, collect_headers, is_persisted_header};
 use crate::cluster::consul::ConsulApi;
 use crate::cluster::{Cluster, WriteBody};
 use crate::config::{CacheMode, Config, ConsensusBackend, Mode, TlsConfig, WritePolicy};
@@ -816,6 +816,24 @@ async fn forward(
         return proxy_request(state, method, &credential, prepared, path_and_query).await;
     };
 
+    if has_sse_c(headers) {
+        match cache.mode() {
+            CacheMode::Write | CacheMode::ReadWrite => {
+                return Err(unsupported_sse_c());
+            }
+            CacheMode::Read => {
+                let response =
+                    proxy_request(state, method, &credential, prepared, path_and_query.clone())
+                        .await?;
+                if method == Method::PUT && response.status().is_success() && !key.is_empty() {
+                    cache.invalidate(&bucket, &key).await;
+                }
+                return Ok(response);
+            }
+            CacheMode::Off => {}
+        }
+    }
+
     if !object || multipart {
         let response = proxy_request(state, method, &credential, prepared, path_and_query).await?;
         if method == Method::POST && query.contains("uploadId") && response.status().is_success() {
@@ -1053,6 +1071,11 @@ async fn read_path(
     if let Some(meta) = cache.pending_entry(bucket, key) {
         lookup.record("cache.hit", true);
         lookup.record("cache.entry.state", meta.state.as_str());
+        match evaluate_read_conditions(headers, &meta) {
+            CacheCondition::NotModified => return Ok(not_modified_response(&meta)),
+            CacheCondition::Failed => return Err(precondition_failed()),
+            CacheCondition::Ok => {}
+        }
         match serve_cached(state, cache, method, range.as_deref(), &meta, bucket, key).await {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
@@ -1124,7 +1147,13 @@ async fn read_path(
     lookup.record("cache.entry.state", meta.state.as_str());
 
     let ttl = cache.ttl_for(bucket);
-    if meta.is_fresh(unix_now(), ttl) || meta.state == EntryState::Failed {
+    let fresh = meta.is_fresh(unix_now(), ttl) || meta.state == EntryState::Failed;
+    if fresh {
+        match evaluate_read_conditions(headers, &meta) {
+            CacheCondition::NotModified => return Ok(not_modified_response(&meta)),
+            CacheCondition::Failed => return Err(precondition_failed()),
+            CacheCondition::Ok => {}
+        }
         match serve_cached(state, cache, method, range.as_deref(), &meta, bucket, key).await {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
@@ -1135,9 +1164,9 @@ async fn read_path(
                 state.metrics.fallback();
             }
         }
-    } else if range.is_some() {
-        // A range is only served from a fresh complete entry. A stale entry
-        // passes the range to origin and does not cache the partial body.
+    } else if range.is_some() || has_client_condition(headers) {
+        // A condition or a range is only served from a fresh complete entry.
+        // The stale entry does not answer it.
         state.metrics.miss();
         return origin_read(
             state,
@@ -1197,6 +1226,7 @@ async fn origin_read(
     let mut request_headers = headers.clone();
     if let Some(meta) = revalidate
         && !meta.etag.is_empty()
+        && !request_headers.contains_key(header::IF_NONE_MATCH)
         && let Ok(value) = HeaderValue::from_str(&meta.etag)
     {
         request_headers.insert(header::IF_NONE_MATCH, value);
@@ -1237,6 +1267,11 @@ async fn origin_read(
             let range = headers
                 .get(header::RANGE)
                 .and_then(|value| value.to_str().ok());
+            match evaluate_read_conditions(headers, &meta) {
+                CacheCondition::NotModified => return Ok(not_modified_response(&meta)),
+                CacheCondition::Failed => return Err(precondition_failed()),
+                CacheCondition::Ok => {}
+            }
             if let Ok(Some(response)) =
                 serve_cached(state, cache, method, range, &meta, bucket, key).await
             {
@@ -1357,8 +1392,27 @@ fn metadata_response(meta: &CacheMetadata) -> Response {
     response
 }
 
+fn not_modified_response(meta: &CacheMetadata) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NOT_MODIFIED;
+    set_meta_headers(meta, response.headers_mut());
+    response
+}
+
 fn set_meta_headers(meta: &CacheMetadata, headers: &mut HeaderMap) {
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    for (name, value) in &meta.headers {
+        if !is_persisted_header(name) || is_reserved_cache_header(name) {
+            continue;
+        }
+        let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(value) else {
+            continue;
+        };
+        headers.insert(name, value);
+    }
     if !meta.etag.is_empty()
         && let Ok(value) = HeaderValue::from_str(&meta.etag)
     {
@@ -1379,6 +1433,116 @@ fn set_meta_headers(meta: &CacheMetadata, headers: &mut HeaderMap) {
     {
         headers.insert(header::CONTENT_ENCODING, value);
     }
+}
+
+fn is_reserved_cache_header(name: &str) -> bool {
+    matches!(
+        name,
+        "content-length" | "content-range" | "etag" | "last-modified"
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheCondition {
+    Ok,
+    NotModified,
+    Failed,
+}
+
+fn has_client_condition(headers: &HeaderMap) -> bool {
+    headers.contains_key(header::IF_MATCH)
+        || headers.contains_key(header::IF_NONE_MATCH)
+        || headers.contains_key(header::IF_MODIFIED_SINCE)
+        || headers.contains_key(header::IF_UNMODIFIED_SINCE)
+}
+
+fn evaluate_read_conditions(headers: &HeaderMap, meta: &CacheMetadata) -> CacheCondition {
+    if let Some(condition) = header_string(headers, header::IF_NONE_MATCH) {
+        if etag_condition_matches(&condition, &meta.etag) {
+            return CacheCondition::NotModified;
+        }
+    } else if let Some(value) = header_string(headers, header::IF_MODIFIED_SINCE)
+        && is_not_modified_since(meta.last_modified.as_deref(), &value)
+    {
+        return CacheCondition::NotModified;
+    }
+    if let Some(condition) = header_string(headers, header::IF_MATCH) {
+        if !etag_condition_matches(&condition, &meta.etag) {
+            return CacheCondition::Failed;
+        }
+    } else if let Some(value) = header_string(headers, header::IF_UNMODIFIED_SINCE)
+        && is_modified_since(meta.last_modified.as_deref(), &value)
+    {
+        return CacheCondition::Failed;
+    }
+    CacheCondition::Ok
+}
+
+/// Compare one `If-Match` or `If-None-Match` value with a stored entity tag.
+fn etag_condition_matches(condition: &str, etag: &str) -> bool {
+    let condition = condition.trim();
+    if condition == "*" {
+        return true;
+    }
+    let etag = etag.trim();
+    let etag = etag.strip_prefix("W/").unwrap_or(etag);
+    let etag = etag.trim_matches('"');
+    condition.split(',').any(|item| {
+        let item = item.trim();
+        let item = item.strip_prefix("W/").unwrap_or(item);
+        item.trim_matches('"') == etag
+    })
+}
+
+fn is_not_modified_since(last_modified: Option<&str>, value: &str) -> bool {
+    let (Some(modified), Some(since)) = (
+        last_modified.and_then(parse_http_date),
+        parse_http_date(value),
+    ) else {
+        return false;
+    };
+    modified <= since
+}
+
+fn is_modified_since(last_modified: Option<&str>, value: &str) -> bool {
+    let (Some(modified), Some(since)) = (
+        last_modified.and_then(parse_http_date),
+        parse_http_date(value),
+    ) else {
+        return false;
+    };
+    modified > since
+}
+
+fn parse_http_date(value: &str) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822).ok()
+}
+
+fn has_sse_c(headers: &HeaderMap) -> bool {
+    [
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key",
+        "x-amz-server-side-encryption-customer-key-md5",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name))
+}
+
+fn unsupported_sse_c() -> S3Error {
+    S3Error::not_implemented(
+        "The cache mode does not support server-side encryption with customer keys. Send the request to origin directly.",
+    )
+}
+
+fn precondition_failed() -> S3Error {
+    S3Error::from_status(StatusCode::PRECONDITION_FAILED)
+}
+
+async fn cached_metadata(cache: &Arc<Cache>, bucket: &str, key: &str) -> Option<CacheMetadata> {
+    if let Some(meta) = cache.pending_entry(bucket, key) {
+        return Some(meta);
+    }
+    cache.read_meta(bucket, key).await.ok().flatten()
 }
 
 fn copy_cache_headers(source: &HeaderMap, target: &mut HeaderMap) {
@@ -1410,7 +1574,7 @@ fn response_from_stream(
 }
 
 // The write path needs the request context and the cache policy.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn write_put(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -1433,6 +1597,37 @@ async fn write_put(
             path_and_query,
         )
         .await;
+    }
+
+    let if_none_match = header_string(headers, header::IF_NONE_MATCH);
+    let if_match = header_string(headers, header::IF_MATCH);
+    if if_none_match.is_some() || if_match.is_some() {
+        if let Some(meta) = cached_metadata(cache, bucket, key).await {
+            if let Some(condition) = &if_none_match
+                && etag_condition_matches(condition, &meta.etag)
+            {
+                return Err(precondition_failed());
+            }
+            if let Some(condition) = &if_match
+                && !etag_condition_matches(condition, &meta.etag)
+            {
+                return Err(precondition_failed());
+            }
+        } else {
+            // Origin must evaluate the condition. The cache has no entry.
+            let response = proxy_request(
+                state,
+                &Method::PUT,
+                credential,
+                prepared,
+                path_and_query.to_owned(),
+            )
+            .await?;
+            if response.status().is_success() {
+                cache.invalidate(bucket, key).await;
+            }
+            return Ok(response);
+        }
     }
 
     let Some(length) = prepared.content_length else {
@@ -1485,6 +1680,7 @@ async fn write_put(
 
     let content_type = header_string(&prepared.headers, header::CONTENT_TYPE);
     let content_encoding = header_string(&prepared.headers, header::CONTENT_ENCODING);
+    let object_headers = collect_headers(&prepared.headers);
     let failure_flag = prepared.failure.clone();
     let body = prepared.body.unwrap_or_else(empty_body);
     let body_started = Arc::new(AtomicBool::new(false));
@@ -1496,6 +1692,7 @@ async fn write_put(
             length,
             content_type,
             content_encoding,
+            object_headers,
             body_started,
         )
         .await
@@ -1513,7 +1710,6 @@ async fn write_put(
     if let Ok(value) = HeaderValue::from_str(&meta.etag) {
         response.headers_mut().insert(header::ETAG, value);
     }
-    let _ = headers;
     Ok(response)
 }
 
@@ -1542,6 +1738,7 @@ async fn write_through_put(
 
     let content_type = header_string(&prepared.headers, header::CONTENT_TYPE);
     let content_encoding = header_string(&prepared.headers, header::CONTENT_ENCODING);
+    let object_headers = collect_headers(&prepared.headers);
     let failure_flag = prepared.failure.clone();
     let body = prepared.body.unwrap_or_else(empty_body);
     let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(2);
@@ -1598,7 +1795,15 @@ async fn write_through_put(
     };
     if let Some(blob) = blob {
         if let Err(error) = cache
-            .commit_synced_blob(bucket, key, &blob, etag, content_type, content_encoding)
+            .commit_synced_blob(
+                bucket,
+                key,
+                &blob,
+                etag,
+                content_type,
+                content_encoding,
+                object_headers,
+            )
             .await
         {
             warn!(%error, "write-through cache metadata failed");
@@ -1639,6 +1844,27 @@ async fn write_delete(
     key: &str,
     path_and_query: &str,
 ) -> Result<Response, S3Error> {
+    if let Some(condition) = header_string(&prepared.headers, header::IF_MATCH) {
+        if let Some(meta) = cached_metadata(cache, bucket, key).await {
+            if !etag_condition_matches(&condition, &meta.etag) {
+                return Err(precondition_failed());
+            }
+        } else {
+            // The cache cannot evaluate the condition. Origin must do it.
+            let response = proxy_request(
+                state,
+                method,
+                credential,
+                prepared,
+                path_and_query.to_owned(),
+            )
+            .await?;
+            if response.status().is_success() {
+                cache.invalidate(bucket, key).await;
+            }
+            return Ok(response);
+        }
+    }
     if cache.pending_entry(bucket, key).is_some() {
         cache
             .delete_pending(bucket, key)

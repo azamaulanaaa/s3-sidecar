@@ -4,7 +4,7 @@ pub mod index;
 pub mod keys;
 pub mod meta;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,10 @@ use self::index::{CacheIndex, IndexEntry};
 use self::keys::{
     blob_key, journal_key, journal_prefix, meta_key, next_id, node_prefix, object_path,
 };
-use self::meta::{CacheMetadata, EntryState, JournalEntry, JournalKind, unix_now};
+use self::meta::{
+    CacheMetadata, EntryState, JournalEntry, JournalKind, collect_headers, is_persisted_header,
+    unix_now,
+};
 use crate::auth::body::BodyStream;
 use crate::auth::{ClientCredential, now};
 use crate::config::{CacheMode, Config, EndpointConfig, OnCacheError, WritePolicy};
@@ -87,7 +90,7 @@ struct SyncJobs {
 /// A cache lookup result.
 pub enum Lookup {
     /// The cache has a usable entry.
-    Hit(CacheMetadata),
+    Hit(Box<CacheMetadata>),
     /// The cache does not have the key.
     Miss,
     /// A tombstone hides the key.
@@ -492,6 +495,7 @@ impl Cache {
         length: u64,
         content_type: Option<String>,
         content_encoding: Option<String>,
+        headers: BTreeMap<String, String>,
         body_started: Arc<AtomicBool>,
     ) -> Result<CacheMetadata, CacheError> {
         let id = next_id();
@@ -511,6 +515,7 @@ impl Cache {
             content_encoding,
             unix_now(),
         );
+        meta.headers = headers;
         meta.state = EntryState::Pending;
         let hashes = self
             .put_blob_stream(
@@ -1052,7 +1057,8 @@ impl Cache {
             meta.mark_synced(etag.unwrap_or_else(|| entry.etag.clone()), unix_now());
             let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
             let _ = self.index_upsert(&cache_key, &meta).await;
-            lock(&self.pending).remove(&(bucket.clone(), entry.key.clone()));
+            let mut pending = lock(&self.pending);
+            remove_pending_if_current(&mut pending, &(bucket.clone(), entry.key.clone()), &path);
         } else {
             lock(&self.tombstones).remove(&(entry.bucket.clone(), entry.key.clone()));
         }
@@ -1086,7 +1092,12 @@ impl Cache {
                 let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
                 self.index_remove(&cache_key);
             }
-            lock(&self.pending).remove(&(entry.bucket.clone(), entry.key.clone()));
+            let mut pending = lock(&self.pending);
+            remove_pending_if_current(
+                &mut pending,
+                &(entry.bucket.clone(), entry.key.clone()),
+                &path,
+            );
         } else {
             lock(&self.tombstones)
                 .insert((entry.bucket.clone(), entry.key.clone()), entry.created_at);
@@ -1118,6 +1129,18 @@ impl Cache {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string())),
         );
         let mut headers = HeaderMap::new();
+        for (name, value) in &entry.headers {
+            if !is_persisted_header(name) {
+                continue;
+            }
+            let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let Ok(value) = HeaderValue::from_str(value) else {
+                continue;
+            };
+            headers.insert(name, value);
+        }
         if let Some(value) = &entry.content_type
             && let Ok(value) = HeaderValue::from_str(value)
         {
@@ -1233,6 +1256,7 @@ impl Cache {
         etag: Option<String>,
         content_type: Option<String>,
         content_encoding: Option<String>,
+        headers: BTreeMap<String, String>,
     ) -> Result<(), CacheError> {
         let etag = etag.unwrap_or_else(|| format!("\"{}\"", blob.md5));
         let mut meta = CacheMetadata::synced(
@@ -1245,6 +1269,7 @@ impl Cache {
             content_encoding,
             unix_now(),
         );
+        meta.headers = headers;
         meta.checksum.clone_from(&blob.checksum);
         self.put_meta(self.cache_bucket(), &blob.cache_key, &meta)
             .await?;
@@ -1763,6 +1788,7 @@ fn metadata_from_journal(entry: &JournalEntry) -> CacheMetadata {
         checksum: entry.checksum.clone(),
         content_type: entry.content_type.clone(),
         content_encoding: entry.content_encoding.clone(),
+        headers: entry.headers.clone(),
         state: entry.state,
         created_at: entry.created_at,
     }
@@ -1796,7 +1822,7 @@ fn metadata_from_response(bucket: &str, key: &str, response: &reqwest::Response)
         .get(header::CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    CacheMetadata::synced(
+    let mut meta = CacheMetadata::synced(
         bucket,
         key,
         etag,
@@ -1805,13 +1831,30 @@ fn metadata_from_response(bucket: &str, key: &str, response: &reqwest::Response)
         content_type,
         content_encoding,
         unix_now(),
-    )
+    );
+    meta.headers = collect_headers(response.headers());
+    meta
 }
 
 fn is_meta_key(key: &str) -> bool {
     std::path::Path::new(key)
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("meta"))
+}
+
+/// Remove the pending entry only when it still names the finished journal.
+fn remove_pending_if_current(
+    pending: &mut HashMap<CacheKey, PendingEntry>,
+    key: &CacheKey,
+    journal: &str,
+) -> bool {
+    let current = pending
+        .get(key)
+        .is_some_and(|entry| entry.journal_key == journal);
+    if current {
+        pending.remove(key);
+    }
+    current
 }
 
 fn update_hash(state: &Mutex<HashState>, bytes: &[u8]) -> Result<(), CacheError> {
@@ -1924,5 +1967,41 @@ mod tests {
         assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
         assert!(!is_retryable_status(StatusCode::FORBIDDEN));
         assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn pending_removal_keeps_a_newer_journal() {
+        let meta = CacheMetadata::synced(
+            "media",
+            "a.txt",
+            "\"etag\"".to_owned(),
+            None,
+            1,
+            None,
+            None,
+            1,
+        );
+        let key = ("media".to_owned(), "a.txt".to_owned());
+        let mut pending = HashMap::new();
+        pending.insert(
+            key.clone(),
+            PendingEntry {
+                meta: meta.clone(),
+                journal_key: "old".to_owned(),
+            },
+        );
+        assert!(!remove_pending_if_current(&mut pending, &key, "new"));
+        assert!(pending.contains_key(&key));
+        pending.insert(
+            key.clone(),
+            PendingEntry {
+                meta,
+                journal_key: "new".to_owned(),
+            },
+        );
+        assert!(!remove_pending_if_current(&mut pending, &key, "old"));
+        assert!(pending.contains_key(&key));
+        assert!(remove_pending_if_current(&mut pending, &key, "new"));
+        assert!(!pending.contains_key(&key));
     }
 }

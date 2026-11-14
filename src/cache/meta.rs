@@ -1,6 +1,46 @@
 //! Cache entry metadata and journal records.
 
+use std::collections::BTreeMap;
+
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
+
+/// Return true when the cache may store and replay one object header.
+#[must_use]
+pub fn is_persisted_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if name.starts_with("x-amz-meta-") {
+        return true;
+    }
+    if name.starts_with("x-amz-server-side-encryption") {
+        return false;
+    }
+    matches!(
+        name.as_str(),
+        "content-type"
+            | "content-encoding"
+            | "content-disposition"
+            | "cache-control"
+            | "content-language"
+            | "expires"
+            | "x-amz-storage-class"
+    )
+}
+
+/// Copy the object headers that the cache may store.
+#[must_use]
+pub fn collect_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
+    let mut stored = BTreeMap::new();
+    for (name, value) in headers {
+        if !is_persisted_header(name.as_str()) {
+            continue;
+        }
+        if let Ok(value) = value.to_str() {
+            stored.insert(name.as_str().to_owned(), value.to_owned());
+        }
+    }
+    stored
+}
 
 /// Lifecycle state of a cache entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +89,9 @@ pub struct CacheMetadata {
     pub content_type: Option<String>,
     /// Content encoding.
     pub content_encoding: Option<String>,
+    /// Object headers that the cache may store and replay.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     /// Entry state.
     pub state: EntryState,
     /// Time the entry was created, in Unix seconds.
@@ -80,6 +123,7 @@ impl CacheMetadata {
             checksum: String::new(),
             content_type,
             content_encoding,
+            headers: BTreeMap::new(),
             state: EntryState::Synced,
             created_at: now,
         }
@@ -148,6 +192,9 @@ pub struct JournalEntry {
     pub content_type: Option<String>,
     /// Content encoding.
     pub content_encoding: Option<String>,
+    /// Object headers that the cache may store and replay.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     /// Creation time in Unix seconds.
     pub created_at: i64,
     /// Number of sync attempts that failed.
@@ -172,6 +219,7 @@ impl JournalEntry {
             checksum: meta.checksum.clone(),
             content_type: meta.content_type.clone(),
             content_encoding: meta.content_encoding.clone(),
+            headers: meta.headers.clone(),
             created_at: meta.created_at,
             attempts: 0,
             state: EntryState::Pending,
@@ -193,6 +241,7 @@ impl JournalEntry {
             checksum: String::new(),
             content_type: None,
             content_encoding: None,
+            headers: BTreeMap::new(),
             created_at: now,
             attempts: 0,
             state: EntryState::Pending,
@@ -211,6 +260,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    use axum::http::HeaderValue;
 
     fn meta() -> CacheMetadata {
         CacheMetadata::synced(
@@ -271,5 +322,46 @@ mod tests {
         assert_eq!(entry.kind, JournalKind::Delete);
         assert_eq!(entry.size, 0);
         assert_eq!(entry.attempts, 0);
+    }
+
+    #[test]
+    fn old_metadata_without_headers_loads() {
+        let mut value = serde_json::to_value(meta()).unwrap();
+        value.as_object_mut().unwrap().remove("headers");
+        let decoded: CacheMetadata = serde_json::from_value(value).unwrap();
+        assert!(decoded.headers.is_empty());
+    }
+
+    #[test]
+    fn only_safe_headers_are_stored() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-color", HeaderValue::from_static("blue"));
+        headers.insert("content-disposition", HeaderValue::from_static("inline"));
+        headers.insert("x-amz-storage-class", HeaderValue::from_static("STANDARD"));
+        headers.insert("content-length", HeaderValue::from_static("5"));
+        headers.insert("content-md5", HeaderValue::from_static("hash"));
+        headers.insert(
+            "x-amz-checksum-sha256",
+            HeaderValue::from_static("checksum"),
+        );
+        headers.insert("authorization", HeaderValue::from_static("token"));
+        headers.insert(
+            "x-amz-server-side-encryption-customer-algorithm",
+            HeaderValue::from_static("AES256"),
+        );
+        let stored = collect_headers(&headers);
+        assert_eq!(
+            stored.get("x-amz-meta-color").map(String::as_str),
+            Some("blue")
+        );
+        assert_eq!(
+            stored.get("content-disposition").map(String::as_str),
+            Some("inline")
+        );
+        assert_eq!(
+            stored.get("x-amz-storage-class").map(String::as_str),
+            Some("STANDARD")
+        );
+        assert_eq!(stored.len(), 3);
     }
 }
