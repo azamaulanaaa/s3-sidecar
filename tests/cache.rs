@@ -53,6 +53,7 @@ struct OriginState {
     counts: Arc<Counts>,
     gate: Arc<Semaphore>,
     put_status: Arc<Mutex<Option<StatusCode>>>,
+    put_headers: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
 }
 
 #[derive(Clone)]
@@ -71,6 +72,7 @@ struct OriginHandle {
     counts: Arc<Counts>,
     gate: Arc<Semaphore>,
     put_status: Arc<Mutex<Option<StatusCode>>>,
+    put_headers: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
 }
 
 #[derive(Clone)]
@@ -120,6 +122,10 @@ impl OriginHandle {
     fn release_puts(&self) {
         self.gate.add_permits(1);
     }
+
+    fn put_headers(&self, key: &str) -> Option<HashMap<String, String>> {
+        self.put_headers.lock().unwrap().get(key).cloned()
+    }
 }
 
 impl CacheHandle {
@@ -143,11 +149,13 @@ async fn spawn_origin() -> (String, OriginHandle) {
     let counts = Arc::new(Counts::default());
     let gate = Arc::new(Semaphore::new(1));
     let put_status = Arc::new(Mutex::new(None));
+    let put_headers = Arc::new(Mutex::new(HashMap::new()));
     let state = OriginState {
         objects: Arc::clone(&objects),
         counts: Arc::clone(&counts),
         gate: Arc::clone(&gate),
         put_status: Arc::clone(&put_status),
+        put_headers: Arc::clone(&put_headers),
     };
     let app = Router::new().fallback(origin_handler).with_state(state);
     tokio::spawn(async move {
@@ -160,6 +168,7 @@ async fn spawn_origin() -> (String, OriginHandle) {
             counts,
             gate,
             put_status,
+            put_headers,
         },
     )
 }
@@ -239,6 +248,20 @@ async fn origin_handler(
                 return xml(status, "<Error><Code>AccessDenied</Code></Error>");
             }
             let etag = format!("\"etag-{}\"", state.counts.put.load(Ordering::Relaxed));
+            let recorded: HashMap<String, String> = headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                })
+                .collect();
+            state
+                .put_headers
+                .lock()
+                .unwrap()
+                .insert(object_key.clone(), recorded);
             state.objects.lock().unwrap().insert(
                 object_key,
                 Stored {
@@ -657,9 +680,25 @@ fn signed_request(
     url: &str,
     body: Option<Vec<u8>>,
 ) -> reqwest::RequestBuilder {
+    signed_request_with_headers(client, method, url, body, &[])
+}
+
+fn signed_request_with_headers(
+    client: &reqwest::Client,
+    method: Method,
+    url: &str,
+    body: Option<Vec<u8>>,
+    extra: &[(&str, &str)],
+) -> reqwest::RequestBuilder {
     let parsed = Url::parse(url).unwrap();
     let credential = credential();
     let mut headers = HeaderMap::new();
+    for (name, value) in extra {
+        headers.insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
     let payload_hash = if body.is_some() {
         "UNSIGNED-PAYLOAD"
     } else {
@@ -869,6 +908,7 @@ async fn crash_after_ack_resumes_on_restart() {
         checksum: String::new(),
         content_type: Some("text/plain".to_owned()),
         content_encoding: None,
+        headers: std::collections::BTreeMap::new(),
         state: EntryState::Pending,
         created_at: now,
     };
@@ -1446,4 +1486,168 @@ async fn otel_metrics_report_counters() {
     assert!(support::counter(&metrics, "s3_sidecar.cache.origin_bytes") >= 5);
     assert_eq!(support::gauge(&metrics, "s3_sidecar.cache.max_bytes"), 0);
     assert_eq!(support::gauge(&metrics, "s3_sidecar.cache.unlimited"), 1);
+}
+
+const OBJECT_HEADERS: [(&str, &str); 5] = [
+    ("x-amz-meta-color", "blue"),
+    ("content-disposition", "attachment; filename=\"report.txt\""),
+    ("cache-control", "max-age=60"),
+    ("content-language", "en-US"),
+    ("expires", "Wed, 21 Oct 2015 07:28:00 GMT"),
+];
+
+fn assert_object_headers(headers: &HeaderMap) {
+    for (name, value) in OBJECT_HEADERS {
+        assert_eq!(
+            headers.get(name).and_then(|value| value.to_str().ok()),
+            Some(value),
+            "header {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn write_back_preserves_object_headers() {
+    let (origin_url, origin) = spawn_origin().await;
+    let _permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/hdr-back", sidecar.url),
+        Some(b"body".to_vec()),
+        &OBJECT_HEADERS,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/hdr-back", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_object_headers(get.headers());
+    assert_eq!(body_text(get).await, "body");
+    assert_eq!(origin.get_count(), 0);
+    origin.release_puts();
+}
+
+#[tokio::test]
+async fn write_back_sync_sends_object_headers() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/hdr-sync", sidecar.url),
+        Some(b"body".to_vec()),
+        &OBJECT_HEADERS,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    wait_for(Duration::from_secs(3), || {
+        let origin = origin.clone();
+        async move { origin.body("media/hdr-sync").is_some() }
+    })
+    .await;
+    let recorded = origin.put_headers("media/hdr-sync").unwrap();
+    for (name, value) in OBJECT_HEADERS {
+        assert_eq!(
+            recorded.get(name).map(String::as_str),
+            Some(value),
+            "header {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn write_through_preserves_object_headers() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteThrough,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/hdr-through", sidecar.url),
+        Some(b"body".to_vec()),
+        &OBJECT_HEADERS,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let blob = blob_key("cache", "node-a", "media", "hdr-through");
+    wait_for(Duration::from_secs(3), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { cache.has(&blob) && cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
+    let recorded = origin.put_headers("media/hdr-through").unwrap();
+    for (name, value) in OBJECT_HEADERS {
+        assert_eq!(
+            recorded.get(name).map(String::as_str),
+            Some(value),
+            "header {name}"
+        );
+    }
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/hdr-through", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_object_headers(get.headers());
+    assert_eq!(body_text(get).await, "body");
+    assert_eq!(origin.get_count(), 0);
 }

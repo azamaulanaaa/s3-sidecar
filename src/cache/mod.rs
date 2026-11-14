@@ -4,7 +4,7 @@ pub mod index;
 pub mod keys;
 pub mod meta;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +24,10 @@ use self::index::{CacheIndex, IndexEntry};
 use self::keys::{
     blob_key, journal_key, journal_prefix, meta_key, next_id, node_prefix, object_path,
 };
-use self::meta::{CacheMetadata, EntryState, JournalEntry, JournalKind, unix_now};
+use self::meta::{
+    CacheMetadata, EntryState, JournalEntry, JournalKind, collect_headers, is_persisted_header,
+    unix_now,
+};
 use crate::auth::body::BodyStream;
 use crate::auth::{ClientCredential, now};
 use crate::config::{CacheMode, Config, EndpointConfig, OnCacheError, WritePolicy};
@@ -87,7 +90,7 @@ struct SyncJobs {
 /// A cache lookup result.
 pub enum Lookup {
     /// The cache has a usable entry.
-    Hit(CacheMetadata),
+    Hit(Box<CacheMetadata>),
     /// The cache does not have the key.
     Miss,
     /// A tombstone hides the key.
@@ -492,6 +495,7 @@ impl Cache {
         length: u64,
         content_type: Option<String>,
         content_encoding: Option<String>,
+        headers: BTreeMap<String, String>,
         body_started: Arc<AtomicBool>,
     ) -> Result<CacheMetadata, CacheError> {
         let id = next_id();
@@ -511,6 +515,7 @@ impl Cache {
             content_encoding,
             unix_now(),
         );
+        meta.headers = headers;
         meta.state = EntryState::Pending;
         let hashes = self
             .put_blob_stream(
@@ -1118,6 +1123,18 @@ impl Cache {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string())),
         );
         let mut headers = HeaderMap::new();
+        for (name, value) in &entry.headers {
+            if !is_persisted_header(name) {
+                continue;
+            }
+            let Ok(name) = axum::http::HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let Ok(value) = HeaderValue::from_str(value) else {
+                continue;
+            };
+            headers.insert(name, value);
+        }
         if let Some(value) = &entry.content_type
             && let Ok(value) = HeaderValue::from_str(value)
         {
@@ -1233,6 +1250,7 @@ impl Cache {
         etag: Option<String>,
         content_type: Option<String>,
         content_encoding: Option<String>,
+        headers: BTreeMap<String, String>,
     ) -> Result<(), CacheError> {
         let etag = etag.unwrap_or_else(|| format!("\"{}\"", blob.md5));
         let mut meta = CacheMetadata::synced(
@@ -1245,6 +1263,7 @@ impl Cache {
             content_encoding,
             unix_now(),
         );
+        meta.headers = headers;
         meta.checksum.clone_from(&blob.checksum);
         self.put_meta(self.cache_bucket(), &blob.cache_key, &meta)
             .await?;
@@ -1763,6 +1782,7 @@ fn metadata_from_journal(entry: &JournalEntry) -> CacheMetadata {
         checksum: entry.checksum.clone(),
         content_type: entry.content_type.clone(),
         content_encoding: entry.content_encoding.clone(),
+        headers: entry.headers.clone(),
         state: entry.state,
         created_at: entry.created_at,
     }
@@ -1796,7 +1816,7 @@ fn metadata_from_response(bucket: &str, key: &str, response: &reqwest::Response)
         .get(header::CONTENT_ENCODING)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    CacheMetadata::synced(
+    let mut meta = CacheMetadata::synced(
         bucket,
         key,
         etag,
