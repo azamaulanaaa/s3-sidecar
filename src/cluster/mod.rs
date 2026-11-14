@@ -1025,13 +1025,16 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// Returns a clear error when the upload belongs to another node.
+    /// Returns a clear error when the upload belongs to another node. Returns
+    /// `NotImplemented` when the request carries an encryption header.
     pub async fn upload_part(
         &self,
         upload_id: &str,
         part_number: &str,
+        headers: &HeaderMap,
         input: WriteBody,
     ) -> Result<Response, S3Error> {
+        reject_encryption_headers(headers)?;
         let record = self.upload_for_node(upload_id)?;
         let path = format!(
             "/{}/objects/{}?partNumber={}&uploadId={}",
@@ -1067,13 +1070,16 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// Returns an error when the backing upload or the commit fails.
+    /// Returns an error when the backing upload or the commit fails. Returns
+    /// `NotImplemented` when the request carries an encryption header.
     #[allow(clippy::too_many_lines)]
     pub async fn complete_multipart(
         &self,
         upload_id: &str,
+        headers: &HeaderMap,
         input: WriteBody,
     ) -> Result<Response, S3Error> {
+        reject_encryption_headers(headers)?;
         let record = self.upload_for_node(upload_id)?;
         let path = format!(
             "/{}/objects/{}?uploadId={}",

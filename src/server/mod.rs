@@ -968,6 +968,7 @@ async fn forward_cluster(
             .upload_part(
                 &upload_id,
                 &part_number,
+                request_headers,
                 WriteBody {
                     body,
                     content_length,
@@ -982,6 +983,7 @@ async fn forward_cluster(
         return cluster
             .complete_multipart(
                 &upload_id,
+                request_headers,
                 WriteBody {
                     body,
                     content_length,
