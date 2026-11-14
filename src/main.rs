@@ -9,10 +9,10 @@ use s3_sidecar::config::loader::{LoadOptions, LoadedConfig, load};
 use s3_sidecar::config::show_table;
 use s3_sidecar::observability;
 use s3_sidecar::server;
+use s3_sidecar::telemetry::Telemetry;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    observability::init();
     let cli = Cli::parse();
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -32,8 +32,12 @@ async fn run(cli: Cli) -> Result<(), String> {
 
 async fn serve(flags: &ConfigFlags) -> Result<(), String> {
     let loaded = load_config(flags)?;
+    let node_id = server::telemetry_node_id(&loaded.config);
+    let telemetry =
+        Telemetry::new(&loaded.config.otel, node_id.as_deref()).map_err(|error| error.message)?;
+    observability::init_with(&loaded.config.otel, telemetry.as_ref())?;
     server::log_config(&loaded.config, loaded.config_path.as_deref());
-    server::serve(loaded.config, &loaded.warnings)
+    server::serve_with_telemetry(loaded.config, &loaded.warnings, telemetry)
         .await
         .map_err(|error| error.to_string())
 }
