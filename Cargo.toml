@@ -19,16 +19,19 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 hmac = "0.12"
 md-5 = "0.10"
-opentelemetry = { version = "0.33.1", features = ["metrics"] }
+opentelemetry = { version = "0.33.1", features = ["logs", "metrics", "trace"] }
+opentelemetry-appender-tracing = "0.33.1"
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = [
   "grpc-tonic",
   "http-proto",
   "internal-logs",
+  "logs",
   "metrics",
   "reqwest-blocking-client",
+  "trace",
 ] }
 opentelemetry-semantic-conventions = "0.33.1"
-opentelemetry_sdk = { version = "0.33.1", features = ["metrics", "rt-tokio"] }
+opentelemetry_sdk = { version = "0.33.1", features = ["logs", "metrics", "rt-tokio", "trace"] }
 openraft = { version = "0.10.0", default-features = false, features = ["serde", "tokio-rt"] }
 percent-encoding = "2"
 redb = "4.5.0"
@@ -48,6 +51,7 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 tonic = { version = "0.14", default-features = false }
 tracing = "0.1"
+tracing-opentelemetry = { version = "0.34", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zeroize = { version = "1", features = ["derive"] }
 
