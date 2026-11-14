@@ -1,8 +1,8 @@
 //! Multipart object writes for sidecar-owned data.
 //!
-//! Client-driven multipart requests still pass through unchanged. This module
-//! gives the cache, cluster, and replication paths one writer that keeps large
-//! objects below the provider single-`PUT` limits.
+//! Client-driven multipart requests use the cache. A write-back upload
+//! completes in the cache and syncs to origin. A read or write-through upload
+//! completes at origin and fills the cache.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
