@@ -26,6 +26,7 @@ use s3_sidecar::config::{
 use s3_sidecar::server::{AppState, router};
 use tempfile::TempDir;
 use time::OffsetDateTime;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -248,6 +249,28 @@ async fn delete(client: &reqwest::Client, url: &str) -> reqwest::Response {
 
 fn client_request() -> reqwest::Client {
     reqwest::Client::new()
+}
+
+/// Send a cluster request with a raw target. A URL parser would resolve `..`,
+/// so a socket writes the request line directly.
+async fn raw_cluster_status(url: &str, method: &str, path: &str) -> StatusCode {
+    let host = url.trim_start_matches("http://").to_owned();
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\n\
+         x-s3-sidecar-cluster-token: {CLUSTER_TOKEN}\r\nConnection: close\r\n\r\n"
+    );
+    let mut stream = tokio::net::TcpStream::connect(&host).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8_lossy(&response);
+    let code = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap();
+    StatusCode::from_u16(code.parse().unwrap()).unwrap()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -941,6 +964,46 @@ async fn blob_transport_requires_the_token_and_checks_references() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn blob_transport_rejects_invalid_identifiers() {
+    let dir = TempDir::new().unwrap();
+    let (backing_url, _backing) = spawn_backing().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let ids = ["a"];
+    let urls = vec![url.clone()];
+    let config = cluster_base(
+        "a",
+        &url,
+        &backing_url,
+        &dir.path().join("a.redb"),
+        &ids,
+        &urls,
+        ReadMode::Local,
+        1,
+        false,
+    );
+    let state = Arc::new(AppState::new(config).unwrap());
+    state.start().await.unwrap();
+    state.set_ready(true);
+    let app = router(Arc::clone(&state));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    for (method, path) in [
+        ("GET", "/_blob/.."),
+        ("DELETE", "/_blob/.."),
+        ("HEAD", "/_blob/not-a-blob"),
+    ] {
+        assert_eq!(
+            raw_cluster_status(&url, method, path).await,
+            StatusCode::BAD_REQUEST,
+            "{method} {path}"
+        );
+    }
 }
 
 #[tokio::test]

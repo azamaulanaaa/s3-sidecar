@@ -21,17 +21,34 @@ use crate::storage::ForwardRequest;
 /// Header that carries the cluster blob transport token.
 pub const CLUSTER_TOKEN_HEADER: &str = "x-s3-sidecar-cluster-token";
 
+/// The length of a blob identifier.
+const BLOB_ID_LENGTH: usize = 48;
+
+/// Return true when the value is a valid blob identifier.
+///
+/// A blob identifier has 48 lowercase ASCII hexadecimal characters.
+fn valid_blob_id(value: &str) -> bool {
+    value.len() == BLOB_ID_LENGTH
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// Stream one blob to a peer.
 ///
 /// # Errors
 ///
-/// Returns `401` for a missing token and `404` when the blob is absent.
+/// Returns `400` for an invalid blob id, `401` for a missing token, and `404`
+/// when the blob is absent.
 pub async fn get(
     State(state): State<Arc<AppState>>,
     Path(uuid): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     let cluster = authorize(&state, &headers)?;
+    if !valid_blob_id(&uuid) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let mut request_headers = HeaderMap::new();
     if let Some(range) = headers.get(header::RANGE) {
         request_headers.insert(header::RANGE, range.clone());
@@ -76,13 +93,17 @@ pub async fn get(
 ///
 /// # Errors
 ///
-/// Returns `401` for a missing token and `404` when the blob is absent.
+/// Returns `400` for an invalid blob id, `401` for a missing token, and `404`
+/// when the blob is absent.
 pub async fn head(
     State(state): State<Arc<AppState>>,
     Path(uuid): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
     let cluster = authorize(&state, &headers)?;
+    if !valid_blob_id(&uuid) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let Some(length) = cluster.head_blob(&uuid).await else {
         return Err(StatusCode::NOT_FOUND);
     };
@@ -101,7 +122,8 @@ pub async fn head(
 ///
 /// # Errors
 ///
-/// Returns `401` for a missing token and `502` when the backing write fails.
+/// Returns `400` for an invalid blob id, `401` for a missing token, and `502`
+/// when the backing write fails.
 pub async fn put(
     State(state): State<Arc<AppState>>,
     Path(uuid): Path<String>,
@@ -109,6 +131,9 @@ pub async fn put(
     body: Body,
 ) -> Result<StatusCode, StatusCode> {
     let cluster = authorize(&state, &headers)?;
+    if !valid_blob_id(&uuid) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let length = parse_length(&headers)?;
     let stream = Box::pin(
         body.into_data_stream()
@@ -141,14 +166,17 @@ pub async fn put(
 ///
 /// # Errors
 ///
-/// Returns `401` for a missing token, `409` when metadata references the blob,
-/// and `502` when the backing delete fails.
+/// Returns `400` for an invalid blob id, `401` for a missing token, `409` when
+/// metadata references the blob, and `502` when the backing delete fails.
 pub async fn delete(
     State(state): State<Arc<AppState>>,
     Path(uuid): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, StatusCode> {
     let cluster = authorize(&state, &headers)?;
+    if !valid_blob_id(&uuid) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let referenced = cluster
         .state
         .has_committed_blob_reference(&uuid)
@@ -211,4 +239,37 @@ fn parse_length(headers: &HeaderMap) -> Result<Option<u64>, StatusCode> {
         .parse::<u64>()
         .map(Some)
         .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_blob_id;
+
+    const VALID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn blob_id_validation_accepts_lowercase_hex() {
+        assert!(valid_blob_id(VALID));
+        assert!(valid_blob_id(
+            "ffffffffffffffffffffffffffffffffffffffffffffffff"
+        ));
+    }
+
+    #[test]
+    fn blob_id_validation_rejects_invalid_values() {
+        for value in [
+            "",
+            ".",
+            "..",
+            "../x",
+            "a/b",
+            "0123456789ABCDEF0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0",
+            "0123456789abcdef0123456789abcdef0123456789abcdeg",
+            "not-a-blob",
+        ] {
+            assert!(!valid_blob_id(value), "accepted invalid id {value:?}");
+        }
+    }
 }
