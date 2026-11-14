@@ -1361,18 +1361,24 @@ impl Cluster {
         let body = input
             .body
             .map(|body| fingerprint_stream(body, Arc::clone(&fingerprint)));
-        let request = ForwardRequest {
-            method: Method::PUT,
-            path_and_query: format!("/{}/objects/{blob}", self.blob_bucket()),
-            headers: HeaderMap::new(),
+        let body = body.unwrap_or_else(|| {
+            let stream: BodyStream = Box::pin(futures_util::stream::empty());
+            stream
+        });
+        let length = input.content_length.unwrap_or(0);
+        let response = crate::multipart::put_object(
+            &self.client,
+            &self.credential,
+            self.blob_bucket(),
+            &format!("objects/{blob}"),
+            HeaderMap::new(),
             body,
-            content_length: input.content_length,
-        };
-        let response = self
-            .client
-            .execute(&self.credential, request)
-            .await
-            .map_err(|error| storage_error(error, input.failure.as_ref()))?;
+            Some(length),
+            &self.config.multipart,
+            &self.metrics,
+        )
+        .await
+        .map_err(|error| storage_error(error, input.failure.as_ref()))?;
         if !response.status().is_success() {
             return Err(S3Error::from_status(response.status()));
         }
@@ -1844,6 +1850,12 @@ fn storage_error(
 ) -> S3Error {
     match error {
         StorageError::Sign(error) => error,
+        StorageError::Status(status) => {
+            body_failure_error(failure_flag).unwrap_or_else(|| S3Error::from_status(status))
+        }
+        StorageError::Body => body_failure_error(failure_flag)
+            .unwrap_or_else(|| S3Error::invalid_request("The request body is not valid.")),
+        StorageError::TooLarge => S3Error::entity_too_large(),
         StorageError::Timeout => {
             body_failure_error(failure_flag).unwrap_or_else(S3Error::request_timeout)
         }
