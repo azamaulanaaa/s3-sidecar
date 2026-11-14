@@ -301,10 +301,35 @@ async fn complete(
         .await
         .map_err(|error| (error, "complete"))?;
     if response.status().is_success() {
-        Ok(response)
+        Ok(complete_response_with_etag(response).await)
     } else {
         Err((StorageError::Status(response.status()), "complete"))
     }
+}
+
+/// Read the small complete response body and keep its `ETag` header.
+///
+/// A real S3 server can send the `ETag` only in the XML body. The caller then
+/// sees the same status and headers, plus an `ETag` header when the body has
+/// one.
+async fn complete_response_with_etag(response: reqwest::Response) -> reqwest::Response {
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.bytes().await.ok();
+    let mut output: axum::http::Response<reqwest::Body> =
+        axum::http::Response::new(reqwest::Body::from(Vec::new()));
+    *output.status_mut() = status;
+    *output.headers_mut() = headers;
+    if let Some(body) = body {
+        let text = String::from_utf8_lossy(&body);
+        if output.headers().get(header::ETAG).is_none()
+            && let Some(etag) = extract_tag(&text, "ETag")
+            && let Ok(value) = HeaderValue::from_str(&etag)
+        {
+            output.headers_mut().insert(header::ETAG, value);
+        }
+    }
+    output.into()
 }
 
 async fn abort(
