@@ -178,7 +178,8 @@ impl S3Client {
         request: ForwardRequest,
     ) -> Result<Response, StorageError> {
         let base = self.endpoint.as_str().trim_end_matches('/');
-        let url = Url::parse(&format!("{base}{}", request.path_and_query))
+        let path_and_query = encode_dot_segments(&request.path_and_query);
+        let url = Url::parse(&format!("{base}{path_and_query}"))
             .map_err(|_| StorageError::Sign(S3Error::internal()))?;
 
         let span = tracing::info_span!(
@@ -329,6 +330,56 @@ impl S3Client {
     }
 }
 
+/// Encode dot segments in a request path. The query string is not changed.
+///
+/// The `url` crate resolves `.` and `..` path segments, and it also resolves
+/// their percent-encoded forms. S3 object keys are literal, so this function
+/// keeps dot segments intact before URL parsing. It writes each dot segment as
+/// `%2E` or `%2E%2E`. It also writes a separator that touches a dot segment as
+/// `%2F`. The origin decodes that separator back to `/`.
+fn encode_dot_segments(path_and_query: &str) -> String {
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (path_and_query, None),
+    };
+    let segments: Vec<&str> = path.split('/').collect();
+    let dot: Vec<Option<&str>> = segments
+        .iter()
+        .map(|segment| dot_segment(segment))
+        .collect();
+    let mut output = String::with_capacity(path.len() + 8);
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            if dot[index - 1].is_some() || dot[index].is_some() {
+                output.push_str("%2F");
+            } else {
+                output.push('/');
+            }
+        }
+        match dot[index] {
+            Some(encoded) => output.push_str(encoded),
+            None => output.push_str(segment),
+        }
+    }
+    if let Some(query) = query {
+        output.push('?');
+        output.push_str(query);
+    }
+    output
+}
+
+fn dot_segment(segment: &str) -> Option<&'static str> {
+    match percent_encoding::percent_decode_str(segment)
+        .decode_utf8()
+        .ok()
+        .as_deref()
+    {
+        Some(".") => Some("%2E"),
+        Some("..") => Some("%2E%2E"),
+        _ => None,
+    }
+}
+
 fn is_idempotent(method: &Method) -> bool {
     matches!(*method, Method::GET | Method::HEAD | Method::DELETE)
 }
@@ -354,4 +405,46 @@ fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
         .map_or(0, |duration| duration.subsec_nanos());
     let jitter = u64::from(nanos) % (base / 2 + 1);
     Duration::from_millis(base.saturating_add(jitter))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::encode_dot_segments;
+
+    #[test]
+    fn dot_segments_survive_url_parsing() {
+        let cases = [
+            ("/media/a/../b", "/media/a%2F%2E%2E%2Fb"),
+            ("/media/a/./b", "/media/a%2F%2E%2Fb"),
+            ("/media/a/b", "/media/a/b"),
+            ("/media/a/%2E/b", "/media/a%2F%2E%2Fb"),
+            ("/media/a/%2E%2E/b", "/media/a%2F%2E%2E%2Fb"),
+            ("/media/..", "/media%2F%2E%2E"),
+        ];
+        for (path, expected) in cases {
+            let encoded = encode_dot_segments(path);
+            assert_eq!(encoded, expected);
+            let url = reqwest::Url::parse(&format!("http://origin{encoded}")).unwrap();
+            assert_eq!(url.path(), expected);
+        }
+    }
+
+    #[test]
+    fn query_string_is_not_encoded() {
+        assert_eq!(
+            encode_dot_segments("/media/a/../b?list-type=2&prefix=../x&delimiter=%2F"),
+            "/media/a%2F%2E%2E%2Fb?list-type=2&prefix=../x&delimiter=%2F"
+        );
+    }
+
+    #[test]
+    fn existing_percent_escapes_are_not_double_encoded() {
+        assert_eq!(
+            encode_dot_segments("/media/a%2Eb/c%20d"),
+            "/media/a%2Eb/c%20d"
+        );
+        assert!(!encode_dot_segments("/media/a/%2E/b").contains("%25"));
+    }
 }

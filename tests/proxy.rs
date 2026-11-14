@@ -11,13 +11,14 @@ use axum::response::{IntoResponse, Response};
 use reqwest::Url;
 use s3_sidecar::auth::sign::sign_request;
 use s3_sidecar::auth::{
-    ALGORITHM, ClientCredential, CredentialStore, EMPTY_SHA256, credential_scope, format_amz_date,
-    format_scope_date, hmac_sha256, now, sha256_hex, signing_key,
+    ALGORITHM, ClientCredential, CredentialStore, EMPTY_SHA256, canonical_uri, credential_scope,
+    format_amz_date, format_scope_date, hmac_sha256, now, sha256_hex, signing_key,
 };
 use s3_sidecar::config::secret::SecretString;
 use s3_sidecar::config::{CacheMode, ClientConfig, Config, EndpointConfig, Mode};
 use s3_sidecar::server::{AppState, router};
 use time::OffsetDateTime;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[derive(Debug, Clone)]
@@ -244,6 +245,98 @@ fn signed_request(
 
 async fn body_text(response: reqwest::Response) -> String {
     response.text().await.unwrap()
+}
+
+fn raw_authorization(method: &str, host: &str, path: &str, payload_hash: &str) -> (String, String) {
+    let timestamp = now();
+    let date = format_amz_date(timestamp);
+    let scope_date = format_scope_date(timestamp);
+    let scope = credential_scope(&scope_date, "us-east-1", "s3");
+    let credential = credential();
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{date}\n");
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_request = format!(
+        "{method}\n{}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+        canonical_uri(path)
+    );
+    let to_sign = format!(
+        "{ALGORITHM}\n{date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let key = signing_key(
+        credential.secret_access_key(),
+        &scope_date,
+        "us-east-1",
+        "s3",
+    );
+    let signature = hex::encode(hmac_sha256(&key, to_sign.as_bytes()));
+    let authorization = format!(
+        "{ALGORITHM} Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+        credential.access_key_id(),
+    );
+    (date, authorization)
+}
+
+/// Send a signed request with a raw target. A URL parser would resolve the dot
+/// segments in the target, so a socket writes the request line directly.
+async fn raw_signed_request(
+    sidecar: &str,
+    method: &str,
+    path: &str,
+    payload_hash: &str,
+    body: &[u8],
+) -> String {
+    use std::fmt::Write as _;
+
+    let host = sidecar.trim_start_matches("http://").to_owned();
+    let (date, authorization) = raw_authorization(method, &host, path, payload_hash);
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nx-amz-date: {date}\r\n\
+         x-amz-content-sha256: {payload_hash}\r\nAuthorization: {authorization}\r\n\
+         Connection: close\r\n"
+    );
+    if !body.is_empty() {
+        write!(request, "Content-Length: {}\r\n", body.len()).unwrap();
+    }
+    request.push_str("\r\n");
+
+    let mut stream = tokio::net::TcpStream::connect(&host).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+#[tokio::test]
+async fn dot_segments_in_object_keys_are_preserved() {
+    let (origin, records) = spawn_origin().await;
+    let (sidecar, _) = spawn_sidecar(origin).await;
+
+    let response = raw_signed_request(&sidecar, "GET", "/media/a/../b", EMPTY_SHA256, &[]).await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let response = raw_signed_request(
+        &sidecar,
+        "PUT",
+        "/media/a/../b",
+        "UNSIGNED-PAYLOAD",
+        b"dot-body",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    for record in records.iter() {
+        let decoded = percent_encoding::percent_decode_str(&record.path)
+            .decode_utf8()
+            .unwrap();
+        assert_eq!(decoded, "/media/a/../b");
+        assert_ne!(record.path, "/media/b");
+    }
 }
 
 #[tokio::test]
