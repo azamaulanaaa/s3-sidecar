@@ -22,3 +22,4 @@ pub mod metrics;
 pub mod observability;
 pub mod server;
 pub mod storage;
+pub mod telemetry;
