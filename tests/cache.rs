@@ -588,7 +588,6 @@ fn config(
             force_path_style: true,
             bucket: "cachebucket".to_owned(),
             prefix: "cache".to_owned(),
-            node_id: "node-a".to_owned(),
             mode: cache_mode,
             max_bytes: Some(max_bytes),
             max_object_bytes: 1_048_576,
@@ -776,7 +775,7 @@ async fn repeat_get_is_served_from_cache() {
     .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
     assert_eq!(body_text(first).await, "hello");
-    let blob = blob_key("cache", "node-a", "media", "item");
+    let blob = blob_key("cache", "media", "item");
     wait_for(Duration::from_secs(2), || {
         let cache = cache.clone();
         let blob = blob.clone();
@@ -894,8 +893,8 @@ async fn crash_after_ack_resumes_on_restart() {
     let (origin_url, origin) = spawn_origin().await;
     let (cache_url, cache) = spawn_cache().await;
     let body = b"recovered body";
-    let blob = blob_key("cache", "node-a", "media", "recovered");
-    let journal = journal_key("cache", "node-a", "crash-id");
+    let blob = blob_key("cache", "media", "recovered");
+    let journal = journal_key("cache", "crash-id");
     let now = unix_now();
     let meta = CacheMetadata {
         version: 1,
@@ -1034,7 +1033,7 @@ async fn permanent_origin_error_quarantines() {
     .await
     .unwrap();
     assert_eq!(put.status(), StatusCode::OK);
-    let blob = blob_key("cache", "node-a", "media", "quarantine");
+    let blob = blob_key("cache", "media", "quarantine");
     wait_for(Duration::from_secs(3), || {
         let telemetry = telemetry.clone();
         async move { support::counter(&telemetry.collect(), "s3_sidecar.cache.quarantine") >= 1 }
@@ -1217,8 +1216,8 @@ async fn unlimited_cache_never_evicts() {
         .unwrap();
         assert_eq!(get.status(), StatusCode::OK);
     }
-    let blob_one = blob_key("cache", "node-a", "media", "one");
-    let blob_two = blob_key("cache", "node-a", "media", "two");
+    let blob_one = blob_key("cache", "media", "one");
+    let blob_two = blob_key("cache", "media", "two");
     wait_for(Duration::from_secs(2), || {
         let cache = cache.clone();
         let one = blob_one.clone();
@@ -1356,7 +1355,7 @@ async fn write_through_tees_to_cache_without_origin_get() {
     .unwrap();
     assert_eq!(put.status(), StatusCode::OK);
     assert_eq!(origin.body("media/through").unwrap(), b"through body");
-    let blob = blob_key("cache", "node-a", "media", "through");
+    let blob = blob_key("cache", "media", "through");
     wait_for(Duration::from_secs(2), || {
         let cache = cache.clone();
         let blob = blob.clone();
@@ -1405,7 +1404,7 @@ async fn write_through_cache_failure_still_writes_origin() {
     .unwrap();
     assert_eq!(put.status(), StatusCode::OK);
     assert_eq!(origin.body("media/cache-down").unwrap(), b"origin body");
-    let blob = blob_key("cache", "node-a", "media", "cache-down");
+    let blob = blob_key("cache", "media", "cache-down");
     assert!(!cache.has(&blob));
 }
 
@@ -1437,7 +1436,7 @@ async fn write_through_origin_failure_discards_cache() {
     .await
     .unwrap();
     assert!(!put.status().is_success());
-    let blob = blob_key("cache", "node-a", "media", "origin-down");
+    let blob = blob_key("cache", "media", "origin-down");
     wait_for(Duration::from_secs(2), || {
         let cache = cache.clone();
         let blob = blob.clone();
@@ -1622,7 +1621,7 @@ async fn write_through_preserves_object_headers() {
     .await
     .unwrap();
     assert_eq!(put.status(), StatusCode::OK);
-    let blob = blob_key("cache", "node-a", "media", "hdr-through");
+    let blob = blob_key("cache", "media", "hdr-through");
     wait_for(Duration::from_secs(3), || {
         let cache = cache.clone();
         let blob = blob.clone();
@@ -1782,7 +1781,7 @@ async fn cached_get_honors_if_none_match() {
     .await
     .unwrap();
     assert_eq!(body_text(first).await, "hello");
-    let blob = blob_key("cache", "node-a", "media", "cond-get");
+    let blob = blob_key("cache", "media", "cond-get");
     wait_for(Duration::from_secs(2), || {
         let cache = cache.clone();
         let blob = blob.clone();
@@ -1861,7 +1860,7 @@ async fn cached_head_honors_if_none_match() {
     .await
     .unwrap();
     assert_eq!(body_text(first).await, "hello");
-    let blob = blob_key("cache", "node-a", "media", "cond-head");
+    let blob = blob_key("cache", "media", "cond-head");
     wait_for(Duration::from_secs(2), || {
         let cache = cache.clone();
         let blob = blob.clone();

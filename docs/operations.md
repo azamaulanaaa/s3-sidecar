@@ -27,13 +27,12 @@ client -> sidecar -> cache S3
 - Set `cache.mode = "read"` for a pure read cache.
 - Set `cache.mode = "write"` for a write buffer.
 - Set `cache.mode = "read_write"` for both.
-- Set `cache.mode = "off"` for a pure proxy.
 - Cache `write` and `read_write` reject SSE-C with `501 NotImplemented`.
-- Cache `read` forwards SSE-C to origin and keeps the cache out of the path.
-- Pure proxy mode is the supported mode for SSE-C.
+- Cache `read` is the supported mode for SSE-C. It forwards SSE-C to origin
+  and keeps the cache out of the path.
 - The cache needs its own bucket. Set `cache.bucket`.
 - The journal is under the cache bucket. All sidecars that share a cache bucket
-  must use a different `cache.node_id`.
+  must use a different `cache.prefix`.
 
 ### Single-node cluster
 
@@ -416,7 +415,7 @@ writes that the sidecar starts.
 
 | Setting | Default | Effect |
 |---|---|---|
-| `cache.max_bytes` | required when cache mode is not `off` | Cache byte limit. `0` means unlimited. A finite value enables the LRU index and eviction. |
+| `cache.max_bytes` | required in cache mode | Cache byte limit. `0` means unlimited. A finite value enables the LRU index and eviction. |
 | `cache.max_object_bytes` | 1 GiB | Bodies larger than this value do not enter the cache. Range reads are not cached. |
 | `cache.high_watermark` | 0.9 | Eviction starts above this fraction of `max_bytes`. |
 | `cache.low_watermark` | 0.8 | Eviction stops at or below this fraction. |
@@ -501,13 +500,12 @@ token, and bucket allow-list.
 
 - Cache `write` and `read_write` return `501 NotImplemented` for SSE-C.
 - Cache `read` forwards SSE-C to origin and bypasses the cache.
-- Cache `off` and pure proxy mode forward SSE-C unchanged.
 - Cluster mode returns `501 NotImplemented` for SSE-C and SSE-S3 or SSE-KMS
   headers on `PutObject`, `CopyObject`, `CreateMultipartUpload`, `UploadPart`,
   and `CompleteMultipartUpload`.
 - Cluster mode needs default encryption on the backing bucket.
-- A client that needs client-supplied encryption keys must use pure proxy mode
-  or cache mode `read`.
+- A client that needs client-supplied encryption keys must use cache mode
+  `read`.
 
 Do not add an encryption header to a cache write. The sidecar cannot store the
 customer key safely.
@@ -668,8 +666,8 @@ S3 client was available.
   return `206 PartialContent` when the validator does not match.
 - The cache header allowlist is fixed. The cache does not preserve object tags,
   object lock headers, website redirect headers, or encryption headers.
-- SSE-C works only in pure proxy mode, or in cache mode `read` where the cache
-  is bypassed. Cache write modes return `501 NotImplemented`.
+- SSE-C works only in cache mode `read` where the cache is bypassed. Cache
+  write modes return `501 NotImplemented`.
 - Cluster mode requires default encryption on the backing bucket. Client
   encryption headers are not supported.
 - Cluster mode rejects encryption headers on `PutObject`, `CopyObject`,

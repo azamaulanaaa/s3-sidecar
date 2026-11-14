@@ -128,13 +128,10 @@ pub struct ConfigFlags {
     /// Cache S3 bucket. All cache objects and journal entries live here.
     #[arg(long = "cache-bucket", value_name = "BUCKET")]
     pub cache_bucket: Option<String>,
-    /// Cache key prefix for this node.
+    /// Cache key prefix.
     #[arg(long = "cache-prefix", value_name = "PREFIX")]
     pub cache_prefix: Option<String>,
-    /// Cache node name. It is part of the cache key and journal path.
-    #[arg(long = "cache-node-id", value_name = "ID")]
-    pub cache_node_id: Option<String>,
-    /// Cache mode: `off`, `read`, `write`, or `read_write`.
+    /// Cache mode: `read`, `write`, or `read_write`.
     #[arg(long = "cache-mode", value_name = "MODE")]
     pub cache_mode: Option<String>,
     /// Maximum cache size in bytes. 0 means unlimited.
@@ -516,13 +513,6 @@ impl ConfigFlags {
             set(
                 &mut object,
                 &["cache", "bucket"],
-                Value::String(value.clone()),
-            );
-        }
-        if let Some(value) = &self.cache_node_id {
-            set(
-                &mut object,
-                &["cache", "node_id"],
                 Value::String(value.clone()),
             );
         }

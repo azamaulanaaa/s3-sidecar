@@ -15,7 +15,7 @@ use s3_sidecar::auth::{
     format_amz_date, format_scope_date, hmac_sha256, now, sha256_hex, signing_key,
 };
 use s3_sidecar::config::secret::SecretString;
-use s3_sidecar::config::{CacheMode, ClientConfig, Config, EndpointConfig, Mode};
+use s3_sidecar::config::{CacheMode, ClientConfig, Config, EndpointConfig, Mode, OnCacheError};
 use s3_sidecar::server::{AppState, router};
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -165,7 +165,11 @@ fn config(origin: String) -> Config {
     Config {
         mode: Mode::Cache,
         cache: s3_sidecar::config::CacheConfig {
-            mode: CacheMode::Off,
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            bucket: "cachebucket".to_owned(),
+            mode: CacheMode::Write,
+            max_bytes: Some(0),
+            on_cache_error: OnCacheError::Origin,
             ..s3_sidecar::config::CacheConfig::default()
         },
         origin: EndpointConfig {

@@ -95,7 +95,10 @@ fn config(origin: String, record_object_keys: bool) -> Config {
     Config {
         mode: Mode::Cache,
         cache: CacheConfig {
-            mode: CacheMode::Off,
+            endpoint: "http://127.0.0.1:1".to_owned(),
+            bucket: "cachebucket".to_owned(),
+            mode: CacheMode::Write,
+            max_bytes: Some(0),
             ..CacheConfig::default()
         },
         origin: EndpointConfig {
@@ -212,6 +215,16 @@ fn attribute(span: &SpanData, key: &str) -> Option<String> {
     })
 }
 
+fn request_upstream_span(spans: &[SpanData]) -> &SpanData {
+    spans
+        .iter()
+        .find(|span| {
+            span.name == "s3.upstream"
+                && attribute(span, "url.path").is_some_and(|path| path.starts_with("/media/"))
+        })
+        .expect("the upstream span is missing")
+}
+
 fn set_propagator() {
     opentelemetry::global::set_text_map_propagator(
         opentelemetry_sdk::propagation::TraceContextPropagator::new(),
@@ -245,10 +258,7 @@ async fn signed_get_creates_server_and_upstream_spans() {
         .iter()
         .find(|span| span.name == "s3.request")
         .expect("the server span is missing");
-    let upstream = spans
-        .iter()
-        .find(|span| span.name == "s3.upstream")
-        .expect("the upstream span is missing");
+    let upstream = request_upstream_span(&spans);
     assert_eq!(
         attribute(server, "http.response.status_code").as_deref(),
         Some("200")
@@ -411,10 +421,7 @@ async fn object_keys_are_omitted_by_default() {
         .iter()
         .find(|span| span.name == "s3.request")
         .expect("the server span is missing");
-    let upstream = spans
-        .iter()
-        .find(|span| span.name == "s3.upstream")
-        .expect("the upstream span is missing");
+    let upstream = request_upstream_span(&spans);
     assert!(attribute(server, "s3.object.key").is_none());
     assert_eq!(
         attribute(server, "url.path").as_deref(),
@@ -510,10 +517,7 @@ async fn object_keys_are_recorded_when_enabled() {
         .iter()
         .find(|span| span.name == "s3.request")
         .expect("the server span is missing");
-    let upstream = spans
-        .iter()
-        .find(|span| span.name == "s3.upstream")
-        .expect("the upstream span is missing");
+    let upstream = request_upstream_span(&spans);
     assert_eq!(
         attribute(server, "s3.object.key").as_deref(),
         Some("private-key")

@@ -109,7 +109,7 @@ impl AppState {
         }
         metrics.set_cache_limit(
             config.cache.max_bytes.unwrap_or(0),
-            config.cache.max_bytes == Some(0) || config.cache.mode == CacheMode::Off,
+            config.cache.max_bytes == Some(0) || config.mode == Mode::Cluster,
         );
         let cache = Cache::new(Arc::clone(&config), Arc::clone(&metrics))?;
         let cluster =
@@ -848,7 +848,6 @@ async fn forward(
                 }
                 return Ok(response);
             }
-            CacheMode::Off => {}
         }
     }
 

@@ -21,6 +21,7 @@ PROXY_PORT=19002
 ORIGIN="http://127.0.0.1:${ORIGIN_PORT}"
 PROXY="http://127.0.0.1:${PROXY_PORT}"
 BUCKET=media
+CACHE_BUCKET="${BUCKET}-cache"
 
 for tool in "$RUSTFS_BIN" "$AWS_BIN"; do
 	if ! command -v "$tool" >/dev/null 2>&1; then
@@ -81,7 +82,14 @@ access_key_id = "${ACCESS_KEY}"
 secret_access_key = "${SECRET_KEY}"
 
 [cache]
-mode = "off"
+endpoint = "${ORIGIN}"
+region = "us-east-1"
+access_key_id = "${ACCESS_KEY}"
+secret_access_key = "${SECRET_KEY}"
+bucket = "${CACHE_BUCKET}"
+prefix = "cache"
+mode = "read_write"
+max_bytes = 0
 
 [[clients]]
 access_key_id = "${ACCESS_KEY}"
@@ -113,6 +121,7 @@ fi
 
 printf '==> direct bucket setup\n'
 "$AWS_BIN" s3 mb "s3://${BUCKET}" --endpoint-url "$ORIGIN"
+"$AWS_BIN" s3 mb "s3://${CACHE_BUCKET}" --endpoint-url "$ORIGIN"
 "$AWS_BIN" s3 cp "$TMP/work/seed.txt" "s3://${BUCKET}/seed.txt" --endpoint-url "$ORIGIN" --only-show-errors
 
 printf '==> aws s3 cp and ls\n'

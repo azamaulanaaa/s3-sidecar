@@ -49,21 +49,18 @@ impl fmt::Display for Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {
-    /// Do not cache. All requests go to origin.
-    #[default]
-    Off,
     /// Cache reads only.
     Read,
     /// Buffer writes only.
     Write,
     /// Cache reads and buffer writes.
+    #[default]
     ReadWrite,
 }
 
 impl fmt::Display for CacheMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Off => f.write_str("off"),
             Self::Read => f.write_str("read"),
             Self::Write => f.write_str("write"),
             Self::ReadWrite => f.write_str("read_write"),
@@ -444,10 +441,8 @@ pub struct CacheConfig {
     pub force_path_style: bool,
     /// Cache S3 bucket. All blobs, metadata, and journal entries live here.
     pub bucket: String,
-    /// Key prefix for this node.
+    /// Cache namespace. It is part of the cache key and journal path.
     pub prefix: String,
-    /// Name of this sidecar node. It is part of the cache key and journal path.
-    pub node_id: String,
     /// Cache behavior.
     pub mode: CacheMode,
     /// Maximum cache size in bytes. `0` means unlimited.
@@ -494,8 +489,7 @@ impl Default for CacheConfig {
             force_path_style: false,
             bucket: String::new(),
             prefix: "cache".to_owned(),
-            node_id: "node".to_owned(),
-            mode: CacheMode::Off,
+            mode: CacheMode::ReadWrite,
             max_bytes: None,
             max_object_bytes: 1_073_741_824,
             write_policy: WritePolicy::default(),
@@ -999,19 +993,18 @@ fn validate_multipart(config: &Config) -> Result<(), ConfigError> {
 }
 
 fn validate_cache(config: &Config, warnings: &mut Vec<String>) -> Result<(), ConfigError> {
+    if config.mode == Mode::Cluster {
+        return Ok(());
+    }
     if config.cache.max_object_bytes == 0 {
         return Err(ConfigError::invalid(
             "cache.max_object_bytes must be greater than 0",
         ));
     }
-    if config.cache.mode != CacheMode::Off && config.cache.max_bytes.is_none() {
-        return Err(ConfigError::invalid(
-            "cache.max_bytes is required when cache.mode is not \"off\". \
-             Set cache.max_bytes to a byte count, or 0 for unlimited.",
-        ));
-    }
     let Some(max_bytes) = config.cache.max_bytes else {
-        return Ok(());
+        return Err(ConfigError::invalid(
+            "cache.max_bytes is required. Set cache.max_bytes to a byte count, or 0 for unlimited.",
+        ));
     };
     if max_bytes > 0 {
         if !(0.0..=1.0).contains(&config.cache.high_watermark) {
@@ -1037,52 +1030,42 @@ fn validate_cache(config: &Config, warnings: &mut Vec<String>) -> Result<(), Con
                 .to_owned(),
         );
     }
-    if config.cache.mode != CacheMode::Off && config.cache.endpoint.trim().is_empty() {
+    if config.cache.endpoint.trim().is_empty() {
+        return Err(ConfigError::invalid("cache.endpoint is required"));
+    }
+    if config.cache.bucket.trim().is_empty() {
+        return Err(ConfigError::invalid("cache.bucket is required"));
+    }
+    if config.cache.prefix.trim().is_empty() {
+        return Err(ConfigError::invalid("cache.prefix must not be empty"));
+    }
+    if config.cache.sync_workers == 0 {
         return Err(ConfigError::invalid(
-            "cache.endpoint is required when cache.mode is not \"off\"",
+            "cache.sync_workers must be greater than 0",
         ));
     }
-    if config.cache.mode != CacheMode::Off {
-        if config.cache.bucket.trim().is_empty() {
-            return Err(ConfigError::invalid(
-                "cache.bucket is required when cache.mode is not \"off\"",
-            ));
-        }
-        if config.cache.node_id.trim().is_empty() {
-            return Err(ConfigError::invalid(
-                "cache.node_id must not be empty when cache.mode is not \"off\"",
-            ));
-        }
-        if config.cache.sync_workers == 0 {
-            return Err(ConfigError::invalid(
-                "cache.sync_workers must be greater than 0",
-            ));
-        }
-        if config.cache.sync_max_attempts == 0 {
-            return Err(ConfigError::invalid(
-                "cache.sync_max_attempts must be greater than 0",
-            ));
-        }
-        if config.cache.staging_ttl.as_duration() == Duration::ZERO {
-            return Err(ConfigError::invalid(
-                "cache.staging_ttl must be greater than 0",
-            ));
-        }
-        if config.cache.orphan_ttl.as_duration() == Duration::ZERO {
-            return Err(ConfigError::invalid(
-                "cache.orphan_ttl must be greater than 0",
-            ));
-        }
-        if config.cache.gc_interval.as_duration() == Duration::ZERO {
-            return Err(ConfigError::invalid(
-                "cache.gc_interval must be greater than 0",
-            ));
-        }
-        if config.cache.index_path.trim().is_empty() {
-            return Err(ConfigError::invalid(
-                "cache.index_path must not be empty when cache.mode is not \"off\"",
-            ));
-        }
+    if config.cache.sync_max_attempts == 0 {
+        return Err(ConfigError::invalid(
+            "cache.sync_max_attempts must be greater than 0",
+        ));
+    }
+    if config.cache.staging_ttl.as_duration() == Duration::ZERO {
+        return Err(ConfigError::invalid(
+            "cache.staging_ttl must be greater than 0",
+        ));
+    }
+    if config.cache.orphan_ttl.as_duration() == Duration::ZERO {
+        return Err(ConfigError::invalid(
+            "cache.orphan_ttl must be greater than 0",
+        ));
+    }
+    if config.cache.gc_interval.as_duration() == Duration::ZERO {
+        return Err(ConfigError::invalid(
+            "cache.gc_interval must be greater than 0",
+        ));
+    }
+    if config.cache.index_path.trim().is_empty() {
+        return Err(ConfigError::invalid("cache.index_path must not be empty"));
     }
     Ok(())
 }
@@ -1109,11 +1092,6 @@ fn validate_endpoints(config: &Config) -> Result<(), ConfigError> {
 fn validate_cluster(config: &Config) -> Result<(), ConfigError> {
     if config.mode != Mode::Cluster {
         return Ok(());
-    }
-    if config.cache.mode != CacheMode::Off {
-        return Err(ConfigError::invalid(
-            "cache.mode must be \"off\" when mode is \"cluster\"",
-        ));
     }
     match config.consensus.backend {
         ConsensusBackend::Single => {
@@ -1489,14 +1467,34 @@ mod tests {
     use super::*;
 
     fn base() -> Config {
-        Config::default()
+        let mut config = Config::default();
+        config.cache.endpoint = "http://127.0.0.1:9002".to_owned();
+        config.cache.bucket = "cache".to_owned();
+        config.cache.max_bytes = Some(0);
+        config
+    }
+
+    #[test]
+    fn cache_mode_defaults_to_read_write() {
+        assert_eq!(CacheMode::default(), CacheMode::ReadWrite);
+    }
+
+    #[test]
+    fn cache_off_mode_fails_to_deserialize() {
+        assert!(serde_json::from_str::<CacheConfig>(r#"{"mode":"off"}"#).is_err());
+    }
+
+    #[test]
+    fn cache_node_id_fails_to_deserialize() {
+        let error = serde_json::from_str::<CacheConfig>(r#"{"node_id":"node-a"}"#).unwrap_err();
+        assert!(error.to_string().contains("unknown field"));
     }
 
     #[test]
     fn cache_mode_requires_max_bytes() {
         let mut config = base();
         config.cache.mode = CacheMode::Read;
-        config.cache.endpoint = "http://127.0.0.1:9002".to_owned();
+        config.cache.max_bytes = None;
         let error = validate(&config).unwrap_err();
         assert!(error.to_string().contains("cache.max_bytes is required"));
     }
@@ -1505,8 +1503,6 @@ mod tests {
     fn unlimited_cache_accepts_zero() {
         let mut config = base();
         config.cache.mode = CacheMode::Read;
-        config.cache.endpoint = "http://127.0.0.1:9002".to_owned();
-        config.cache.bucket = "cache".to_owned();
         config.cache.max_bytes = Some(0);
         assert!(validate(&config).is_ok());
     }
@@ -1515,10 +1511,25 @@ mod tests {
     fn cache_mode_requires_a_cache_bucket() {
         let mut config = base();
         config.cache.mode = CacheMode::Read;
-        config.cache.endpoint = "http://127.0.0.1:9002".to_owned();
-        config.cache.max_bytes = Some(0);
+        config.cache.bucket.clear();
         let error = validate(&config).unwrap_err();
         assert!(error.to_string().contains("cache.bucket is required"));
+    }
+
+    #[test]
+    fn cache_mode_requires_an_endpoint() {
+        let mut config = base();
+        config.cache.endpoint.clear();
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("cache.endpoint is required"));
+    }
+
+    #[test]
+    fn cache_mode_rejects_an_empty_prefix() {
+        let mut config = base();
+        config.cache.prefix.clear();
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("cache.prefix"));
     }
 
     #[test]
@@ -1751,14 +1762,20 @@ mod tests {
     }
 
     #[test]
-    fn cluster_mode_rejects_a_cache_mode() {
+    fn cluster_mode_accepts_a_cache_config() {
         let mut config = cluster_base();
         config.cache.mode = CacheMode::Write;
         config.cache.endpoint = "http://127.0.0.1:9003".to_owned();
         config.cache.bucket = "cache".to_owned();
         config.cache.max_bytes = Some(0);
-        let error = validate(&config).unwrap_err();
-        assert!(error.to_string().contains("cache.mode"));
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn cluster_mode_accepts_default_cache_settings() {
+        let mut config = cluster_base();
+        config.cache = CacheConfig::default();
+        assert!(validate(&config).is_ok());
     }
 
     #[test]

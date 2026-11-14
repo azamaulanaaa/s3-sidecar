@@ -247,13 +247,12 @@ entry.
 **Action**
 
 1. In cache `write` or `read_write`, remove the SSE-C headers.
-2. Use `cache.mode = "read"` or `cache.mode = "off"` for SSE-C.
+2. Use `cache.mode = "read"` for SSE-C.
 3. In cluster mode, remove the encryption headers from the write and copy
    requests.
 4. In cluster mode, remove the encryption headers from `UploadPart` and
    `CompleteMultipartUpload`.
 5. In cluster mode, enable default encryption on the backing bucket.
-6. Use pure proxy mode when the client must supply an encryption key.
 
 ## `403 InvalidToken`
 
