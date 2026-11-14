@@ -26,7 +26,10 @@ retry_attempts = 2              # Retries after the first attempt.
 
 [multipart]
 # Settings for sidecar-owned object writes to origin, cache, backing, and peers.
-# Client-driven multipart requests pass through unchanged.
+# The sidecar also uses these settings for client-driven multipart uploads.
+# In cache mode, a read or write-through upload completes at origin, then the
+# sidecar fills the cache. A write-back upload completes in the cache, then the
+# sidecar syncs it to origin.
 enabled = true
 threshold = "64MiB"      # Objects below this size use one PUT.
 chunk_size = "16MiB"     # Target size of one part.

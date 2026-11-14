@@ -407,10 +407,28 @@ Every failed multipart write aborts the upload before it returns the error. A
 failed abort logs a warning. The original error is the error that the caller
 sees.
 
-Client-driven multipart requests are not affected. A client that sends
-`CreateMultipartUpload`, `UploadPart`, and `CompleteMultipartUpload` still
-reaches the upstream server as before. The `[multipart]` values apply only to
-writes that the sidecar starts.
+Client-driven multipart requests use the cache. The behavior depends on the
+cache mode and the write policy:
+
+- In `read` mode, the upload completes at origin. The sidecar then reads the
+  completed object from origin and stores it in the cache.
+- With `write_policy = "write_back"`, the upload completes in the cache. The
+  sidecar writes the journal entry and syncs the object to origin in the
+  background.
+- With `write_policy = "write_through"`, the upload completes at origin. The
+  sidecar then reads the completed object from origin and stores it in the
+  cache.
+- If a create request fails and `on_cache_error = "origin"`, the sidecar sends
+  the upload to origin.
+- If `on_cache_error = "fail"`, the sidecar returns the cache error.
+
+The sidecar keeps the write-back upload state in memory. A restart loses this
+state. A client must start the upload again after a restart. An object that is
+larger than `cache.max_object_bytes` skips the cache fill. The sidecar does not
+list an in-flight write-back upload in `ListMultipartUploads`.
+
+The `[multipart]` values apply to writes that the sidecar starts and to the
+origin sync of a write-back upload.
 
 ## Sizing
 
