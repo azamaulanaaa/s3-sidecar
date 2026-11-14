@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, HttpBody as _};
 use axum::extract::{DefaultBodyLimit, OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
@@ -714,7 +714,8 @@ async fn limited_forward(
     let permit = Arc::clone(&state.slots)
         .try_acquire_owned()
         .map_err(|_| S3Error::slow_down())?;
-    let streaming = is_streaming_request(&method, &headers, &uri);
+    let has_body = !body.is_end_stream();
+    let streaming = is_streaming_request(&method, &headers, &uri, has_body);
     let future = forward(&state, &method, &uri, &headers, body);
     let response = if streaming {
         future.await?
@@ -740,15 +741,16 @@ fn hold_permit(response: Response, permit: OwnedSemaphorePermit) -> Response {
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
-fn is_streaming_request(method: &Method, headers: &HeaderMap, uri: &Uri) -> bool {
+fn is_streaming_request(method: &Method, headers: &HeaderMap, uri: &Uri, has_body: bool) -> bool {
     if matches!(*method, Method::GET | Method::HEAD) {
-        return !object_key(uri.path()).is_empty();
+        return !object_key(uri.path()).is_empty() || has_body;
     }
     content_length(headers)
         .ok()
         .flatten()
         .is_some_and(|length| length > 0)
         || headers.contains_key(header::TRANSFER_ENCODING)
+        || has_body
 }
 
 fn idle_stream<S, E>(stream: S, idle: Duration) -> BodyStream
@@ -800,7 +802,15 @@ async fn forward(
     let key = object_key(uri.path());
     warn_checksum_dropped(headers, &payload, &bucket, &key);
     let max_body_bytes = state.config.server.max_body_bytes;
-    let prepared = prepare_request(body, headers, payload, max_body_bytes, state.idle_timeout())?;
+    let has_body = !body.is_end_stream();
+    let prepared = prepare_request(
+        body,
+        headers,
+        payload,
+        has_body,
+        max_body_bytes,
+        state.idle_timeout(),
+    )?;
     let path_and_query = upstream_path_and_query(uri, is_presigned(uri));
     let query = uri.query().unwrap_or_default();
     let multipart =
@@ -1957,6 +1967,7 @@ fn prepare_request(
     body: Body,
     headers: &HeaderMap,
     payload: PayloadKind,
+    has_body: bool,
     max_body_bytes: u64,
     idle: Duration,
 ) -> Result<PreparedRequest, S3Error> {
@@ -1965,8 +1976,6 @@ fn prepare_request(
 
     match payload {
         PayloadKind::Unsigned => {
-            let has_body = original_length.is_some_and(|length| length > 0)
-                || headers.contains_key(header::TRANSFER_ENCODING);
             if !has_body {
                 return Ok(PreparedRequest {
                     headers: output_headers,
@@ -1988,7 +1997,7 @@ fn prepare_request(
             })
         }
         PayloadKind::Hash(expected) => {
-            if is_empty_hash(&expected) && original_length.unwrap_or(0) == 0 {
+            if is_empty_hash(&expected) && original_length.unwrap_or(0) == 0 && !has_body {
                 return Ok(PreparedRequest {
                     headers: output_headers,
                     body: None,
@@ -2478,4 +2487,51 @@ pub fn log_config(config: &Config, path: Option<&std::path::Path>) {
         config_file = %path.map_or_else(|| "none".to_owned(), |value| value.display().to_string()),
         "configuration loaded"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    async fn prepared_body_bytes(prepared: PreparedRequest) -> Option<Bytes> {
+        let mut stream = prepared.body?;
+        let mut output = BytesMut::new();
+        while let Some(chunk) = stream.next().await {
+            output.extend_from_slice(&chunk.unwrap());
+        }
+        Some(output.freeze())
+    }
+
+    #[tokio::test]
+    async fn prepare_request_keeps_a_body_that_has_no_length_header() {
+        let prepared = prepare_request(
+            Body::from("payload"),
+            &HeaderMap::new(),
+            PayloadKind::Unsigned,
+            true,
+            1024,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let body = prepared_body_bytes(prepared).await.unwrap();
+        assert_eq!(&body[..], b"payload");
+    }
+
+    #[tokio::test]
+    async fn prepare_request_drops_the_body_of_a_bodyless_get() {
+        let prepared = prepare_request(
+            Body::empty(),
+            &HeaderMap::new(),
+            PayloadKind::Unsigned,
+            false,
+            1024,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert!(prepared.body.is_none());
+    }
 }
