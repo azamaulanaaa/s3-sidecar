@@ -1111,6 +1111,117 @@ async fn multipart_upload_preserves_object_headers() {
 }
 
 #[tokio::test]
+async fn upload_part_rejects_an_sse_c_header() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let create_url = format!("{}/media/part-sse-c?uploads", sidecar.url);
+    let response = signed_request(&client, Method::POST, &create_url, Some(Vec::new()), &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let upload_id = extract(&body_text(response).await, "UploadId");
+
+    let part_url = format!(
+        "{}/media/part-sse-c?partNumber=1&uploadId={upload_id}",
+        sidecar.url
+    );
+    let response = put(
+        &client,
+        &part_url,
+        b"part-body",
+        &[("x-amz-server-side-encryption-customer-algorithm", "AES256")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(body_text(response).await.contains("NotImplemented"));
+}
+
+#[tokio::test]
+async fn complete_multipart_rejects_an_sse_c_header() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let create_url = format!("{}/media/complete-sse-c?uploads", sidecar.url);
+    let response = signed_request(&client, Method::POST, &create_url, Some(Vec::new()), &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let upload_id = extract(&body_text(response).await, "UploadId");
+
+    let complete_url = format!("{}/media/complete-sse-c?uploadId={upload_id}", sidecar.url);
+    let response = signed_request(
+        &client,
+        Method::POST,
+        &complete_url,
+        Some(b"<CompleteMultipartUpload></CompleteMultipartUpload>".to_vec()),
+        &[("x-amz-server-side-encryption-customer-algorithm", "AES256")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(body_text(response).await.contains("NotImplemented"));
+}
+
+#[tokio::test]
+async fn upload_part_rejects_a_managed_encryption_header() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let create_url = format!("{}/media/part-sse?uploads", sidecar.url);
+    let response = signed_request(&client, Method::POST, &create_url, Some(Vec::new()), &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let upload_id = extract(&body_text(response).await, "UploadId");
+
+    let part_url = format!(
+        "{}/media/part-sse?partNumber=1&uploadId={upload_id}",
+        sidecar.url
+    );
+    let response = put(
+        &client,
+        &part_url,
+        b"part-body",
+        &[("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(body_text(response).await.contains("NotImplemented"));
+}
+
+#[tokio::test]
 async fn encryption_headers_return_not_implemented() {
     let (backing, handle) = spawn_backing().await;
     let dir = tempfile::tempdir().unwrap();
