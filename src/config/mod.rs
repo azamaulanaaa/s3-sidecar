@@ -169,7 +169,7 @@ impl fmt::Display for ReadMode {
     }
 }
 
-/// OTLP transport protocol for metrics export.
+/// OTLP transport protocol for signal export.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum OtelProtocol {
     /// gRPC over HTTP/2.
@@ -201,19 +201,35 @@ impl OtelProtocol {
     }
 }
 
-/// OpenTelemetry metrics export settings.
+/// OpenTelemetry export settings for metrics, traces, and logs.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct OtelConfig {
-    /// Export metrics over OTLP. The default is off.
+    /// Master switch for all OpenTelemetry export. The default is off.
     pub enabled: bool,
+    /// Export metrics over OTLP. The default is on.
+    pub metrics: bool,
+    /// Export traces over OTLP. The default is off.
+    pub traces: bool,
+    /// Export logs over OTLP. The default is off.
+    pub logs: bool,
     /// Name of this service. An empty value uses `OTEL_SERVICE_NAME`, then
     /// `s3-sidecar`.
     pub service_name: Option<String>,
     /// Version of this service.
     pub service_version: String,
-    /// OTLP collector URL. An empty value uses `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    /// OTLP collector URL for all signals. An empty value uses
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT`.
     pub endpoint: Option<String>,
+    /// OTLP collector URL for traces. An empty value uses `endpoint`, then
+    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`.
+    pub trace_endpoint: Option<String>,
+    /// OTLP collector URL for logs. An empty value uses `endpoint`, then
+    /// `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`.
+    pub logs_endpoint: Option<String>,
+    /// Fraction of root traces to sample. The value is in `0.0..=1.0`.
+    pub trace_sample_ratio: f64,
     /// OTLP transport. An empty value uses `OTEL_EXPORTER_OTLP_PROTOCOL`, then
     /// `grpc`.
     pub protocol: Option<OtelProtocol>,
@@ -224,29 +240,44 @@ pub struct OtelConfig {
     pub headers_file: Option<PathBuf>,
     /// Timeout for one OTLP export request.
     pub timeout: HumanDuration,
-    /// Interval between exports. An empty value uses
+    /// Interval between metric exports. An empty value uses
     /// `OTEL_METRIC_EXPORT_INTERVAL`, then `60s`.
     pub export_interval: Option<HumanDuration>,
+    /// Delay between trace exports.
+    pub trace_schedule_delay: HumanDuration,
+    /// Delay between log exports.
+    pub log_schedule_delay: HumanDuration,
     /// Bound for the final flush during shutdown.
     pub export_timeout: HumanDuration,
     /// Extra resource attributes. Each value is sent as a string.
     pub resource_attributes: BTreeMap<String, String>,
+    /// Add the `s3.object.key` span attribute. The default is off.
+    pub record_object_keys: bool,
 }
 
 impl Default for OtelConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            metrics: true,
+            traces: false,
+            logs: false,
             service_name: None,
             service_version: "0.1.0".to_owned(),
             endpoint: None,
+            trace_endpoint: None,
+            logs_endpoint: None,
+            trace_sample_ratio: 1.0,
             protocol: None,
             headers: BTreeMap::new(),
             headers_file: None,
             timeout: HumanDuration::new(Duration::from_secs(10)),
             export_interval: None,
+            trace_schedule_delay: HumanDuration::new(Duration::from_secs(5)),
+            log_schedule_delay: HumanDuration::new(Duration::from_secs(5)),
             export_timeout: HumanDuration::new(Duration::from_secs(10)),
             resource_attributes: BTreeMap::new(),
+            record_object_keys: false,
         }
     }
 }
@@ -672,7 +703,7 @@ pub struct Config {
     pub consensus: ConsensusConfig,
     /// Cluster garbage collection and metadata settings.
     pub cluster: ClusterConfig,
-    /// OpenTelemetry metrics export settings.
+    /// OpenTelemetry export settings for metrics, traces, and logs.
     pub otel: OtelConfig,
     /// Client credentials.
     pub clients: Vec<ClientConfig>,
@@ -781,16 +812,24 @@ pub fn validate(config: &Config) -> Result<Vec<String>, ConfigError> {
 
 fn validate_otel(config: &Config) -> Result<(), ConfigError> {
     let otel = &config.otel;
-    if let Some(endpoint) = &otel.endpoint
-        && !endpoint.trim().is_empty()
-        && !is_http_url(endpoint)
-    {
-        return Err(ConfigError::invalid(
-            "otel.endpoint must be an absolute http:// or https:// URL",
-        ));
+    for (name, endpoint) in [
+        ("otel.endpoint", otel.endpoint.as_deref()),
+        ("otel.trace_endpoint", otel.trace_endpoint.as_deref()),
+        ("otel.logs_endpoint", otel.logs_endpoint.as_deref()),
+    ] {
+        if let Some(endpoint) = endpoint
+            && !endpoint.trim().is_empty()
+            && !is_http_url(endpoint)
+        {
+            return Err(ConfigError::invalid(format!(
+                "{name} must be an absolute http:// or https:// URL"
+            )));
+        }
     }
     for (name, duration) in [
         ("otel.timeout", otel.timeout),
+        ("otel.trace_schedule_delay", otel.trace_schedule_delay),
+        ("otel.log_schedule_delay", otel.log_schedule_delay),
         ("otel.export_timeout", otel.export_timeout),
     ] {
         if duration.as_duration() == Duration::ZERO {
@@ -798,6 +837,11 @@ fn validate_otel(config: &Config) -> Result<(), ConfigError> {
                 "{name} must be greater than 0"
             )));
         }
+    }
+    if !(0.0..=1.0).contains(&otel.trace_sample_ratio) {
+        return Err(ConfigError::invalid(
+            "otel.trace_sample_ratio must be between 0.0 and 1.0",
+        ));
     }
     if let Some(interval) = otel.export_interval
         && interval.as_duration() == Duration::ZERO
@@ -1836,6 +1880,57 @@ mod tests {
         config.otel.export_interval = Some(HumanDuration::new(Duration::ZERO));
         let error = validate(&config).unwrap_err();
         assert!(error.to_string().contains("export_interval"));
+    }
+
+    #[test]
+    fn otel_signal_defaults_keep_metrics_on() {
+        let otel = OtelConfig::default();
+        assert!(otel.metrics);
+        assert!(!otel.traces);
+        assert!(!otel.logs);
+        assert!(!otel.record_object_keys);
+        assert!((otel.trace_sample_ratio - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn otel_trace_and_log_endpoints_must_be_absolute() {
+        let mut config = base();
+        config.otel.trace_endpoint = Some("127.0.0.1:4317".to_owned());
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("otel.trace_endpoint"));
+
+        let mut config = base();
+        config.otel.logs_endpoint = Some("127.0.0.1:4317".to_owned());
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("otel.logs_endpoint"));
+    }
+
+    #[test]
+    fn otel_schedule_delays_must_be_positive() {
+        let mut config = base();
+        config.otel.trace_schedule_delay = HumanDuration::new(Duration::ZERO);
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("trace_schedule_delay"));
+
+        let mut config = base();
+        config.otel.log_schedule_delay = HumanDuration::new(Duration::ZERO);
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("log_schedule_delay"));
+    }
+
+    #[test]
+    fn otel_sample_ratio_must_be_in_range() {
+        for ratio in [-0.1, 1.1, f64::NAN] {
+            let mut config = base();
+            config.otel.trace_sample_ratio = ratio;
+            let error = validate(&config).unwrap_err();
+            assert!(error.to_string().contains("trace_sample_ratio"));
+        }
+        for ratio in [0.0, 0.5, 1.0] {
+            let mut config = base();
+            config.otel.trace_sample_ratio = ratio;
+            assert!(validate(&config).is_ok());
+        }
     }
 
     #[test]

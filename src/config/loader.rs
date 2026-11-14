@@ -284,6 +284,7 @@ struct SecretEnv {
     path: Vec<&'static str>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
     let entry = match key {
         "MODE" => (EnvKind::Text, vec!["mode"]),
@@ -364,16 +365,25 @@ fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
         "CLUSTER__RECONCILE_INTERVAL" => (EnvKind::Text, vec!["cluster", "reconcile_interval"]),
         "CLUSTER__NODES" => (EnvKind::Json, vec!["cluster", "nodes"]),
         "OTEL__ENABLED" => (EnvKind::Bool, vec!["otel", "enabled"]),
+        "OTEL__METRICS" => (EnvKind::Bool, vec!["otel", "metrics"]),
+        "OTEL__TRACES" => (EnvKind::Bool, vec!["otel", "traces"]),
+        "OTEL__LOGS" => (EnvKind::Bool, vec!["otel", "logs"]),
         "OTEL__SERVICE_NAME" => (EnvKind::Text, vec!["otel", "service_name"]),
         "OTEL__SERVICE_VERSION" => (EnvKind::Text, vec!["otel", "service_version"]),
         "OTEL__ENDPOINT" => (EnvKind::Text, vec!["otel", "endpoint"]),
+        "OTEL__TRACE_ENDPOINT" => (EnvKind::Text, vec!["otel", "trace_endpoint"]),
+        "OTEL__LOGS_ENDPOINT" => (EnvKind::Text, vec!["otel", "logs_endpoint"]),
+        "OTEL__TRACE_SAMPLE_RATIO" => (EnvKind::Float, vec!["otel", "trace_sample_ratio"]),
         "OTEL__PROTOCOL" => (EnvKind::Text, vec!["otel", "protocol"]),
         "OTEL__HEADERS" => (EnvKind::Json, vec!["otel", "headers"]),
         "OTEL__HEADERS_FILE" => (EnvKind::Text, vec!["otel", "headers_file"]),
         "OTEL__TIMEOUT" => (EnvKind::Text, vec!["otel", "timeout"]),
         "OTEL__EXPORT_INTERVAL" => (EnvKind::Text, vec!["otel", "export_interval"]),
+        "OTEL__TRACE_SCHEDULE_DELAY" => (EnvKind::Text, vec!["otel", "trace_schedule_delay"]),
+        "OTEL__LOG_SCHEDULE_DELAY" => (EnvKind::Text, vec!["otel", "log_schedule_delay"]),
         "OTEL__EXPORT_TIMEOUT" => (EnvKind::Text, vec!["otel", "export_timeout"]),
         "OTEL__RESOURCE_ATTRIBUTES" => (EnvKind::Json, vec!["otel", "resource_attributes"]),
+        "OTEL__RECORD_OBJECT_KEYS" => (EnvKind::Bool, vec!["otel", "record_object_keys"]),
         "CLIENTS" => (EnvKind::Json, vec!["clients"]),
         "BUCKETS" => (EnvKind::Json, vec!["buckets"]),
         _ => return None,
@@ -776,6 +786,46 @@ buckets = ["media"]
                 .get("x-api-key")
                 .map(SecretString::expose_secret),
             Some("header-secret")
+        );
+    }
+
+    #[test]
+    fn otel_signal_environment_variables_are_parsed() {
+        let dir = tempdir().unwrap();
+        let env = vec![
+            ("S3_SIDECAR_OTEL__ENABLED".to_owned(), "true".to_owned()),
+            ("S3_SIDECAR_OTEL__TRACES".to_owned(), "true".to_owned()),
+            ("S3_SIDECAR_OTEL__LOGS".to_owned(), "true".to_owned()),
+            (
+                "S3_SIDECAR_OTEL__TRACE_SAMPLE_RATIO".to_owned(),
+                "0.25".to_owned(),
+            ),
+            (
+                "S3_SIDECAR_OTEL__TRACE_ENDPOINT".to_owned(),
+                "http://127.0.0.1:4317".to_owned(),
+            ),
+            (
+                "S3_SIDECAR_OTEL__LOGS_ENDPOINT".to_owned(),
+                "http://127.0.0.1:4317".to_owned(),
+            ),
+            (
+                "S3_SIDECAR_OTEL__RECORD_OBJECT_KEYS".to_owned(),
+                "true".to_owned(),
+            ),
+        ];
+        let loaded = load_with(dir.path(), None, env, json!({})).unwrap();
+        assert!(loaded.config.otel.enabled);
+        assert!(loaded.config.otel.traces);
+        assert!(loaded.config.otel.logs);
+        assert!(loaded.config.otel.record_object_keys);
+        assert!((loaded.config.otel.trace_sample_ratio - 0.25).abs() < f64::EPSILON);
+        assert_eq!(
+            loaded.config.otel.trace_endpoint.as_deref(),
+            Some("http://127.0.0.1:4317")
+        );
+        assert_eq!(
+            loaded.config.otel.logs_endpoint.as_deref(),
+            Some("http://127.0.0.1:4317")
         );
     }
 

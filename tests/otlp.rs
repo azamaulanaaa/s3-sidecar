@@ -79,6 +79,7 @@ fn otel_config(endpoint: String) -> OtelConfig {
             "deployment.environment.name".to_owned(),
             "test".to_owned(),
         )]),
+        ..OtelConfig::default()
     }
 }
 

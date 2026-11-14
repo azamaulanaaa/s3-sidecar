@@ -396,6 +396,24 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         "otel.enabled",
         config.otel.enabled.to_string(),
     );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.metrics",
+        config.otel.metrics.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.traces",
+        config.otel.traces.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.logs",
+        config.otel.logs.to_string(),
+    );
     push_optional(
         &mut rows,
         sources,
@@ -413,6 +431,24 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         sources,
         "otel.endpoint",
         config.otel.endpoint.clone().unwrap_or_default(),
+    );
+    push_optional(
+        &mut rows,
+        sources,
+        "otel.trace_endpoint",
+        config.otel.trace_endpoint.clone().unwrap_or_default(),
+    );
+    push_optional(
+        &mut rows,
+        sources,
+        "otel.logs_endpoint",
+        config.otel.logs_endpoint.clone().unwrap_or_default(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.trace_sample_ratio",
+        config.otel.trace_sample_ratio.to_string(),
     );
     push_optional(
         &mut rows,
@@ -457,6 +493,18 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
     push_row(
         &mut rows,
         sources,
+        "otel.trace_schedule_delay",
+        config.otel.trace_schedule_delay.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.log_schedule_delay",
+        config.otel.log_schedule_delay.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
         "otel.export_timeout",
         config.otel.export_timeout.to_string(),
     );
@@ -465,6 +513,12 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         sources,
         "otel.resource_attributes",
         serde_json::to_string(&config.otel.resource_attributes).unwrap_or_else(|_| "{}".to_owned()),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.record_object_keys",
+        config.otel.record_object_keys.to_string(),
     );
 
     if config.clients.is_empty() {

@@ -250,6 +250,33 @@ pub struct ConfigFlags {
     /// Export metrics over OTLP.
     #[arg(long = "otel-enabled")]
     pub otel_enabled: bool,
+    /// Export metrics over OTLP when OpenTelemetry is enabled.
+    #[arg(long = "otel-metrics")]
+    pub otel_metrics: bool,
+    /// Export traces over OTLP.
+    #[arg(long = "otel-traces")]
+    pub otel_traces: bool,
+    /// Export logs over OTLP.
+    #[arg(long = "otel-logs")]
+    pub otel_logs: bool,
+    /// Fraction of root traces to sample, from 0.0 to 1.0.
+    #[arg(long = "otel-trace-sample-ratio", value_name = "RATIO")]
+    pub otel_trace_sample_ratio: Option<f64>,
+    /// OTLP collector URL for traces.
+    #[arg(long = "otel-trace-endpoint", value_name = "URL")]
+    pub otel_trace_endpoint: Option<String>,
+    /// OTLP collector URL for logs.
+    #[arg(long = "otel-logs-endpoint", value_name = "URL")]
+    pub otel_logs_endpoint: Option<String>,
+    /// Delay between trace exports.
+    #[arg(long = "otel-trace-schedule-delay", value_name = "DURATION")]
+    pub otel_trace_schedule_delay: Option<String>,
+    /// Delay between log exports.
+    #[arg(long = "otel-log-schedule-delay", value_name = "DURATION")]
+    pub otel_log_schedule_delay: Option<String>,
+    /// Add the `s3.object.key` attribute to spans.
+    #[arg(long = "otel-record-object-keys")]
+    pub otel_record_object_keys: bool,
     /// Service name for exported telemetry.
     #[arg(long = "otel-service-name", value_name = "NAME")]
     pub otel_service_name: Option<String>,
@@ -696,6 +723,53 @@ impl ConfigFlags {
 
         if self.otel_enabled {
             set(&mut object, &["otel", "enabled"], Value::Bool(true));
+        }
+        if self.otel_metrics {
+            set(&mut object, &["otel", "metrics"], Value::Bool(true));
+        }
+        if self.otel_traces {
+            set(&mut object, &["otel", "traces"], Value::Bool(true));
+        }
+        if self.otel_logs {
+            set(&mut object, &["otel", "logs"], Value::Bool(true));
+        }
+        if let Some(value) = self.otel_trace_sample_ratio {
+            set(&mut object, &["otel", "trace_sample_ratio"], json!(value));
+        }
+        if let Some(value) = &self.otel_trace_endpoint {
+            set(
+                &mut object,
+                &["otel", "trace_endpoint"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.otel_logs_endpoint {
+            set(
+                &mut object,
+                &["otel", "logs_endpoint"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.otel_trace_schedule_delay {
+            set(
+                &mut object,
+                &["otel", "trace_schedule_delay"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.otel_log_schedule_delay {
+            set(
+                &mut object,
+                &["otel", "log_schedule_delay"],
+                Value::String(value.clone()),
+            );
+        }
+        if self.otel_record_object_keys {
+            set(
+                &mut object,
+                &["otel", "record_object_keys"],
+                Value::Bool(true),
+            );
         }
         if let Some(value) = &self.otel_service_name {
             set(
