@@ -423,9 +423,11 @@ cache mode and the write policy:
 - If `on_cache_error = "fail"`, the sidecar returns the cache error.
 
 The sidecar keeps the write-back upload state in memory. A restart loses this
-state. A client must start the upload again after a restart. An object that is
-larger than `cache.max_object_bytes` skips the cache fill. The sidecar does not
-list an in-flight write-back upload in `ListMultipartUploads`.
+state. A client must start the upload again after a restart. An abandoned
+write-back upload has no expiry until a restart. Read and write-through skip the
+cache fill when an object is larger than `cache.max_object_bytes`. Write-back
+rejects a multipart upload above this limit with `400 EntityTooLarge`. The
+sidecar does not list an in-flight write-back upload in `ListMultipartUploads`.
 
 The `[multipart]` values apply to writes that the sidecar starts and to the
 origin sync of a write-back upload.
