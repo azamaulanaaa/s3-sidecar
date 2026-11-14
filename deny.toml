@@ -82,6 +82,31 @@ name = "rand_core"
 version = "=0.6.4"
 reason = "rand 0.8 uses rand_core 0.6. rand 0.10 uses rand_core 0.10."
 
+[[bans.skip]]
+name = "getrandom"
+version = "=0.3.4"
+reason = "opentelemetry_sdk rand 0.9 uses getrandom 0.3. openraft rand 0.10 uses getrandom 0.4."
+
+[[bans.skip]]
+name = "r-efi"
+version = "=5.3.0"
+reason = "getrandom 0.3 uses r-efi 5. getrandom 0.4 uses r-efi 6."
+
+[[bans.skip]]
+name = "rand"
+version = "=0.9.5"
+reason = "opentelemetry_sdk uses rand 0.9 for metric IDs. openraft uses rand 0.10."
+
+[[bans.skip]]
+name = "rand_core"
+version = "=0.9.5"
+reason = "rand 0.9 uses rand_core 0.9. rand 0.10 uses rand_core 0.10."
+
+[[bans.skip]]
+name = "reqwest"
+version = "=0.12.28"
+reason = "the sidecar uses reqwest 0.12. opentelemetry-otlp uses reqwest 0.13 for the blocking OTLP HTTP client."
+
 [sources]
 # Fail the check for unknown registries.
 unknown-registry = "deny"

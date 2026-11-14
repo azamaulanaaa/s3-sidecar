@@ -19,6 +19,16 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex = "0.4"
 hmac = "0.12"
 md-5 = "0.10"
+opentelemetry = { version = "0.33.1", features = ["metrics"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = [
+  "grpc-tonic",
+  "http-proto",
+  "internal-logs",
+  "metrics",
+  "reqwest-blocking-client",
+] }
+opentelemetry-semantic-conventions = "0.33.1"
+opentelemetry_sdk = { version = "0.33.1", features = ["metrics", "rt-tokio"] }
 openraft = { version = "0.10.0", default-features = false, features = ["serde", "tokio-rt"] }
 percent-encoding = "2"
 redb = "4.5.0"
@@ -36,11 +46,13 @@ thiserror = "2"
 time = { version = "0.3", features = ["parsing", "formatting"] }
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
+tonic = { version = "0.14", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+opentelemetry_sdk = { version = "0.33.1", features = ["testing"] }
 tempfile = "3"
 
 [lints.clippy]
