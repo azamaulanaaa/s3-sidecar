@@ -85,6 +85,42 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         "upstream.retry_attempts",
         config.upstream.retry_attempts.to_string(),
     );
+    push_row(
+        &mut rows,
+        sources,
+        "multipart.enabled",
+        config.multipart.enabled.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "multipart.threshold",
+        config.multipart.threshold.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "multipart.chunk_size",
+        config.multipart.chunk_size.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "multipart.min_chunk_size",
+        config.multipart.min_chunk_size.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "multipart.max_parts",
+        config.multipart.max_parts.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "multipart.concurrency",
+        config.multipart.concurrency.to_string(),
+    );
 
     push_endpoint(&mut rows, sources, "origin", &config.origin);
 

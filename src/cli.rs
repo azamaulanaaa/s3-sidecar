@@ -61,6 +61,24 @@ pub struct ConfigFlags {
     /// Listen address.
     #[arg(long = "server-bind", value_name = "ADDRESS")]
     pub server_bind: Option<String>,
+    /// Use multipart for internal object writes.
+    #[arg(long = "multipart-enabled")]
+    pub multipart_enabled: bool,
+    /// Smallest object size that uses multipart, for example `64MiB`.
+    #[arg(long = "multipart-threshold", value_name = "SIZE")]
+    pub multipart_threshold: Option<String>,
+    /// Target part size, for example `16MiB`.
+    #[arg(long = "multipart-chunk-size", value_name = "SIZE")]
+    pub multipart_chunk_size: Option<String>,
+    /// Smallest allowed part size, for example `5MiB`.
+    #[arg(long = "multipart-min-chunk-size", value_name = "SIZE")]
+    pub multipart_min_chunk_size: Option<String>,
+    /// Largest number of parts in one upload.
+    #[arg(long = "multipart-max-parts", value_name = "COUNT")]
+    pub multipart_max_parts: Option<u32>,
+    /// Largest number of part uploads in flight.
+    #[arg(long = "multipart-concurrency", value_name = "COUNT")]
+    pub multipart_concurrency: Option<usize>,
     /// Origin S3 endpoint URL.
     #[arg(long = "origin-endpoint", value_name = "URL")]
     pub origin_endpoint: Option<String>,
@@ -369,6 +387,36 @@ impl ConfigFlags {
                 &["server", "bind"],
                 Value::String(value.clone()),
             );
+        }
+        if self.multipart_enabled {
+            set(&mut object, &["multipart", "enabled"], Value::Bool(true));
+        }
+        if let Some(value) = &self.multipart_threshold {
+            set(
+                &mut object,
+                &["multipart", "threshold"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.multipart_chunk_size {
+            set(
+                &mut object,
+                &["multipart", "chunk_size"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.multipart_min_chunk_size {
+            set(
+                &mut object,
+                &["multipart", "min_chunk_size"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = self.multipart_max_parts {
+            set(&mut object, &["multipart", "max_parts"], json!(value));
+        }
+        if let Some(value) = self.multipart_concurrency {
+            set(&mut object, &["multipart", "concurrency"], json!(value));
         }
 
         if let Some(value) = &self.origin_endpoint {

@@ -4,6 +4,7 @@ pub mod duration;
 pub mod loader;
 pub mod secret;
 pub mod show;
+pub mod size;
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -15,6 +16,14 @@ use serde::{Deserialize, Serialize};
 use self::duration::HumanDuration;
 use self::loader::SourceMap;
 use self::secret::SecretString;
+use self::size::Size;
+
+/// Smallest part size that S3 accepts, except for the last part.
+pub const S3_MIN_PART_BYTES: u64 = 5 * 1_024 * 1_024;
+/// Largest part size that S3 accepts.
+pub const S3_MAX_PART_BYTES: u64 = 5 * 1_024 * 1_024 * 1_024;
+/// Largest number of parts that one S3 multipart upload accepts.
+pub const S3_MAX_PARTS: u32 = 10_000;
 
 /// Run mode for the sidecar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -344,6 +353,37 @@ impl Default for UpstreamConfig {
             connect_timeout: HumanDuration::new(Duration::from_secs(10)),
             request_timeout: HumanDuration::new(Duration::from_mins(5)),
             retry_attempts: 2,
+        }
+    }
+}
+
+/// Multipart upload settings for sidecar-owned object writes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MultipartConfig {
+    /// Use multipart for internal object writes when the size permits.
+    pub enabled: bool,
+    /// Smallest object size that uses multipart. `0` always uses multipart.
+    pub threshold: Size,
+    /// Target size of one part.
+    pub chunk_size: Size,
+    /// Smallest allowed part size, except for the last part.
+    pub min_chunk_size: Size,
+    /// Largest number of parts in one upload.
+    pub max_parts: u32,
+    /// Largest number of part uploads in flight.
+    pub concurrency: usize,
+}
+
+impl Default for MultipartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: Size::new(64 * 1_048_576),
+            chunk_size: Size::new(16 * 1_048_576),
+            min_chunk_size: Size::new(S3_MIN_PART_BYTES),
+            max_parts: S3_MAX_PARTS,
+            concurrency: 4,
         }
     }
 }
@@ -693,6 +733,8 @@ pub struct Config {
     pub server: ServerConfig,
     /// Upstream connection and retry settings.
     pub upstream: UpstreamConfig,
+    /// Multipart settings for internal object writes.
+    pub multipart: MultipartConfig,
     /// Origin S3 endpoint.
     pub origin: EndpointConfig,
     /// Cache settings.
@@ -801,6 +843,7 @@ impl ConfigError {
 pub fn validate(config: &Config) -> Result<Vec<String>, ConfigError> {
     let mut warnings = Vec::new();
     validate_server(config)?;
+    validate_multipart(config)?;
     validate_cache(config, &mut warnings)?;
     validate_endpoints(config)?;
     validate_cluster(config)?;
@@ -916,6 +959,41 @@ fn validate_server(config: &Config) -> Result<(), ConfigError> {
                 "server.tls.key_file must not be empty",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_multipart(config: &Config) -> Result<(), ConfigError> {
+    let multipart = &config.multipart;
+    if multipart.min_chunk_size.as_bytes() < S3_MIN_PART_BYTES {
+        return Err(ConfigError::invalid(
+            "multipart.min_chunk_size must be at least 5MiB, the S3 minimum for a part",
+        ));
+    }
+    if multipart.min_chunk_size.as_bytes() > S3_MAX_PART_BYTES {
+        return Err(ConfigError::invalid(
+            "multipart.min_chunk_size must not be greater than 5GiB, the S3 maximum for a part",
+        ));
+    }
+    if multipart.chunk_size < multipart.min_chunk_size {
+        return Err(ConfigError::invalid(
+            "multipart.chunk_size must not be less than multipart.min_chunk_size",
+        ));
+    }
+    if multipart.chunk_size.as_bytes() > S3_MAX_PART_BYTES {
+        return Err(ConfigError::invalid(
+            "multipart.chunk_size must not be greater than 5GiB, the S3 maximum for a part",
+        ));
+    }
+    if !(1..=S3_MAX_PARTS).contains(&multipart.max_parts) {
+        return Err(ConfigError::invalid(
+            "multipart.max_parts must be between 1 and 10000",
+        ));
+    }
+    if !(1..=64).contains(&multipart.concurrency) {
+        return Err(ConfigError::invalid(
+            "multipart.concurrency must be between 1 and 64",
+        ));
     }
     Ok(())
 }
