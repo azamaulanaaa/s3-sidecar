@@ -411,7 +411,25 @@ async fn object_keys_are_omitted_by_default() {
         .iter()
         .find(|span| span.name == "s3.request")
         .expect("the server span is missing");
+    let upstream = spans
+        .iter()
+        .find(|span| span.name == "s3.upstream")
+        .expect("the upstream span is missing");
     assert!(attribute(server, "s3.object.key").is_none());
+    assert_eq!(
+        attribute(server, "url.path").as_deref(),
+        Some("/media/[redacted]")
+    );
+    assert_eq!(
+        attribute(upstream, "url.path").as_deref(),
+        Some("/media/[redacted]")
+    );
+    assert!(
+        spans.iter().all(|span| {
+            attribute(span, "url.path").is_none_or(|path| !path.contains("private-key"))
+        }),
+        "an object key leaked into a span path"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -440,9 +458,43 @@ async fn object_keys_are_recorded_when_enabled() {
         .iter()
         .find(|span| span.name == "s3.request")
         .expect("the server span is missing");
+    let upstream = spans
+        .iter()
+        .find(|span| span.name == "s3.upstream")
+        .expect("the upstream span is missing");
     assert_eq!(
         attribute(server, "s3.object.key").as_deref(),
         Some("private-key")
+    );
+    assert_eq!(
+        attribute(server, "url.path").as_deref(),
+        Some("/media/private-key")
+    );
+    assert_eq!(
+        attribute(upstream, "url.path").as_deref(),
+        Some("/media/private-key")
+    );
+}
+
+#[test]
+fn control_paths_are_not_redacted() {
+    for path in [
+        "/healthz",
+        "/readyz",
+        "/_raft/vote",
+        "/_coord/propose",
+        "/_blob/abc",
+    ] {
+        assert_eq!(s3_sidecar::telemetry::redact_object_path(path, false), path);
+        assert_eq!(s3_sidecar::telemetry::redact_object_path(path, true), path);
+    }
+    assert_eq!(
+        s3_sidecar::telemetry::redact_object_path("/media/item", false),
+        "/media/[redacted]"
+    );
+    assert_eq!(
+        s3_sidecar::telemetry::redact_object_path("/media/item", true),
+        "/media/item"
     );
 }
 
