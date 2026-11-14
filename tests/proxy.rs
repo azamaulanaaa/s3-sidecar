@@ -266,6 +266,18 @@ async fn health_and_readiness_respond() {
 }
 
 #[tokio::test]
+async fn metrics_endpoint_is_removed() {
+    let (origin, _) = spawn_origin().await;
+    let (sidecar, _) = spawn_sidecar(origin).await;
+    let response = reqwest::Client::new()
+        .get(format!("{sidecar}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn signed_get_is_forwarded_and_response_headers_pass_through() {
     let (origin, records) = spawn_origin().await;
     let (sidecar, _) = spawn_sidecar(origin).await;

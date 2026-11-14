@@ -2,6 +2,8 @@
 
 //! Cache-mode integration tests with an in-process fake origin and fake cache.
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -539,6 +541,26 @@ async fn spawn_sidecar(config: Config) -> Sidecar {
     }
 }
 
+async fn spawn_sidecar_with_metrics(config: Config, metrics: &support::TestMetrics) -> Sidecar {
+    s3_sidecar::observability::init();
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(
+        AppState::new_with_metrics(config, Arc::clone(&metrics.metrics), None, None).unwrap(),
+    );
+    state.start().await.unwrap();
+    state.set_ready(true);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = router(Arc::clone(&state));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Sidecar {
+        url: format!("http://{address}"),
+        _dir: dir,
+    }
+}
+
 fn credential() -> Arc<ClientCredential> {
     CredentialStore::new(&[client_config()])
         .lookup("AKIA")
@@ -862,16 +884,20 @@ async fn permanent_origin_error_quarantines() {
     *origin.put_status.lock().unwrap() = Some(StatusCode::FORBIDDEN);
     let (cache_url, cache) = spawn_cache().await;
     let dir = tempfile::tempdir().unwrap();
-    let sidecar = spawn_sidecar(config(
-        origin_url,
-        cache_url,
-        CacheMode::ReadWrite,
-        0,
-        3_600,
-        WritePolicy::WriteBack,
-        OnCacheError::Origin,
-        &dir.path().join("index.redb"),
-    ))
+    let telemetry = support::TestMetrics::new();
+    let sidecar = spawn_sidecar_with_metrics(
+        config(
+            origin_url,
+            cache_url,
+            CacheMode::ReadWrite,
+            0,
+            3_600,
+            WritePolicy::WriteBack,
+            OnCacheError::Origin,
+            &dir.path().join("index.redb"),
+        ),
+        &telemetry,
+    )
     .await;
     let client = reqwest::Client::new();
     let put = signed_request(
@@ -886,12 +912,8 @@ async fn permanent_origin_error_quarantines() {
     assert_eq!(put.status(), StatusCode::OK);
     let blob = blob_key("cache", "node-a", "media", "quarantine");
     wait_for(Duration::from_secs(3), || {
-        let client = client.clone();
-        let url = format!("{}/metrics", sidecar.url);
-        async move {
-            let text = client.get(url).send().await.unwrap().text().await.unwrap();
-            text.contains("s3_sidecar_cache_quarantine_total 1")
-        }
+        let telemetry = telemetry.clone();
+        async move { support::counter(&telemetry.collect(), "s3_sidecar.cache.quarantine") >= 1 }
     })
     .await;
     let get = signed_request(
@@ -1043,16 +1065,20 @@ async fn unlimited_cache_never_evicts() {
     origin.put("media/two", &[b'b'; 60], "\"etag-2\"");
     let (cache_url, cache) = spawn_cache().await;
     let dir = tempfile::tempdir().unwrap();
-    let sidecar = spawn_sidecar(config(
-        origin_url,
-        cache_url,
-        CacheMode::Read,
-        0,
-        3_600,
-        WritePolicy::WriteBack,
-        OnCacheError::Origin,
-        &dir.path().join("index.redb"),
-    ))
+    let telemetry = support::TestMetrics::new();
+    let sidecar = spawn_sidecar_with_metrics(
+        config(
+            origin_url,
+            cache_url,
+            CacheMode::Read,
+            0,
+            3_600,
+            WritePolicy::WriteBack,
+            OnCacheError::Origin,
+            &dir.path().join("index.redb"),
+        ),
+        &telemetry,
+    )
     .await;
     let client = reqwest::Client::new();
     for key in ["one", "two"] {
@@ -1076,16 +1102,10 @@ async fn unlimited_cache_never_evicts() {
         async move { cache.has(&one) && cache.has(&two) }
     })
     .await;
-    let metrics = client
-        .get(format!("{}/metrics", sidecar.url))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(metrics.contains("s3_sidecar_cache_evictions_total 0"));
-    assert!(metrics.contains("s3_sidecar_cache_unlimited 1"));
+    let metrics = telemetry.collect();
+    assert_eq!(support::counter(&metrics, "s3_sidecar.cache.evictions"), 0);
+    assert_eq!(support::gauge(&metrics, "s3_sidecar.cache.unlimited"), 1);
+    assert_eq!(support::gauge(&metrics, "s3_sidecar.cache.max_bytes"), 0);
 }
 
 #[tokio::test]
@@ -1095,16 +1115,20 @@ async fn small_cap_evicts_to_low_watermark() {
     origin.put("media/two", &[b'b'; 60], "\"etag-2\"");
     let (cache_url, _cache) = spawn_cache().await;
     let dir = tempfile::tempdir().unwrap();
-    let sidecar = spawn_sidecar(config(
-        origin_url,
-        cache_url,
-        CacheMode::Read,
-        100,
-        3_600,
-        WritePolicy::WriteBack,
-        OnCacheError::Origin,
-        &dir.path().join("index.redb"),
-    ))
+    let telemetry = support::TestMetrics::new();
+    let sidecar = spawn_sidecar_with_metrics(
+        config(
+            origin_url,
+            cache_url,
+            CacheMode::Read,
+            100,
+            3_600,
+            WritePolicy::WriteBack,
+            OnCacheError::Origin,
+            &dir.path().join("index.redb"),
+        ),
+        &telemetry,
+    )
     .await;
     let client = reqwest::Client::new();
     for key in ["one", "two"] {
@@ -1120,34 +1144,13 @@ async fn small_cap_evicts_to_low_watermark() {
         assert_eq!(get.status(), StatusCode::OK);
     }
     wait_for(Duration::from_secs(3), || {
-        let client = client.clone();
-        let url = format!("{}/metrics", sidecar.url);
-        async move {
-            let text = client.get(url).send().await.unwrap().text().await.unwrap();
-            text.contains("s3_sidecar_cache_evictions_total 1")
-        }
+        let telemetry = telemetry.clone();
+        async move { support::counter(&telemetry.collect(), "s3_sidecar.cache.evictions") >= 1 }
     })
     .await;
-    let metrics = client
-        .get(format!("{}/metrics", sidecar.url))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let tracked = metric_value(&metrics, "s3_sidecar_cache_tracked_bytes");
+    let metrics = telemetry.collect();
+    let tracked = support::gauge(&metrics, "s3_sidecar.cache.tracked_bytes");
     assert!(tracked <= 80, "tracked bytes: {tracked}");
-}
-
-fn metric_value(text: &str, name: &str) -> u64 {
-    text.lines()
-        .find_map(|line| {
-            let rest = line.strip_prefix(name)?;
-            let rest = rest.strip_prefix(' ')?;
-            rest.parse().ok()
-        })
-        .unwrap_or(0)
 }
 
 #[tokio::test]
@@ -1320,21 +1323,25 @@ async fn write_through_origin_failure_discards_cache() {
 }
 
 #[tokio::test]
-async fn metrics_endpoint_reports_counters() {
+async fn otel_metrics_report_counters() {
     let (origin_url, origin) = spawn_origin().await;
     origin.put("media/item", b"hello", "\"etag-1\"");
     let (cache_url, _cache) = spawn_cache().await;
     let dir = tempfile::tempdir().unwrap();
-    let sidecar = spawn_sidecar(config(
-        origin_url,
-        cache_url,
-        CacheMode::Read,
-        0,
-        3_600,
-        WritePolicy::WriteBack,
-        OnCacheError::Origin,
-        &dir.path().join("index.redb"),
-    ))
+    let telemetry = support::TestMetrics::new();
+    let sidecar = spawn_sidecar_with_metrics(
+        config(
+            origin_url,
+            cache_url,
+            CacheMode::Read,
+            0,
+            3_600,
+            WritePolicy::WriteBack,
+            OnCacheError::Origin,
+            &dir.path().join("index.redb"),
+        ),
+        &telemetry,
+    )
     .await;
     let client = reqwest::Client::new();
     for _ in 0..2 {
@@ -1349,17 +1356,10 @@ async fn metrics_endpoint_reports_counters() {
         .unwrap();
         assert_eq!(get.status(), StatusCode::OK);
     }
-    let metrics = client
-        .get(format!("{}/metrics", sidecar.url))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(metrics.contains("s3_sidecar_cache_hits_total"));
-    assert!(metrics.contains("s3_sidecar_cache_bytes_served_total"));
-    assert!(metrics.contains("s3_sidecar_origin_bytes_fetched_total"));
-    assert!(metrics.contains("s3_sidecar_cache_max_bytes 0"));
-    assert!(metrics.contains("s3_sidecar_cache_unlimited 1"));
+    let metrics = telemetry.collect();
+    assert!(support::counter(&metrics, "s3_sidecar.cache.hits") >= 1);
+    assert!(support::counter(&metrics, "s3_sidecar.cache.bytes_served") >= 5);
+    assert!(support::counter(&metrics, "s3_sidecar.cache.origin_bytes") >= 5);
+    assert_eq!(support::gauge(&metrics, "s3_sidecar.cache.max_bytes"), 0);
+    assert_eq!(support::gauge(&metrics, "s3_sidecar.cache.unlimited"), 1);
 }

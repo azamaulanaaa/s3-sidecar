@@ -2,6 +2,8 @@
 
 //! Cluster-mode integration tests with an in-process fake backing S3.
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -535,6 +537,25 @@ impl Sidecar {
 
 async fn spawn_sidecar(config: Config) -> Sidecar {
     let state = Arc::new(AppState::new(config).unwrap());
+    state.start().await.unwrap();
+    state.set_ready(true);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = router(Arc::clone(&state));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Sidecar {
+        url: format!("http://{address}"),
+        state,
+        task,
+    }
+}
+
+async fn spawn_sidecar_with_metrics(config: Config, metrics: &support::TestMetrics) -> Sidecar {
+    let state = Arc::new(
+        AppState::new_with_metrics(config, Arc::clone(&metrics.metrics), None, None).unwrap(),
+    );
     state.start().await.unwrap();
     state.set_ready(true);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1185,14 +1206,18 @@ async fn upload_id_on_the_wrong_node_returns_a_clear_error() {
 async fn leader_read_calls_the_read_index() {
     let (backing, _) = spawn_backing().await;
     let dir = tempfile::tempdir().unwrap();
-    let sidecar = spawn_sidecar(cluster_config(
-        backing,
-        "a",
-        &dir.path().join("meta.redb"),
-        ReadMode::Leader,
-        3_600,
-        86_400,
-    ))
+    let telemetry = support::TestMetrics::new();
+    let sidecar = spawn_sidecar_with_metrics(
+        cluster_config(
+            backing,
+            "a",
+            &dir.path().join("meta.redb"),
+            ReadMode::Leader,
+            3_600,
+            86_400,
+        ),
+        &telemetry,
+    )
     .await;
     let client = reqwest::Client::new();
     let response = signed_request(
@@ -1207,20 +1232,8 @@ async fn leader_read_calls_the_read_index() {
     .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    let metrics = body_text(
-        client
-            .get(format!("{}/metrics", sidecar.url))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    let line = metrics
-        .lines()
-        .find(|line| line.starts_with("s3_sidecar_cluster_read_index_calls_total"))
-        .unwrap();
-    let value: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
-    assert!(value >= 1);
+    let metrics = telemetry.collect();
+    assert!(support::counter(&metrics, "s3_sidecar.cluster.read_index_calls") >= 1);
 }
 
 #[tokio::test]

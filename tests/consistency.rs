@@ -3,6 +3,8 @@
 //! Write acknowledgement policies and the failure matrix with an in-memory
 //! Consul metadata authority.
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -500,6 +502,20 @@ async fn spawn_consul_cluster(
     read: ReadMode,
     race: Option<(String, Vec<u8>)>,
 ) -> TestCluster {
+    spawn_consul_cluster_with_metrics(ids, write_ack, replicas, min_replicas, read, race, None)
+        .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_consul_cluster_with_metrics(
+    ids: &[&str],
+    write_ack: WriteAck,
+    replicas: u32,
+    min_replicas: u32,
+    read: ReadMode,
+    race: Option<(String, Vec<u8>)>,
+    metrics: Option<&support::TestMetrics>,
+) -> TestCluster {
     let dir = TempDir::new().unwrap();
     let memory = Arc::new(MemoryConsul::new());
     let mut listeners = Vec::new();
@@ -539,9 +555,15 @@ async fn spawn_consul_cluster(
             )),
             None => Arc::new(WrappedConsul::plain(Arc::clone(&memory))),
         };
-        let state = Arc::new(
-            AppState::new_with_consul_api(config, Some(api)).expect("cluster state is valid"),
-        );
+        let state = match metrics {
+            Some(metrics) => Arc::new(
+                AppState::new_with_metrics(config, Arc::clone(&metrics.metrics), Some(api), None)
+                    .expect("cluster state is valid"),
+            ),
+            None => Arc::new(
+                AppState::new_with_consul_api(config, Some(api)).expect("cluster state is valid"),
+            ),
+        };
         spawned.push(((*id).to_owned(), state, backings[index].1.clone()));
     }
     let mut nodes_out = Vec::new();
@@ -620,13 +642,15 @@ async fn wait_absent_on_all_backings(cluster: &TestCluster, timeout: Duration) {
 
 #[tokio::test]
 async fn quorum_write_succeeds_with_one_peer_down() {
-    let cluster = spawn_consul_cluster(
+    let telemetry = support::TestMetrics::new();
+    let cluster = spawn_consul_cluster_with_metrics(
         &["a", "b", "c"],
         WriteAck::Quorum,
         3,
         2,
         ReadMode::LocalThenPeer,
         None,
+        Some(&telemetry),
     )
     .await;
     let leader = cluster.leader().unwrap().id.clone();
@@ -662,18 +686,15 @@ async fn quorum_write_succeeds_with_one_peer_down() {
     assert!(cluster.node(&acked).backing.has(&blob));
     assert!(cluster.node(&leader).backing.has(&blob));
 
-    let metrics = client
-        .get(format!("{}/metrics", cluster.node(&leader).url))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(metrics.contains("s3_sidecar_cluster_write_ack_total{policy=\"quorum\"}"));
-    assert!(metrics.contains("s3_sidecar_cluster_quorum_success_total"));
-    assert!(metrics.contains("s3_sidecar_cluster_sync_replication_latency_micros_total"));
-    assert!(metrics.contains("s3_sidecar_cluster_replica_acks_total"));
+    let metrics = telemetry.collect();
+    assert!(
+        support::counter_with(&metrics, "s3_sidecar.cluster.write_ack", "policy", "quorum",) >= 1
+    );
+    assert!(support::counter(&metrics, "s3_sidecar.cluster.quorum.success") >= 1);
+    assert!(
+        support::histogram_count(&metrics, "s3_sidecar.cluster.sync_replication.duration") >= 1
+    );
+    assert!(support::counter(&metrics, "s3_sidecar.cluster.replica_acks") >= 1);
 }
 
 #[tokio::test]

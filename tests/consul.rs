@@ -2,6 +2,8 @@
 
 //! Consul backend integration tests with an in-memory Consul API.
 
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -332,6 +334,29 @@ struct Sidecar {
 
 async fn spawn_sidecar(listener: TcpListener, config: Config, api: Arc<dyn ConsulApi>) -> Sidecar {
     let state = Arc::new(AppState::new_with_consul_api(config, Some(api)).unwrap());
+    state.start().await.unwrap();
+    state.set_ready(true);
+    let address = listener.local_addr().unwrap();
+    let app = router(Arc::clone(&state));
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Sidecar {
+        url: format!("http://{address}"),
+        state,
+        task,
+    }
+}
+
+async fn spawn_sidecar_with_metrics(
+    listener: TcpListener,
+    config: Config,
+    api: Arc<dyn ConsulApi>,
+    metrics: &support::TestMetrics,
+) -> Sidecar {
+    let state = Arc::new(
+        AppState::new_with_metrics(config, Arc::clone(&metrics.metrics), Some(api), None).unwrap(),
+    );
     state.start().await.unwrap();
     state.set_ready(true);
     let address = listener.local_addr().unwrap();
@@ -714,7 +739,8 @@ async fn leader_read_uses_a_consistent_get() {
         Arc::new(WrappedConsul::plain(Arc::clone(&memory))),
     )
     .await;
-    let node_b = spawn_sidecar(
+    let telemetry = support::TestMetrics::new();
+    let node_b = spawn_sidecar_with_metrics(
         listener_b,
         consul_config(
             backing_b,
@@ -724,6 +750,7 @@ async fn leader_read_uses_a_consistent_get() {
             ReadMode::Leader,
         ),
         Arc::new(WrappedConsul::plain(Arc::clone(&memory)).without_watch()),
+        &telemetry,
     )
     .await;
     let sidecars = [&node_a, &node_b];
@@ -762,20 +789,8 @@ async fn leader_read_uses_a_consistent_get() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let stored = stored_metadata(&node_b, "media", "direct").unwrap();
     assert_eq!(stored.owner, "remote");
-    let metrics = client
-        .get(format!("{}/metrics", node_b.url))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let calls = metrics
-        .lines()
-        .find(|line| line.starts_with("s3_sidecar_cluster_read_index_calls_total"))
-        .unwrap();
-    let calls: u64 = calls.split_whitespace().nth(1).unwrap().parse().unwrap();
-    assert!(calls >= 1);
+    let metrics = telemetry.collect();
+    assert!(support::counter(&metrics, "s3_sidecar.cluster.read_index_calls") >= 1);
     for sidecar in [node_a, node_b] {
         sidecar.task.abort();
         let _ = sidecar.task.await;
