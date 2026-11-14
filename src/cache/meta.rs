@@ -14,6 +14,18 @@ pub enum EntryState {
     Failed,
 }
 
+impl EntryState {
+    /// Return the stable name used in telemetry attributes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Synced => "synced",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Metadata stored next to a cache blob.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheMetadata {

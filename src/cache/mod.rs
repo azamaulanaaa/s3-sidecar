@@ -18,7 +18,7 @@ use md5::Md5;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 use self::index::{CacheIndex, IndexEntry};
 use self::keys::{
@@ -638,44 +638,53 @@ impl Cache {
             &origin_bucket,
             &origin_key,
         );
-        tokio::spawn(async move {
-            let body = receiver_stream(receiver);
-            match cache
-                .put_blob_stream(
-                    cache.cache_bucket(),
-                    &cache_key_value,
-                    body,
-                    Some(meta_writer.size),
-                    None,
-                )
-                .await
-            {
-                Ok(hashes) => {
-                    if !completed_writer.load(Ordering::Acquire) {
-                        let _ = cache
-                            .delete_object(cache.cache_bucket(), &cache_key_value)
-                            .await;
-                        return;
+        let tee_span = tracing::info_span!(
+            "cache.tee",
+            "s3.bucket.name" = meta.origin_bucket.as_str(),
+            "cache.hit" = false,
+            "cache.entry.state" = meta.state.as_str(),
+        );
+        tokio::spawn(
+            async move {
+                let body = receiver_stream(receiver);
+                match cache
+                    .put_blob_stream(
+                        cache.cache_bucket(),
+                        &cache_key_value,
+                        body,
+                        Some(meta_writer.size),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(hashes) => {
+                        if !completed_writer.load(Ordering::Acquire) {
+                            let _ = cache
+                                .delete_object(cache.cache_bucket(), &cache_key_value)
+                                .await;
+                            return;
+                        }
+                        let mut stored = meta_writer;
+                        stored.size = hashes.size;
+                        stored.checksum = hashes.sha256;
+                        stored.etag = format!("\"{}\"", hashes.md5);
+                        if let Err(error) = cache
+                            .put_meta(cache.cache_bucket(), &cache_key_value, &stored)
+                            .await
+                        {
+                            warn!(%error, "cache metadata write failed");
+                        }
+                        if let Err(error) = cache.index_upsert(&cache_key_value, &stored).await {
+                            warn!(%error, "cache index update failed");
+                        }
                     }
-                    let mut stored = meta_writer;
-                    stored.size = hashes.size;
-                    stored.checksum = hashes.sha256;
-                    stored.etag = format!("\"{}\"", hashes.md5);
-                    if let Err(error) = cache
-                        .put_meta(cache.cache_bucket(), &cache_key_value, &stored)
-                        .await
-                    {
-                        warn!(%error, "cache metadata write failed");
+                    Err(error) => {
+                        warn!(%error, "cache tee write failed");
                     }
-                    if let Err(error) = cache.index_upsert(&cache_key_value, &stored).await {
-                        warn!(%error, "cache index update failed");
-                    }
-                }
-                Err(error) => {
-                    warn!(%error, "cache tee write failed");
                 }
             }
-        });
+            .instrument(tee_span),
+        );
 
         let stream = async_stream::try_stream! {
             let mut body = response.bytes_stream();
@@ -720,6 +729,7 @@ impl Cache {
     /// # Errors
     ///
     /// Returns an error when the cache listing fails.
+    #[tracing::instrument(name = "gc.cycle", skip_all)]
     pub async fn gc_once(&self) -> Result<(), CacheError> {
         let bucket = self.cache_bucket().to_owned();
         self.gc_bucket(&bucket).await
@@ -960,6 +970,15 @@ impl Cache {
     }
 
     async fn sync_entry(self: &Arc<Self>, entry: &JournalEntry) {
+        let span = tracing::info_span!(
+            "cache.sync",
+            "s3.bucket.name" = entry.bucket.as_str(),
+            "cache.entry.state" = entry.state.as_str(),
+        );
+        self.sync_entry_inner(entry).instrument(span).await;
+    }
+
+    async fn sync_entry_inner(self: &Arc<Self>, entry: &JournalEntry) {
         if entry.kind == JournalKind::Put && self.is_tombstoned(&entry.bucket, &entry.key) {
             let path = journal_key(
                 &self.config.cache.prefix,
