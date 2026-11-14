@@ -61,9 +61,19 @@ pub struct ConfigFlags {
     /// Listen address.
     #[arg(long = "server-bind", value_name = "ADDRESS")]
     pub server_bind: Option<String>,
-    /// Use multipart for internal object writes.
-    #[arg(long = "multipart-enabled")]
-    pub multipart_enabled: bool,
+    /// Use multipart for internal object writes. The value is optional and
+    /// defaults to true when the flag has no value.
+    #[arg(
+        long = "multipart-enabled",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        conflicts_with = "no_multipart"
+    )]
+    pub multipart_enabled: Option<bool>,
+    /// Disable multipart for internal object writes.
+    #[arg(long = "no-multipart", conflicts_with = "multipart_enabled")]
+    pub no_multipart: bool,
     /// Smallest object size that uses multipart, for example `64MiB`.
     #[arg(long = "multipart-threshold", value_name = "SIZE")]
     pub multipart_threshold: Option<String>,
@@ -388,8 +398,11 @@ impl ConfigFlags {
                 Value::String(value.clone()),
             );
         }
-        if self.multipart_enabled {
-            set(&mut object, &["multipart", "enabled"], Value::Bool(true));
+        if let Some(value) = self.multipart_enabled {
+            set(&mut object, &["multipart", "enabled"], Value::Bool(value));
+        }
+        if self.no_multipart {
+            set(&mut object, &["multipart", "enabled"], Value::Bool(false));
         }
         if let Some(value) = &self.multipart_threshold {
             set(
@@ -1029,9 +1042,51 @@ mod tests {
 
     use std::fs;
 
+    use clap::Parser;
     use tempfile::tempdir;
 
-    use super::{ConfigFlags, StdinTarget};
+    use super::{Cli, Command, ConfigFlags, StdinTarget};
+
+    fn multipart_enabled(args: &[&str]) -> Option<bool> {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Check(check) = cli.command else {
+            panic!("the test must use the check command");
+        };
+        let layer = check.config.to_layer(None).unwrap();
+        layer
+            .get("multipart")
+            .and_then(|multipart| multipart.get("enabled"))
+            .and_then(serde_json::Value::as_bool)
+    }
+
+    #[test]
+    fn multipart_flag_accepts_true_and_false_forms() {
+        assert_eq!(
+            multipart_enabled(&["s3-sidecar", "check", "--multipart-enabled"]),
+            Some(true)
+        );
+        assert_eq!(
+            multipart_enabled(&["s3-sidecar", "check", "--multipart-enabled=true"]),
+            Some(true)
+        );
+        assert_eq!(
+            multipart_enabled(&["s3-sidecar", "check", "--multipart-enabled", "true"]),
+            Some(true)
+        );
+        assert_eq!(
+            multipart_enabled(&["s3-sidecar", "check", "--multipart-enabled=false"]),
+            Some(false)
+        );
+        assert_eq!(
+            multipart_enabled(&["s3-sidecar", "check", "--multipart-enabled", "false"]),
+            Some(false)
+        );
+        assert_eq!(
+            multipart_enabled(&["s3-sidecar", "check", "--no-multipart"]),
+            Some(false)
+        );
+        assert_eq!(multipart_enabled(&["s3-sidecar", "check"]), None);
+    }
 
     #[test]
     fn cluster_secret_file_flag_sets_the_token() {
