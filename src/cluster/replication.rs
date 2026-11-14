@@ -472,14 +472,19 @@ impl Cluster {
                 .bytes_stream()
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
         );
-        let request = ForwardRequest {
-            method: Method::PUT,
-            path_and_query: format!("/{}/objects/{}", self.blob_bucket(), metadata.blob),
-            headers: HeaderMap::new(),
-            body: Some(stream),
-            content_length: Some(length),
-        };
-        match self.client.execute(&self.credential, request).await {
+        match crate::multipart::put_object(
+            &self.client,
+            &self.credential,
+            self.blob_bucket(),
+            &format!("objects/{}", metadata.blob),
+            HeaderMap::new(),
+            stream,
+            Some(length),
+            &self.config.multipart,
+            &self.metrics,
+        )
+        .await
+        {
             Ok(response) => response.status().is_success(),
             Err(error) => {
                 warn!(%error, "owner blob repair write failed");
@@ -594,6 +599,8 @@ impl Cluster {
         let (sender, mut receiver) = mpsc::channel::<Result<bytes::Bytes, io::Error>>(2);
         let client = self.client.clone();
         let credential = std::sync::Arc::clone(&self.credential);
+        let config = std::sync::Arc::clone(&self.config);
+        let metrics = std::sync::Arc::clone(&self.metrics);
         let bucket = self.blob_bucket().to_owned();
         let blob = metadata.blob.clone();
         let length = metadata.size;
@@ -603,14 +610,19 @@ impl Cluster {
                     yield item?;
                 }
             };
-            let request = ForwardRequest {
-                method: Method::PUT,
-                path_and_query: format!("/{bucket}/objects/{blob}"),
-                headers: HeaderMap::new(),
-                body: Some(Box::pin(stream)),
-                content_length: Some(length),
-            };
-            if let Err(error) = client.execute(&credential, request).await {
+            if let Err(error) = crate::multipart::put_object(
+                &client,
+                &credential,
+                &bucket,
+                &format!("objects/{blob}"),
+                HeaderMap::new(),
+                Box::pin(stream),
+                Some(length),
+                &config.multipart,
+                &metrics,
+            )
+            .await
+            {
                 warn!(%error, "read repair write failed");
             }
         });

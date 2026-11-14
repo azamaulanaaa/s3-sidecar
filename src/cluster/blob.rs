@@ -114,23 +114,22 @@ pub async fn put(
         body.into_data_stream()
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
     );
-    let response = cluster
-        .client
-        .execute(
-            &cluster.credential,
-            ForwardRequest {
-                method: Method::PUT,
-                path_and_query: format!("/{}/objects/{uuid}", cluster.blob_bucket()),
-                headers: HeaderMap::new(),
-                body: Some(stream),
-                content_length: length,
-            },
-        )
-        .await
-        .map_err(|error| {
-            warn!(%error, "blob transport write failed");
-            StatusCode::BAD_GATEWAY
-        })?;
+    let response = crate::multipart::put_object(
+        &cluster.client,
+        &cluster.credential,
+        cluster.blob_bucket(),
+        &format!("objects/{uuid}"),
+        HeaderMap::new(),
+        stream,
+        length,
+        &cluster.config.multipart,
+        &cluster.metrics,
+    )
+    .await
+    .map_err(|error| {
+        warn!(%error, "blob transport write failed");
+        StatusCode::BAD_GATEWAY
+    })?;
     if response.status().is_success() {
         Ok(StatusCode::OK)
     } else {
