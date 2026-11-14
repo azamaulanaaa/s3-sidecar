@@ -415,7 +415,7 @@ writes that the sidecar starts.
 
 | Setting | Default | Effect |
 |---|---|---|
-| `cache.max_bytes` | required when cache mode is not `off` | Cache byte limit. `0` means unlimited. A finite value enables the LRU index and eviction. |
+| `cache.max_bytes` | required in cache mode | Cache byte limit. `0` means unlimited. A finite value enables the LRU index and eviction. |
 | `cache.max_object_bytes` | 1 GiB | Bodies larger than this value do not enter the cache. Range reads are not cached. |
 | `cache.high_watermark` | 0.9 | Eviction starts above this fraction of `max_bytes`. |
 | `cache.low_watermark` | 0.8 | Eviction stops at or below this fraction. |

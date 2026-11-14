@@ -478,8 +478,7 @@ deletes a partial cache object.
 A successful delete returns `204`. In `write` and `read_write` modes the
 sidecar removes the cache object and writes a tombstone journal record before
 it returns. A delete of a pending write makes no origin call. A tombstone hides
-the key from reads. In `read` mode and `off` mode the delete goes to origin
-first.
+the key from reads. In `read` mode the delete goes to origin first.
 
 ### Failure policy
 

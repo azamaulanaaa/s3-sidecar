@@ -57,7 +57,7 @@ This section lists behavior changes.
 - A cache entry is two S3 objects. There is no atomic switch between them.
 - Cache mode does not evaluate `If-Range`.
 - The cache header allowlist is fixed.
-- SSE-C works only in pure proxy mode and in cache mode `read`.
+- SSE-C works only in cache mode `read`.
 - Cluster mode requires default encryption on the backing bucket.
 - There is no local metrics endpoint.
 - A slow client has no total response deadline.
