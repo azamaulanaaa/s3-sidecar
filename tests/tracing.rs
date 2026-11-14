@@ -433,6 +433,58 @@ async fn object_keys_are_omitted_by_default() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn request_log_redacts_the_object_key() {
+    set_propagator();
+    let (logger, log_exporter) = log_provider();
+    let subscriber = tracing_subscriber::registry().with(OpenTelemetryTracingBridge::new(&logger));
+    let guard = tracing::subscriber::set_default(subscriber);
+    let (origin, _records) = spawn_origin().await;
+    let (sidecar, _state) = spawn_sidecar(origin, false).await;
+
+    let response = signed_request(
+        &reqwest::Client::new(),
+        Method::GET,
+        &format!("{sidecar}/media/private-key"),
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.text().await.unwrap();
+
+    logger.force_flush().unwrap();
+    drop(guard);
+    let logs = log_exporter.get_emitted_logs().unwrap();
+    let request_log = logs
+        .iter()
+        .find(|log| {
+            log.record.body().is_some_and(|body| {
+                matches!(
+                    body,
+                    opentelemetry::logs::AnyValue::String(value) if value.as_str() == "request"
+                )
+            })
+        })
+        .expect("the request log is missing");
+    let path = request_log
+        .record
+        .attributes_iter()
+        .find_map(|(key, value)| {
+            if key.as_str() != "path" {
+                return None;
+            }
+            match value {
+                opentelemetry::logs::AnyValue::String(value) => Some(value.as_str().to_owned()),
+                _ => None,
+            }
+        })
+        .expect("the request log has no path field");
+    assert_eq!(path, "/media/[redacted]");
+    assert!(!path.contains("private-key"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn object_keys_are_recorded_when_enabled() {
     set_propagator();
     let (provider, exporter) = trace_provider(1.0);

@@ -660,6 +660,8 @@ async fn handle_s3(
         "http.response.status_code" = tracing::field::Empty,
         "otel.kind" = "server",
     );
+    let log_path =
+        crate::telemetry::redact_object_path(uri.path(), state.config.otel.record_object_keys);
     if let Ok(bucket) = bucket_name(uri.path()) {
         span.record("s3.bucket.name", bucket.as_str());
     }
@@ -690,7 +692,7 @@ async fn handle_s3(
         info!(
             request_id = %request_id,
             method = %method,
-            path = %uri.path(),
+            path = %log_path,
             status,
             elapsed_ms,
             "request"
@@ -800,7 +802,13 @@ async fn forward(
     let (credential, payload) = auth.into_parts();
     let bucket = bucket_name(uri.path())?;
     let key = object_key(uri.path());
-    warn_checksum_dropped(headers, &payload, &bucket, &key);
+    warn_checksum_dropped(
+        headers,
+        &payload,
+        &bucket,
+        &key,
+        state.config.otel.record_object_keys,
+    );
     let max_body_bytes = state.config.server.max_body_bytes;
     let has_body = !body.is_end_stream();
     let prepared = prepare_request(
@@ -2167,7 +2175,13 @@ fn strip_aws_chunked(headers: &mut HeaderMap) {
     }
 }
 
-fn warn_checksum_dropped(headers: &HeaderMap, payload: &PayloadKind, bucket: &str, key: &str) {
+fn warn_checksum_dropped(
+    headers: &HeaderMap,
+    payload: &PayloadKind,
+    bucket: &str,
+    key: &str,
+    record_object_keys: bool,
+) {
     let algorithm = headers.contains_key("x-amz-checksum-algorithm");
     let trailer_checksum = match payload {
         PayloadKind::Streaming(context) => context.trailer && has_checksum_header(headers),
@@ -2175,6 +2189,11 @@ fn warn_checksum_dropped(headers: &HeaderMap, payload: &PayloadKind, bucket: &st
         PayloadKind::Unsigned | PayloadKind::Hash(_) => false,
     };
     if algorithm || trailer_checksum {
+        let key = if record_object_keys {
+            key
+        } else {
+            "[redacted]"
+        };
         warn!(
             bucket,
             key,

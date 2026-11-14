@@ -37,6 +37,17 @@ use crate::storage::{ForwardRequest, S3Client, StorageError};
 
 pub use self::meta::CacheMetadata as Metadata;
 
+/// Return the object key for a log field.
+///
+/// The key becomes `[redacted]` when `otel.record_object_keys` is false.
+fn log_key<'a>(config: &Config, key: &'a str) -> &'a str {
+    if config.otel.record_object_keys {
+        key
+    } else {
+        "[redacted]"
+    }
+}
+
 /// A problem in the cache data path.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheError {
@@ -773,7 +784,11 @@ impl Cache {
             let age = now - modified;
             let age = age.whole_seconds();
             if age > i64::try_from(staging.as_secs()).unwrap_or(i64::MAX) {
-                info!(bucket, key, "removing orphan cache blob");
+                info!(
+                    bucket,
+                    key = log_key(&self.config, &key),
+                    "removing orphan cache blob"
+                );
                 let _ = self.delete_object(bucket, &key).await;
             }
         }
@@ -838,7 +853,10 @@ impl Cache {
             };
             let body = response.bytes().await.map_err(|_| CacheError::Body)?;
             let Ok(entry) = serde_json::from_slice::<JournalEntry>(&body) else {
-                warn!(key = %object, "skipping invalid journal record");
+                warn!(
+                    key = %log_key(&self.config, object),
+                    "skipping invalid journal record"
+                );
                 continue;
             };
             let cache_key = (entry.bucket.clone(), entry.key.clone());
@@ -884,7 +902,7 @@ impl Cache {
                 {
                     warn!(
                         bucket = %entry.bucket,
-                        key = %entry.key,
+                        key = %log_key(&self.config, &entry.key),
                         "journal blob is missing; the entry is quarantined"
                     );
                     let mut failed = entry.clone();
@@ -1022,7 +1040,7 @@ impl Cache {
                     }
                     warn!(
                         bucket = %current.bucket,
-                        key = %current.key,
+                        key = %log_key(&self.config, &current.key),
                         kind = ?current.kind,
                         reason = %failure.reason,
                         "sync quarantined"
@@ -1066,7 +1084,7 @@ impl Cache {
         self.metrics.synced();
         info!(
             bucket = %entry.bucket,
-            key = %entry.key,
+            key = %log_key(&self.config, &entry.key),
             "sync completed"
         );
     }
@@ -1617,7 +1635,7 @@ impl Cache {
             let _ = self.delete_object(self.cache_bucket(), &cache_key).await;
             info!(
                 bucket = %entry.origin_bucket,
-                key = %entry.origin_key,
+                key = %log_key(&self.config, &entry.origin_key),
                 "cache entry evicted"
             );
             self.metrics.evicted();
@@ -1949,6 +1967,16 @@ mod tests {
         assert_eq!(watermark(100, 0.9), 90);
         assert_eq!(watermark(100, 0.8), 80);
         assert_eq!(watermark(0, 0.9), 0);
+    }
+
+    #[test]
+    fn log_key_redacts_when_object_keys_are_disabled() {
+        let mut config = Config::default();
+        config.otel.record_object_keys = false;
+        assert_eq!(log_key(&config, "private-key"), "[redacted]");
+
+        config.otel.record_object_keys = true;
+        assert_eq!(log_key(&config, "private-key"), "private-key");
     }
 
     #[test]
