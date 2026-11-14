@@ -132,14 +132,16 @@ impl Cache {
             session_token: config.cache.session_token.clone(),
             force_path_style: config.cache.force_path_style,
         };
-        let client = S3Client::new_with_upstream(&cache_endpoint, &config.upstream)?;
+        let client = S3Client::new_with_upstream(&cache_endpoint, &config.upstream)?
+            .with_record_object_keys(config.otel.record_object_keys);
         let credential = Arc::new(ClientCredential::new(
             config.cache.access_key_id.clone(),
             config.cache.secret_access_key.clone(),
             config.cache.session_token.clone(),
             Vec::new(),
         ));
-        let origin = S3Client::new_with_upstream(&config.origin, &config.upstream)?;
+        let origin = S3Client::new_with_upstream(&config.origin, &config.upstream)?
+            .with_record_object_keys(config.otel.record_object_keys);
         let origin_credential = Arc::new(ClientCredential::new(
             config.origin.access_key_id.clone(),
             config.origin.secret_access_key.clone(),

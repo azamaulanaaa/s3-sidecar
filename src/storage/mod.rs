@@ -79,6 +79,7 @@ pub struct S3Client {
     region: String,
     request_timeout: Duration,
     retry_attempts: u32,
+    record_object_keys: bool,
 }
 
 impl S3Client {
@@ -142,7 +143,15 @@ impl S3Client {
             region: config.region_or_default().to_owned(),
             request_timeout: upstream.request_timeout.as_duration(),
             retry_attempts: upstream.retry_attempts,
+            record_object_keys: false,
         })
+    }
+
+    /// Set whether span paths keep the object key.
+    #[must_use]
+    pub fn with_record_object_keys(mut self, record_object_keys: bool) -> Self {
+        self.record_object_keys = record_object_keys;
+        self
     }
 
     /// Send a signed request to the origin.
@@ -167,7 +176,7 @@ impl S3Client {
             "s3.upstream",
             "http.request.method" = %request.method,
             "server.address" = url.host_str().unwrap_or_default(),
-            "url.path" = url.path(),
+            "url.path" = telemetry::redact_object_path(url.path(), self.record_object_keys),
             "http.response.status_code" = tracing::field::Empty,
             "otel.kind" = "client",
         );

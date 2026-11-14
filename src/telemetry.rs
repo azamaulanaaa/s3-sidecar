@@ -455,6 +455,37 @@ impl Injector for HeaderInjector<'_> {
     }
 }
 
+/// Return a span path for an S3 request.
+///
+/// The object key is removed unless `record_object_keys` is true. Bucket-level
+/// paths and control paths are unchanged.
+#[must_use]
+pub fn redact_object_path(path: &str, record_object_keys: bool) -> String {
+    if record_object_keys || is_control_path(path) {
+        return path.to_owned();
+    }
+    let trimmed = path.trim_start_matches('/');
+    let Some((bucket, key)) = trimmed.split_once('/') else {
+        return path.to_owned();
+    };
+    if bucket.is_empty() || key.is_empty() {
+        return path.to_owned();
+    }
+    format!("/{bucket}/[redacted]")
+}
+
+fn is_control_path(path: &str) -> bool {
+    if matches!(path, "/healthz" | "/readyz" | "/metrics") {
+        return true;
+    }
+    let first = path
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    matches!(first, "_raft" | "_coord" | "_blob")
+}
+
 /// Extract the W3C trace context from request headers.
 #[must_use]
 pub fn extract_context(headers: &HeaderMap) -> Context {

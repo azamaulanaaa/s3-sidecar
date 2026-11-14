@@ -101,7 +101,8 @@ impl AppState {
         } else {
             &config.origin
         };
-        let client = S3Client::new_with_upstream(endpoint, &config.upstream)?;
+        let client = S3Client::new_with_upstream(endpoint, &config.upstream)?
+            .with_record_object_keys(config.otel.record_object_keys);
         let credentials = CredentialStore::new(&config.clients);
         if credentials.is_empty() {
             warn!("no clients are configured; all S3 requests will be denied");
@@ -652,7 +653,7 @@ async fn handle_s3(
     let span = tracing::info_span!(
         "s3.request",
         "http.request.method" = %method,
-        "url.path" = uri.path(),
+        "url.path" = crate::telemetry::redact_object_path(uri.path(), state.config.otel.record_object_keys),
         "s3.bucket.name" = tracing::field::Empty,
         "s3.operation" = s3_operation(&method, &uri, &headers),
         "s3.object.key" = tracing::field::Empty,

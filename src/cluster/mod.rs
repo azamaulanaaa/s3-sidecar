@@ -155,7 +155,8 @@ impl Cluster {
                 config.consensus.raft.node_id.clone()
             }
         };
-        let client = S3Client::new_with_upstream(&config.backing, &config.upstream)?;
+        let client = S3Client::new_with_upstream(&config.backing, &config.upstream)?
+            .with_record_object_keys(config.otel.record_object_keys);
         let credential = Arc::new(ClientCredential::new(
             config.backing.access_key_id.clone(),
             config.backing.secret_access_key.clone(),
