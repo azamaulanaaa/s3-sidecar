@@ -632,8 +632,9 @@ async fn replication_receive_uses_multipart() {
     ))
     .await;
     let body = vec![8_u8; 4_096];
+    let blob = "0123456789abcdef0123456789abcdef0123456789abcdef";
     let response = reqwest::Client::new()
-        .put(format!("{}/_blob/blob-one", sidecar.url))
+        .put(format!("{}/_blob/{blob}", sidecar.url))
         .header("x-s3-sidecar-cluster-token", "cluster-secret")
         .body(body.clone())
         .send()
@@ -643,7 +644,7 @@ async fn replication_receive_uses_multipart() {
     assert_eq!(backing.uploads(), 1);
     assert_eq!(backing.parts(), 8);
     assert_eq!(
-        backing.object("data/objects/blob-one"),
+        backing.object(&format!("data/objects/{blob}")),
         Some(Bytes::from(body))
     );
     sidecar.stop().await;
