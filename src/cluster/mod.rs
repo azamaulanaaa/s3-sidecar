@@ -25,7 +25,7 @@ use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{Instrument, info_span, warn};
 
 use self::consul::api::{ConsulApi, HttpConsul};
 use self::consul::coordinator::ConsulCoordinator;
@@ -436,17 +436,28 @@ impl Cluster {
         }
         let base_version = current.as_ref().map_or(0, |metadata| metadata.version);
         let blob = next_id();
+        let bucket_config = self.bucket_config(bucket)?;
+        let replicas = self.replicas_for(bucket, key, bucket_config.replicas);
         let fingerprint = Arc::new(Mutex::new(Fingerprint::new()));
-        if let Err(error) = self
+        let stage_span = info_span!(
+            "cluster.stage",
+            "s3.bucket.name" = bucket,
+            "cluster.node_id" = self.node_id.as_str(),
+            "cluster.result" = tracing::field::Empty,
+        );
+        let stage_result = self
             .stage_blob(&blob, input, Arc::clone(&fingerprint))
-            .await
-        {
+            .instrument(stage_span.clone())
+            .await;
+        stage_span.record(
+            "cluster.result",
+            if stage_result.is_ok() { "ok" } else { "error" },
+        );
+        if let Err(error) = stage_result {
             self.metrics.aborted_write();
             return Err(error);
         }
         let (etag, checksum, size) = fingerprint_result(&fingerprint);
-        let bucket_config = self.bucket_config(bucket)?;
-        let replicas = self.replicas_for(bucket, key, bucket_config.replicas);
         let request = CommitRequest {
             bucket: bucket.to_owned(),
             key: key.to_owned(),
@@ -483,10 +494,31 @@ impl Cluster {
         bucket: &str,
         key: &str,
         blob: &str,
+        request: CommitRequest,
+        bucket_config: &BucketConfigRecord,
+    ) -> Result<Metadata, S3Error> {
+        let span = info_span!(
+            "cluster.commit",
+            "s3.bucket.name" = bucket,
+            "cluster.node_id" = self.node_id.as_str(),
+            "cluster.write_ack" = tracing::field::Empty,
+            "cluster.result" = tracing::field::Empty,
+        );
+        self.commit_staged_write_inner(bucket, key, blob, request, bucket_config)
+            .instrument(span)
+            .await
+    }
+
+    async fn commit_staged_write_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        blob: &str,
         mut request: CommitRequest,
         bucket_config: &BucketConfigRecord,
     ) -> Result<Metadata, S3Error> {
         let policy = bucket_config.write_ack;
+        tracing::Span::current().record("cluster.write_ack", policy.to_string());
         self.metrics.write_ack(&policy.to_string());
         let intended: Vec<String> = request
             .replicas
@@ -512,6 +544,7 @@ impl Cluster {
                 self.metrics.quorum_failure();
             }
             self.discard_staged_blob(blob, &acked).await;
+            tracing::Span::current().record("cluster.result", "aborted");
             return Err(S3Error::no_leader());
         }
         if policy != WriteAck::Leader {
@@ -549,6 +582,7 @@ impl Cluster {
                         .collect();
                     self.enqueue_put_targets(bucket, key, &metadata, remaining);
                 }
+                tracing::Span::current().record("cluster.result", "ok");
                 Ok(metadata)
             }
             Err(error) => {
@@ -557,6 +591,7 @@ impl Cluster {
                     self.metrics.quorum_failure();
                 }
                 self.discard_staged_blob(blob, &acked).await;
+                tracing::Span::current().record("cluster.result", "error");
                 Err(map_coord_error(error))
             }
         }
@@ -685,6 +720,30 @@ impl Cluster {
         Ok(copy_response(&metadata))
     }
 
+    async fn read_index_for(&self, bucket: &str, key: Option<&str>) -> Result<(), S3Error> {
+        let span = info_span!(
+            "cluster.read_index",
+            "s3.bucket.name" = bucket,
+            "cluster.node_id" = self.node_id.as_str(),
+            "cluster.result" = tracing::field::Empty,
+        );
+        let result = async {
+            self.coord.read_index().await.map_err(map_coord_error)?;
+            self.coord
+                .refresh_read(bucket, key)
+                .await
+                .map_err(map_coord_error)?;
+            Ok(())
+        }
+        .instrument(span.clone())
+        .await;
+        span.record(
+            "cluster.result",
+            if result.is_ok() { "ok" } else { "error" },
+        );
+        result
+    }
+
     /// Read one object or its metadata.
     ///
     /// # Errors
@@ -700,11 +759,7 @@ impl Cluster {
     ) -> Result<Response, S3Error> {
         let config = self.bucket_config(bucket)?;
         if config.read == ReadMode::Leader {
-            self.coord.read_index().await.map_err(map_coord_error)?;
-            self.coord
-                .refresh_read(bucket, Some(key))
-                .await
-                .map_err(map_coord_error)?;
+            self.read_index_for(bucket, Some(key)).await?;
         }
         let Some(metadata) = self
             .state
@@ -826,11 +881,7 @@ impl Cluster {
             ));
         }
         if self.bucket_config(bucket)?.read == ReadMode::Leader {
-            self.coord.read_index().await.map_err(map_coord_error)?;
-            self.coord
-                .refresh_read(bucket, None)
-                .await
-                .map_err(map_coord_error)?;
+            self.read_index_for(bucket, None).await?;
         }
         let prefix = query_value(&pairs, "prefix").unwrap_or_default();
         let delimiter = query_value(&pairs, "delimiter").filter(|value| !value.is_empty());
@@ -1194,6 +1245,7 @@ impl Cluster {
     /// # Errors
     ///
     /// Returns an error when metadata or the backing listing cannot be read.
+    #[tracing::instrument(name = "gc.cycle", skip_all)]
     pub async fn gc_once(&self) -> Result<GcReport, S3Error> {
         let now = state::unix_now();
         let staging = duration_seconds(self.config.cluster.staging_ttl.as_duration());

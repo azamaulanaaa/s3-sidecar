@@ -12,7 +12,7 @@ use axum::response::Response;
 use futures_util::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{Instrument, info_span, warn};
 
 use super::blob::CLUSTER_TOKEN_HEADER;
 use super::state::{Metadata, ReplicationJob, ReplicationOp, unix_now};
@@ -144,7 +144,24 @@ impl Cluster {
                 continue;
             };
             let started = std::time::Instant::now();
-            let result = tokio::time::timeout(timeout, self.send_blob(&address, uuid)).await;
+            let replicate_span = info_span!(
+                "cluster.replicate",
+                "cluster.node_id" = self.node_id.as_str(),
+                "cluster.peer_id" = peer.as_str(),
+                "cluster.result" = tracing::field::Empty,
+            );
+            let result = tokio::time::timeout(timeout, self.send_blob(&address, uuid))
+                .instrument(replicate_span.clone())
+                .await;
+            replicate_span.record(
+                "cluster.result",
+                match &result {
+                    Ok(Ok(status)) if status.is_success() => "ok",
+                    Ok(Ok(_)) => "rejected",
+                    Ok(Err(_)) => "error",
+                    Err(_) => "timeout",
+                },
+            );
             self.metrics.sync_replication(started.elapsed());
             match result {
                 Ok(Ok(status)) if status.is_success() => {
@@ -264,10 +281,32 @@ impl Cluster {
                 let _ = self.state.complete_replication_target(&job.uuid, &target);
                 continue;
             };
+            let copy_span = info_span!(
+                "replication.copy",
+                "cluster.node_id" = self.node_id.as_str(),
+                "cluster.peer_id" = target.as_str(),
+                "cluster.result" = tracing::field::Empty,
+            );
             let result = match job.op {
-                ReplicationOp::Put => self.send_blob(&address, &job.uuid).await,
-                ReplicationOp::Delete => self.send_delete(&address, &job.uuid).await,
+                ReplicationOp::Put => {
+                    self.send_blob(&address, &job.uuid)
+                        .instrument(copy_span.clone())
+                        .await
+                }
+                ReplicationOp::Delete => {
+                    self.send_delete(&address, &job.uuid)
+                        .instrument(copy_span.clone())
+                        .await
+                }
             };
+            copy_span.record(
+                "cluster.result",
+                match &result {
+                    Ok(status) if operation_succeeded(job.op, *status) => "ok",
+                    Ok(_) => "rejected",
+                    Err(_) => "error",
+                },
+            );
             match result {
                 Ok(status) if operation_succeeded(job.op, status) => {
                     self.metrics.replication_success();
@@ -325,14 +364,21 @@ impl Cluster {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let url = format!("{}/_blob/{uuid}", address.trim_end_matches('/'));
-        let mut builder = self.http.put(url).header(
-            CLUSTER_TOKEN_HEADER,
-            self.config.cluster.secret.expose_secret(),
-        );
-        if let Some(length) = length {
-            builder = builder.header(header::CONTENT_LENGTH, length);
+        let mut headers = HeaderMap::new();
+        if let Ok(value) =
+            axum::http::HeaderValue::from_str(self.config.cluster.secret.expose_secret())
+        {
+            headers.insert(CLUSTER_TOKEN_HEADER, value);
         }
-        let sent = builder
+        if let Some(length) = length
+            && let Ok(value) = axum::http::HeaderValue::from_str(&length)
+        {
+            headers.insert(header::CONTENT_LENGTH, value);
+        }
+        let sent = self
+            .http
+            .put(url)
+            .headers(crate::telemetry::injected_headers(headers))
             .body(reqwest::Body::wrap_stream(response.bytes_stream()))
             .send()
             .await
@@ -342,13 +388,16 @@ impl Cluster {
 
     async fn send_delete(&self, address: &str, uuid: &str) -> Result<StatusCode, BlobError> {
         let url = format!("{}/_blob/{uuid}", address.trim_end_matches('/'));
+        let mut headers = HeaderMap::new();
+        if let Ok(value) =
+            axum::http::HeaderValue::from_str(self.config.cluster.secret.expose_secret())
+        {
+            headers.insert(CLUSTER_TOKEN_HEADER, value);
+        }
         let response = self
             .http
             .delete(url)
-            .header(
-                CLUSTER_TOKEN_HEADER,
-                self.config.cluster.secret.expose_secret(),
-            )
+            .headers(crate::telemetry::injected_headers(headers))
             .send()
             .await
             .map_err(|_| BlobError::Http)?;
@@ -357,12 +406,15 @@ impl Cluster {
 
     async fn peer_head(&self, address: &str, uuid: &str) -> bool {
         let url = format!("{}/_blob/{uuid}", address.trim_end_matches('/'));
+        let mut headers = HeaderMap::new();
+        if let Ok(value) =
+            axum::http::HeaderValue::from_str(self.config.cluster.secret.expose_secret())
+        {
+            headers.insert(CLUSTER_TOKEN_HEADER, value);
+        }
         self.http
             .head(url)
-            .header(
-                CLUSTER_TOKEN_HEADER,
-                self.config.cluster.secret.expose_secret(),
-            )
+            .headers(crate::telemetry::injected_headers(headers))
             .send()
             .await
             .is_ok_and(|response| response.status().is_success())
@@ -389,13 +441,16 @@ impl Cluster {
 
     async fn copy_peer_blob(&self, address: &str, metadata: &Metadata) -> bool {
         let url = format!("{}/_blob/{}", address.trim_end_matches('/'), metadata.blob);
+        let mut headers = HeaderMap::new();
+        if let Ok(value) =
+            axum::http::HeaderValue::from_str(self.config.cluster.secret.expose_secret())
+        {
+            headers.insert(CLUSTER_TOKEN_HEADER, value);
+        }
         let response = match self
             .http
             .get(url)
-            .header(
-                CLUSTER_TOKEN_HEADER,
-                self.config.cluster.secret.expose_secret(),
-            )
+            .headers(crate::telemetry::injected_headers(headers))
             .send()
             .await
         {
@@ -442,6 +497,23 @@ impl Cluster {
         method: &Method,
         headers: &HeaderMap,
     ) -> Result<Option<Response>, S3Error> {
+        let span = info_span!(
+            "cluster.peer_fetch",
+            "cluster.node_id" = self.node_id.as_str(),
+            "cluster.peer_id" = tracing::field::Empty,
+            "cluster.result" = tracing::field::Empty,
+        );
+        self.fetch_from_peers_inner(metadata, method, headers)
+            .instrument(span)
+            .await
+    }
+
+    async fn fetch_from_peers_inner(
+        &self,
+        metadata: &Metadata,
+        method: &Method,
+        headers: &HeaderMap,
+    ) -> Result<Option<Response>, S3Error> {
         let mut candidates = metadata.replicas.clone();
         if !candidates.iter().any(|node| node == &metadata.owner) {
             candidates.push(metadata.owner.clone());
@@ -451,6 +523,7 @@ impl Cluster {
             if node == self.node_id || !tried.insert(node.clone()) {
                 continue;
             }
+            tracing::Span::current().record("cluster.peer_id", node.as_str());
             let Some(address) = self.config.cluster.node_addr(&node).map(str::to_owned) else {
                 continue;
             };
@@ -459,20 +532,29 @@ impl Cluster {
             }
             if method == Method::HEAD {
                 self.metrics.peer_fetch();
+                tracing::Span::current().record("cluster.result", "ok");
                 return Ok(Some(metadata_response(metadata)));
             }
             let url = format!("{}/_blob/{}", address.trim_end_matches('/'), metadata.blob);
-            let mut request = self.http.get(url).header(
-                CLUSTER_TOKEN_HEADER,
-                self.config.cluster.secret.expose_secret(),
-            );
-            if let Some(range) = headers.get(header::RANGE) {
-                request = request.header(header::RANGE, range.clone());
+            let mut request_headers = HeaderMap::new();
+            if let Ok(value) =
+                axum::http::HeaderValue::from_str(self.config.cluster.secret.expose_secret())
+            {
+                request_headers.insert(CLUSTER_TOKEN_HEADER, value);
             }
-            let response = request.send().await.map_err(|error| {
-                warn!(%error, "peer blob fetch failed");
-                S3Error::service_unavailable()
-            })?;
+            if let Some(range) = headers.get(header::RANGE) {
+                request_headers.insert(header::RANGE, range.clone());
+            }
+            let response = self
+                .http
+                .get(url)
+                .headers(crate::telemetry::injected_headers(request_headers))
+                .send()
+                .await
+                .map_err(|error| {
+                    warn!(%error, "peer blob fetch failed");
+                    S3Error::service_unavailable()
+                })?;
             if !response.status().is_success() {
                 continue;
             }
@@ -501,8 +583,10 @@ impl Cluster {
                 output.headers_mut().insert(name.clone(), value.clone());
             }
             set_metadata_headers(metadata, output.headers_mut());
+            tracing::Span::current().record("cluster.result", "ok");
             return Ok(Some(output));
         }
+        tracing::Span::current().record("cluster.result", "miss");
         Ok(None)
     }
 

@@ -275,6 +275,7 @@ impl RaftStateMachine<TypeConfig> for RaftStore {
         Ok((log_id, membership))
     }
 
+    #[tracing::instrument(name = "raft.apply", skip_all)]
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
     where
         Strm: futures_util::Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>>

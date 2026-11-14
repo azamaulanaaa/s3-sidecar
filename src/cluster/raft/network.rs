@@ -107,6 +107,9 @@ impl HttpNetwork {
             .client
             .post(url)
             .header(TOKEN_HEADER, &self.token)
+            .headers(crate::telemetry::injected_headers(
+                axum::http::HeaderMap::new(),
+            ))
             .timeout(self.timeout)
             .json(body)
             .send()

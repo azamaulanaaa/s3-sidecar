@@ -408,6 +408,9 @@ impl ConsulCoordinator {
             .http
             .post(url)
             .header(TOKEN_HEADER, self.secret())
+            .headers(crate::telemetry::injected_headers(
+                axum::http::HeaderMap::new(),
+            ))
             .timeout(FORWARD_TIMEOUT)
             .json(&entry)
             .send()
@@ -644,6 +647,7 @@ impl ConsulCoordinator {
         );
     }
 
+    #[tracing::instrument(name = "consul.reconcile", skip_all)]
     fn reconcile_all_metadata(&self, entries: &[KvEntry], index: u64) -> Result<(), CoordError> {
         let mut present = std::collections::HashSet::new();
         for entry in entries {

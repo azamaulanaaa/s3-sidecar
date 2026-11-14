@@ -147,7 +147,12 @@ impl HttpConsul {
     }
 
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let request = self.client.request(method, format!("{}{path}", self.base));
+        let request = self
+            .client
+            .request(method, format!("{}{path}", self.base))
+            .headers(crate::telemetry::injected_headers(
+                axum::http::HeaderMap::new(),
+            ));
         if self.token.is_empty() {
             request
         } else {

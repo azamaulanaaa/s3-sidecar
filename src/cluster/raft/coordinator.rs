@@ -101,6 +101,9 @@ impl RaftCoordinator {
             .http()
             .post(url)
             .header(TOKEN_HEADER, node.secret())
+            .headers(crate::telemetry::injected_headers(
+                axum::http::HeaderMap::new(),
+            ))
             .timeout(node.timeout())
             .json(&entry)
             .send()
@@ -145,6 +148,9 @@ impl RaftCoordinator {
             .http()
             .post(url)
             .header(TOKEN_HEADER, node.secret())
+            .headers(crate::telemetry::injected_headers(
+                axum::http::HeaderMap::new(),
+            ))
             .timeout(node.timeout())
             .json(&serde_json::json!({}))
             .send()
