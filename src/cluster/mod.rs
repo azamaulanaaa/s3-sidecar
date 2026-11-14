@@ -764,9 +764,7 @@ impl Cluster {
             return Err(S3Error::from_status(response.status()));
         }
         self.metrics.cluster_read_local();
-        self.metrics
-            .bytes_served
-            .fetch_add(metadata.size, Ordering::Relaxed);
+        self.metrics.add_served_bytes(metadata.size);
         if method == Method::HEAD {
             drop(response);
             return Ok(Some(metadata_response(metadata)));

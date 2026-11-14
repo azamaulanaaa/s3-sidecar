@@ -73,13 +73,8 @@ impl RaftCoordinator {
             node.refresh_metrics();
         } else {
             let tombstones = self.store.tombstone_count().unwrap_or(0);
-            self.metrics.set_cluster_state(
-                self.store.applied_index(),
-                self.metrics
-                    .raft_term
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                tombstones,
-            );
+            self.metrics
+                .set_cluster_state(self.store.applied_index(), 0, tombstones);
         }
     }
 

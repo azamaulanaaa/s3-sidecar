@@ -13,7 +13,7 @@ use axum::extract::{DefaultBodyLimit, OriginalUri, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum_server::tls_rustls::RustlsConfig;
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, TryStreamExt};
@@ -30,10 +30,11 @@ use crate::cache::Cache;
 use crate::cache::meta::{CacheMetadata, EntryState};
 use crate::cluster::consul::ConsulApi;
 use crate::cluster::{Cluster, WriteBody};
-use crate::config::{CacheMode, Config, Mode, TlsConfig, WritePolicy};
+use crate::config::{CacheMode, Config, ConsensusBackend, Mode, TlsConfig, WritePolicy};
 use crate::errors::S3Error;
 use crate::metrics;
 use crate::storage::{ForwardRequest, S3Client, StorageError};
+use crate::telemetry::Telemetry;
 
 /// Response header that carries the sidecar request identifier.
 pub const REQUEST_ID_HEADER: &str = "x-s3-sidecar-request-id";
@@ -48,6 +49,7 @@ pub struct AppState {
     cache: Option<Arc<Cache>>,
     cluster: Option<Arc<Cluster>>,
     metrics: Arc<metrics::Metrics>,
+    telemetry: Option<Telemetry>,
     slots: Arc<Semaphore>,
     ready: AtomicBool,
 }
@@ -73,6 +75,25 @@ impl AppState {
         config: Config,
         consul_api: Option<Arc<dyn ConsulApi>>,
     ) -> Result<Self, S3Error> {
+        Self::new_with_metrics(
+            config,
+            Arc::new(metrics::Metrics::default()),
+            consul_api,
+            None,
+        )
+    }
+
+    /// Build the shared state with explicit metrics and telemetry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an endpoint URL or the cache index is not valid.
+    pub fn new_with_metrics(
+        config: Config,
+        metrics: Arc<metrics::Metrics>,
+        consul_api: Option<Arc<dyn ConsulApi>>,
+        telemetry: Option<Telemetry>,
+    ) -> Result<Self, S3Error> {
         let config = Arc::new(config);
         let endpoint = if config.mode == Mode::Cluster {
             &config.backing
@@ -84,13 +105,9 @@ impl AppState {
         if credentials.is_empty() {
             warn!("no clients are configured; all S3 requests will be denied");
         }
-        let metrics = Arc::new(metrics::Metrics::default());
-        metrics
-            .cache_max_bytes
-            .store(config.cache.max_bytes.unwrap_or(0), Ordering::Relaxed);
-        metrics.cache_unlimited.store(
-            u64::from(config.cache.max_bytes == Some(0) || config.cache.mode == CacheMode::Off),
-            Ordering::Relaxed,
+        metrics.set_cache_limit(
+            config.cache.max_bytes.unwrap_or(0),
+            config.cache.max_bytes == Some(0) || config.cache.mode == CacheMode::Off,
         );
         let cache = Cache::new(Arc::clone(&config), Arc::clone(&metrics))?;
         let cluster =
@@ -103,6 +120,7 @@ impl AppState {
             cache,
             cluster,
             metrics,
+            telemetry,
             slots,
             ready: AtomicBool::new(false),
         })
@@ -183,6 +201,9 @@ impl AppState {
         if let Some(cluster) = &self.cluster {
             cluster.shutdown().await;
         }
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.shutdown();
+        }
     }
 
     fn is_ready(&self) -> bool {
@@ -219,11 +240,15 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
-        .route("/metrics", get(metrics_endpoint))
+        .route("/metrics", any(metrics_removed))
         .merge(raft)
         .fallback(handle_s3)
         .with_state(state)
         .layer(middleware::from_fn(request_id_layer))
+}
+
+async fn metrics_removed() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 async fn request_id_layer(mut request: Request, next: Next) -> Response {
@@ -257,24 +282,6 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not ready".to_owned())
     }
-}
-
-/// Return the Prometheus metrics response.
-pub async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let (pending, lag) = state
-        .cache
-        .as_ref()
-        .map_or((0, 0), |cache| cache.pending_stats());
-    let tracked = state
-        .cache
-        .as_ref()
-        .map_or(0, |cache| cache.tracked_bytes());
-    state.metrics.set_tracked(tracked);
-    if let Some(cluster) = &state.cluster {
-        cluster.refresh_metrics();
-    }
-    let text = metrics::render(&state.metrics, pending, lag);
-    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], text)
 }
 
 /// A handle that triggers graceful shutdown.
@@ -388,8 +395,17 @@ pub async fn start(config: Config, warnings: &[String]) -> Result<Server, ServeE
     }
 
     let tls = load_tls(config.server.tls.as_ref()).await?;
-    let state =
-        Arc::new(AppState::new(config.clone()).map_err(|error| ServeError::Config(error.message))?);
+    let node_id = telemetry_node_id(&config);
+    let telemetry = Telemetry::new(&config.otel, node_id.as_deref())
+        .map_err(|error| ServeError::Config(error.message))?;
+    let metrics = match &telemetry {
+        Some(telemetry) => Arc::new(metrics::Metrics::new(&telemetry.meter())),
+        None => Arc::new(metrics::Metrics::default()),
+    };
+    let state = Arc::new(
+        AppState::new_with_metrics(config.clone(), metrics, None, telemetry)
+            .map_err(|error| ServeError::Config(error.message))?,
+    );
     state
         .start()
         .await
@@ -429,6 +445,17 @@ pub async fn start(config: Config, warnings: &[String]) -> Result<Server, ServeE
         shutdown,
         task,
     })
+}
+
+fn telemetry_node_id(config: &Config) -> Option<String> {
+    if config.mode != Mode::Cluster {
+        return None;
+    }
+    let id = match config.consensus.backend {
+        ConsensusBackend::Consul => config.consensus.consul.node_id.as_str(),
+        ConsensusBackend::Single | ConsensusBackend::Raft => config.consensus.raft.node_id.as_str(),
+    };
+    (!id.trim().is_empty()).then(|| id.to_owned())
 }
 
 async fn load_tls(tls: Option<&TlsConfig>) -> Result<Option<RustlsConfig>, ServeError> {
@@ -1160,10 +1187,7 @@ async fn origin_read(
     if eligible {
         let meta = Cache::metadata_from_response(bucket, key, &response);
         if meta.size > 0 {
-            state
-                .metrics
-                .origin_bytes
-                .fetch_add(meta.size, Ordering::Relaxed);
+            state.metrics.add_origin_bytes(meta.size);
             let size = meta.size;
             let body = cache.tee_response(response, meta);
             return Ok(response_from_stream(
@@ -1176,7 +1200,7 @@ async fn origin_read(
     }
 
     if let Some(size) = size {
-        metrics::Metrics::add_bytes(&state.metrics.origin_bytes, size);
+        state.metrics.add_origin_bytes(size);
     }
     if method == Method::HEAD && revalidate.is_some() {
         cache.invalidate(bucket, key).await;
@@ -1225,7 +1249,7 @@ async fn serve_cached(
         output.headers_mut().insert(header::CONTENT_LENGTH, value);
     }
     state.metrics.hit();
-    metrics::Metrics::add_bytes(&state.metrics.bytes_served, meta.size);
+    state.metrics.add_served_bytes(meta.size);
     cache.touch(bucket, key);
     Ok(Some(output))
 }

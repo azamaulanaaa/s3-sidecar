@@ -243,10 +243,8 @@ impl ConsulCoordinator {
         );
         self.metrics
             .set_consul_leader(leadership.leader.as_ref().map(|leader| leader.id.as_str()));
-        self.metrics.consul_materialized.store(
-            u64::from(self.materialized.load(Ordering::Acquire)),
-            Ordering::Relaxed,
-        );
+        self.metrics
+            .set_consul_materialized(self.materialized.load(Ordering::Acquire));
     }
 
     fn snapshot(&self) -> Leadership {
@@ -294,9 +292,7 @@ impl ConsulCoordinator {
         {
             warn!("consul session destroy failed");
         }
-        self.metrics
-            .consul_session_losses
-            .fetch_add(1, Ordering::Relaxed);
+        self.metrics.consul_session_lost();
         self.metrics.set_consul_leader(None);
         warn!(reason, "consul leadership lost");
     }
@@ -338,9 +334,7 @@ impl ConsulCoordinator {
             state.holds_leader = true;
             drop(state);
             if changed {
-                self.metrics
-                    .consul_leader_changes
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.consul_leader_changed();
             }
             self.metrics.set_consul_leader(Some(self.node_id()));
             info!(term, "consul leader acquired");
@@ -370,9 +364,7 @@ impl ConsulCoordinator {
         };
         match self.api.renew_session(&session).await {
             Ok(true) => {
-                self.metrics
-                    .consul_session_renewals
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.consul_session_renewed();
             }
             Ok(false) => self.step_down("the consul session ended").await,
             Err(error) => {

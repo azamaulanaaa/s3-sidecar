@@ -164,11 +164,7 @@ impl Cache {
         };
 
         let max_bytes = config.cache.max_bytes.unwrap_or(0);
-        metrics.cache_max_bytes.store(max_bytes, Ordering::Relaxed);
-        metrics.cache_unlimited.store(
-            u64::from(config.cache.max_bytes == Some(0)),
-            Ordering::Relaxed,
-        );
+        metrics.set_cache_limit(max_bytes, config.cache.max_bytes == Some(0));
 
         Ok(Some(Arc::new(Self {
             sync_slots: Arc::new(Semaphore::new(config.cache.sync_workers)),
@@ -281,6 +277,13 @@ impl Cache {
         (count, lag)
     }
 
+    /// Refresh the cache size and journal gauges.
+    pub fn refresh_metrics(&self) {
+        self.metrics.set_tracked(self.tracked_bytes());
+        let (pending, lag) = self.pending_stats();
+        self.metrics.set_pending_stats(pending, lag);
+    }
+
     /// Start recovery, the sync worker, and the garbage collector.
     ///
     /// # Errors
@@ -293,6 +296,7 @@ impl Cache {
         self.ensure_index_loaded().await;
         self.recover().await?;
         self.spawn_gc();
+        self.spawn_metrics();
         Ok(())
     }
 
@@ -1639,6 +1643,19 @@ impl Cache {
                 if let Err(error) = cache.gc_once().await {
                     warn!(%error, "cache garbage collection failed");
                 }
+            }
+        });
+        self.track(task);
+    }
+
+    fn spawn_metrics(self: &Arc<Self>) {
+        let cache = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                cache.refresh_metrics();
             }
         });
         self.track(task);

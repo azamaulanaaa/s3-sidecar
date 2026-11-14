@@ -7,7 +7,6 @@ pub mod network;
 pub mod store;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -304,21 +303,13 @@ impl RaftNode {
             .unwrap_or_else(PoisonError::into_inner);
         let leader_seen = raft.current_leader.is_some();
         if term > election.term && leader_seen {
-            self.metrics.raft_elections.fetch_add(1, Ordering::Relaxed);
+            self.metrics.add_raft_election();
         }
         election.term = term;
         election.leader_seen = leader_seen;
         drop(election);
-        self.metrics.raft_term.store(term, Ordering::Relaxed);
         self.metrics
-            .raft_last_log_index
-            .store(last_log, Ordering::Relaxed);
-        self.metrics
-            .raft_last_applied
-            .store(applied, Ordering::Relaxed);
-        self.metrics
-            .raft_snapshot_index
-            .store(snapshot, Ordering::Relaxed);
+            .set_raft_state(term, last_log, applied, snapshot);
         self.metrics.set_raft_leader(raft.current_leader.as_deref());
         self.metrics
             .set_cluster_state(applied, term, self.store.tombstone_count().unwrap_or(0));
