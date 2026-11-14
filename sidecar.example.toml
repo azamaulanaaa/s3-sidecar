@@ -124,6 +124,22 @@ backend = "single"             # single | raft | consul
 # id = "c"
 # addr = "http://127.0.0.1:9200"
 
+[otel]
+# OpenTelemetry metrics export over OTLP. The default is off.
+enabled = false
+# service_name = "s3-sidecar"
+# service_version = "0.1.0"
+# endpoint = "http://127.0.0.1:4317"
+# protocol = "grpc"             # grpc | http/protobuf
+# timeout = "10s"               # Timeout for one export request.
+# export_interval = "60s"       # Interval between exports.
+# export_timeout = "10s"        # Bound for the final flush at shutdown.
+# headers = { "x-api-key" = "..." }
+# Prefer --otel-headers-file or S3_SIDECAR_OTEL__HEADERS_FILE for a header
+# secret. The file contains a JSON object.
+# headers_file = "/run/secrets/otel-headers.json"
+# resource_attributes = { "deployment.environment.name" = "production" }
+
 [[clients]]
 access_key_id = "minioadmin"
 secret_access_key = "minioadmin"

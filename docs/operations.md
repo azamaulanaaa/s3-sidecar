@@ -120,87 +120,141 @@ key never existed.
 
 ## Metrics
 
-The sidecar serves Prometheus text at `GET /metrics` on `server.bind`.
-`GET /healthz` reports the process. `GET /readyz` reports readiness.
+The sidecar exports metrics with OpenTelemetry over OTLP. Export is off by
+default. There is no local metrics endpoint. `GET /healthz` reports the process.
+`GET /readyz` reports readiness.
 
-The renderer writes `# TYPE ... gauge` for each single-value series. Treat the
-logical type in the table below as the intended type. Use `rate()` only on a
-series that the table marks as a counter.
+Set `otel.enabled = true` to start export.
+
+```toml
+[otel]
+enabled = true
+service_name = "s3-sidecar"
+service_version = "0.1.0"
+endpoint = "http://127.0.0.1:4317"
+protocol = "grpc"                # grpc | http/protobuf
+headers = { "x-api-key" = "..." }
+timeout = "10s"
+export_interval = "60s"
+export_timeout = "10s"
+resource_attributes = { "deployment.environment.name" = "production" }
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `otel.enabled` | `false` | Send metrics over OTLP. |
+| `otel.service_name` | `s3-sidecar` | The `service.name` resource attribute. |
+| `otel.service_version` | `0.1.0` | The `service.version` resource attribute. |
+| `otel.endpoint` | unset | Collector URL. |
+| `otel.protocol` | `grpc` | `grpc` or `http/protobuf`. |
+| `otel.headers` | empty | OTLP request headers. Values are secret. |
+| `otel.headers_file` | unset | File with a JSON object of OTLP headers. |
+| `otel.timeout` | `10s` | Timeout for one export request. |
+| `otel.export_interval` | `60s` | Interval between exports. |
+| `otel.export_timeout` | `10s` | Bound for the final flush at shutdown. |
+| `otel.resource_attributes` | empty | Extra resource attributes. |
+
+Environment fallbacks apply when a setting is unset:
+
+| Setting | Fallback |
+|---|---|
+| `otel.endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `otel.headers` | `OTEL_EXPORTER_OTLP_HEADERS` |
+| `otel.service_name` | `OTEL_SERVICE_NAME`, then `s3-sidecar` |
+| `otel.protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL`, then `grpc` |
+| `otel.export_interval` | `OTEL_METRIC_EXPORT_INTERVAL`, then `60s` |
+
+The exporter adds `service.name`, `service.version`, and `service.instance.id`
+to the resource. `service.instance.id` is the cluster node id when present,
+otherwise the hostname. The SDK adds the `telemetry.sdk.*` attributes.
+
+For HTTP, use the HTTP collector port. The sidecar appends `/v1/metrics` to the
+configured endpoint when the path is not already present.
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+s3-sidecar serve --otel-enabled
+```
+
+All instrument names start with `s3_sidecar.` and use dots. The tables below
+use that prefix once per table.
 
 ### Cache
 
-| Metric | Type | Meaning |
-|---|---|---|
-| `s3_sidecar_cache_hits_total` | counter | Cache hits. |
-| `s3_sidecar_cache_misses_total` | counter | Cache misses. |
-| `s3_sidecar_cache_hit_ratio` | gauge | Hits divided by hits plus misses. |
-| `s3_sidecar_cache_bytes_served_total` | counter | Bytes sent to clients from the cache. |
-| `s3_sidecar_origin_bytes_fetched_total` | counter | Bytes fetched from origin. |
-| `s3_sidecar_cache_revalidations_total` | counter | Conditional origin requests that returned `304`. |
-| `s3_sidecar_cache_fallbacks_total` | counter | Cache failures that fell back to origin. |
-| `s3_sidecar_cache_pending_writes` | gauge | Pending write and delete journal entries. |
-| `s3_sidecar_cache_sync_lag_seconds` | gauge | Age of the oldest pending journal entry. |
-| `s3_sidecar_cache_sync_success_total` | counter | Syncs that reached origin. |
-| `s3_sidecar_cache_sync_failure_total` | counter | Sync attempts that failed. |
-| `s3_sidecar_cache_quarantine_total` | counter | Entries moved to quarantine. |
-| `s3_sidecar_cache_evictions_total` | counter | Cache entries removed by eviction. |
-| `s3_sidecar_cache_tracked_bytes` | gauge | Bytes tracked by the LRU index. |
-| `s3_sidecar_cache_max_bytes` | gauge | Configured cache limit. Zero means unlimited. |
-| `s3_sidecar_cache_unlimited` | gauge | One when the cache has no size limit. |
+| Metric | Type | Unit | Attributes | Meaning |
+|---|---|---|---|---|
+| `cache.hits` | counter | `1` | | Cache hits. |
+| `cache.misses` | counter | `1` | | Cache misses. |
+| `cache.bytes_served` | counter | `By` | | Bytes sent to clients from the cache. |
+| `cache.origin_bytes` | counter | `By` | | Bytes fetched from origin. |
+| `cache.revalidations` | counter | `1` | | Conditional origin requests that returned `304`. |
+| `cache.sync.success` | counter | `1` | | Syncs that reached origin. |
+| `cache.sync.failure` | counter | `1` | | Sync attempts that failed. |
+| `cache.quarantine` | counter | `1` | | Entries moved to quarantine. |
+| `cache.evictions` | counter | `1` | | Cache entries removed by eviction. |
+| `cache.fallbacks` | counter | `1` | | Cache failures that fell back to origin. |
+| `cache.pending_writes` | gauge | `1` | | Pending write and delete journal entries. |
+| `cache.sync_lag` | gauge | `s` | | Age of the oldest pending journal entry. |
+| `cache.tracked_bytes` | gauge | `By` | | Bytes tracked by the LRU index. |
+| `cache.max_bytes` | gauge | `By` | | Configured cache limit. Zero means unlimited. |
+| `cache.unlimited` | gauge | `1` | | One when the cache has no size limit. |
 
 ### Cluster data path
 
-| Metric | Type | Meaning |
-|---|---|---|
-| `s3_sidecar_cluster_committed_writes_total` | counter | Cluster writes that reached the committed state. |
-| `s3_sidecar_cluster_aborted_writes_total` | counter | Cluster writes that were rejected and removed. |
-| `s3_sidecar_cluster_commit_latency_micros_total` | counter | Total cluster commit latency in microseconds. |
-| `s3_sidecar_cluster_read_local_hits_total` | counter | Reads served from local metadata and a local blob. |
-| `s3_sidecar_cluster_missing_blob_reads_total` | counter | Reads where the blob was missing. |
-| `s3_sidecar_cluster_tombstones` | gauge | Current cluster tombstone count. |
-| `s3_sidecar_cluster_gc_deletions_total` | counter | Blobs removed by cluster garbage collection. |
-| `s3_sidecar_cluster_applied_index` | gauge | Applied metadata index. |
-| `s3_sidecar_cluster_term` | gauge | Current coordinator term. |
-| `s3_sidecar_cluster_read_index_calls_total` | counter | Calls to the coordinator read index. |
-| `s3_sidecar_cluster_peer_fetches_total` | counter | Reads served by a peer blob fetch. |
-| `s3_sidecar_cluster_read_repairs_total` | counter | Peer reads that stored the blob locally. |
-| `s3_sidecar_cluster_replication_success_total` | counter | Replication operations that reached a target. |
-| `s3_sidecar_cluster_replication_queue_depth` | gauge | Pending replication jobs. |
-| `s3_sidecar_cluster_replication_oldest_age_seconds` | gauge | Age of the oldest pending replication job in seconds. |
-| `s3_sidecar_cluster_reconcile_checked_total` | gauge | Replica targets checked by the last reconciliation pass. |
-| `s3_sidecar_cluster_reconcile_present_total` | gauge | Replica targets present during the last reconciliation pass. |
-| `s3_sidecar_cluster_reconcile_missing_total` | gauge | Replica targets missing during the last reconciliation pass. |
-| `s3_sidecar_cluster_owner_blobs_repaired_total` | counter | Owner blobs restored by reconciliation. |
-| `s3_sidecar_cluster_owner_blobs_unrecoverable_total` | counter | Owner blobs that no replica could supply. |
-| `s3_sidecar_cluster_quorum_success_total` | counter | Quorum writes that reached the required acknowledgements. |
-| `s3_sidecar_cluster_quorum_failure_total` | counter | Quorum writes that did not reach the required acknowledgements. |
-| `s3_sidecar_cluster_sync_replication_latency_micros_total` | counter | Total synchronous replication latency in microseconds. |
-| `s3_sidecar_cluster_sync_replication_count_total` | counter | Synchronous peer copy attempts. |
-| `s3_sidecar_cluster_replica_acks_total` | counter | Peer copies that acknowledged the blob. |
-| `s3_sidecar_cluster_replica_ack_failures_total` | counter | Peer copies that failed or timed out. |
-| `s3_sidecar_cluster_write_ack_total{policy}` | counter | Accepted writes by acknowledgement policy. |
-| `s3_sidecar_cluster_replication_failures_total{status}` | counter | Replication failures by status or transport class. |
+| Metric | Type | Unit | Attributes | Meaning |
+|---|---|---|---|---|
+| `cluster.committed_writes` | counter | `1` | | Cluster writes that reached the committed state. |
+| `cluster.aborted_writes` | counter | `1` | | Cluster writes that were rejected and removed. |
+| `cluster.commit.duration` | histogram | `ms` | | Duration of one cluster commit. |
+| `cluster.read_local_hits` | counter | `1` | | Reads served from local metadata and a local blob. |
+| `cluster.missing_blob_reads` | counter | `1` | | Reads where the blob was missing. |
+| `cluster.tombstones` | gauge | `1` | | Current cluster tombstone count. |
+| `cluster.gc_deletions` | counter | `1` | | Blobs removed by cluster garbage collection. |
+| `cluster.applied_index` | gauge | `1` | | Applied metadata index. |
+| `cluster.term` | gauge | `1` | | Current coordinator term. |
+| `cluster.read_index_calls` | counter | `1` | | Calls to the coordinator read index. |
+| `cluster.peer_fetches` | counter | `1` | | Reads served by a peer blob fetch. |
+| `cluster.read_repairs` | counter | `1` | | Peer reads that stored the blob locally. |
+| `cluster.replication.success` | counter | `1` | | Replication operations that reached a target. |
+| `cluster.replication.failures` | counter | `1` | `status` | Replication failures by status or transport class. |
+| `cluster.replication.queue_depth` | gauge | `1` | | Pending replication jobs. |
+| `cluster.replication.oldest_age` | gauge | `s` | | Age of the oldest pending replication job. |
+| `cluster.reconcile.checked` | counter | `1` | | Replica targets checked by reconciliation. |
+| `cluster.reconcile.present` | counter | `1` | | Replica targets present during reconciliation. |
+| `cluster.reconcile.missing` | counter | `1` | | Replica targets missing during reconciliation. |
+| `cluster.owner_blobs.repaired` | counter | `1` | | Owner blobs restored by reconciliation. |
+| `cluster.owner_blobs.unrecoverable` | counter | `1` | | Owner blobs that no replica could supply. |
+| `cluster.write_ack` | counter | `1` | `policy` | Accepted writes by acknowledgement policy. |
+| `cluster.quorum.success` | counter | `1` | | Quorum writes that reached the required acknowledgements. |
+| `cluster.quorum.failure` | counter | `1` | | Quorum writes that did not reach the required acknowledgements. |
+| `cluster.sync_replication.duration` | histogram | `ms` | | Duration of one synchronous peer copy. |
+| `cluster.replica_acks` | counter | `1` | | Peer copies that acknowledged the blob. |
+| `cluster.replica_ack_failures` | counter | `1` | | Peer copies that failed or timed out. |
 
 ### Raft
 
-| Metric | Type | Meaning |
-|---|---|---|
-| `s3_sidecar_raft_term` | gauge | Current raft term. |
-| `s3_sidecar_raft_leader{id}` | gauge | One for the current leader name. |
-| `s3_sidecar_raft_last_log_index` | gauge | Last raft log index. |
-| `s3_sidecar_raft_last_applied` | gauge | Last applied raft log index. |
-| `s3_sidecar_raft_snapshot_index` | gauge | Last snapshot raft log index. |
-| `s3_sidecar_raft_elections_total` | counter | Observed raft leader elections. |
+| Metric | Type | Unit | Attributes | Meaning |
+|---|---|---|---|---|
+| `raft.term` | gauge | `1` | | Current raft term. |
+| `raft.leader` | gauge | `1` | `id` | One for the current leader. Zero with `id=""` when there is no leader. |
+| `raft.last_log_index` | gauge | `1` | | Last raft log index. |
+| `raft.last_applied` | gauge | `1` | | Last applied raft log index. |
+| `raft.snapshot_index` | gauge | `1` | | Last snapshot raft log index. |
+| `raft.elections` | counter | `1` | | Observed raft leader elections. |
 
 ### Consul
 
-| Metric | Type | Meaning |
-|---|---|---|
-| `s3_sidecar_consul_leader{id}` | gauge | One for the current Consul leader name. |
-| `s3_sidecar_consul_materialized` | gauge | One when the first Consul reconcile completed. |
-| `s3_sidecar_consul_session_renewals_total` | counter | Successful Consul session renewals. |
-| `s3_sidecar_consul_session_losses_total` | counter | Consul sessions that ended or failed to renew. |
-| `s3_sidecar_consul_leader_changes_total` | counter | Consul leadership acquisitions. |
+| Metric | Type | Unit | Attributes | Meaning |
+|---|---|---|---|---|
+| `consul.leader` | gauge | `1` | `id` | One for the current leader. Zero with `id=""` when there is no leader. |
+| `consul.materialized` | gauge | `1` | | One when the first Consul reconcile completed. |
+| `consul.session.renewals` | counter | `1` | | Successful Consul session renewals. |
+| `consul.session.losses` | counter | `1` | | Consul sessions that ended or failed to renew. |
+| `consul.leader.changes` | counter | `1` | | Consul leadership acquisitions. |
+
+The exporter logs a warning when an export fails. Export failure does not stop
+the sidecar. Shutdown flushes pending metrics before the process exits.
 
 ## Sizing
 

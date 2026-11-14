@@ -20,7 +20,8 @@ single-node foundation of M2 (coordination):
   materialized `redb` cache, and a blocking-query watcher.
 - Asynchronous blob replication to a deterministic replica set, peer blob
   fetch, read repair, delete propagation, and replica reconciliation.
-- Health, readiness, and Prometheus metrics endpoints.
+- Health and readiness endpoints.
+- OpenTelemetry metrics export over OTLP.
 - `s3-sidecar check --show-config` with redacted secrets and field sources.
 
 Raft and Consul replicate metadata. Each node also copies blobs to its intended
@@ -233,6 +234,44 @@ s3-sidecar serve --server-bind 0.0.0.0:9001 \
 The convenience flag `--bucket media` adds a bucket name. Repeat it to add
 more buckets.
 
+### OpenTelemetry metrics
+
+Metrics export is off by default. Set `otel.enabled = true` to send metrics to
+an OTLP collector.
+
+```toml
+[otel]
+enabled = true
+service_name = "s3-sidecar"
+service_version = "0.1.0"
+endpoint = "http://127.0.0.1:4317"
+protocol = "grpc"                # grpc | http/protobuf
+timeout = "10s"
+export_interval = "60s"
+export_timeout = "10s"
+resource_attributes = { "deployment.environment.name" = "production" }
+```
+
+For HTTP, set `protocol = "http/protobuf"` and use the HTTP collector port.
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+s3-sidecar serve --otel-enabled --config sidecar.toml
+```
+
+An unset `otel.endpoint` uses `OTEL_EXPORTER_OTLP_ENDPOINT`. An unset
+`otel.protocol` uses `OTEL_EXPORTER_OTLP_PROTOCOL`, then `grpc`. An unset
+`otel.export_interval` uses `OTEL_METRIC_EXPORT_INTERVAL`, then `60s`.
+
+Use `otel.headers` or `otel.headers_file` for collector authentication. The
+headers file contains a JSON object. `check --show-config` redacts header values.
+
+```toml
+[otel.headers]
+"x-api-key" = "..."
+```
+
 ### Secrets
 
 Do not put a secret in `argv`. Use one of these forms:
@@ -413,16 +452,20 @@ references.
 
 ### Metrics
 
-`GET /metrics` returns Prometheus text. It exports:
+Metrics export over OTLP when `otel.enabled = true`. The sidecar sends the
+`cache.*`, `cluster.*`, `raft.*`, and `consul.*` instruments that
+[docs/operations.md](docs/operations.md) lists. There is no local metrics
+endpoint.
 
-- cache hits, misses, and hit ratio
-- bytes served from cache and bytes fetched from origin
+Cache metrics cover:
+
+- cache hits, misses, bytes served, and origin bytes
 - revalidations and cache fallbacks
 - pending writes and sync lag in seconds
 - sync success and failure counts
 - quarantine count
 - evictions and tracked bytes
-- `cache_max_bytes` (`0` means unlimited) and `cache_unlimited`
+- cache size limit and unlimited state
 
 ## Cluster mode
 
