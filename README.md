@@ -185,6 +185,11 @@ retry_attempts = 2
 - An upstream timeout returns `504 RequestTimeout` in S3 XML.
 - A client disconnect cancels the request task and the matching upstream
   request.
+- The sidecar streams a request body and does not buffer it. A body with no
+  `Content-Length` and no `Transfer-Encoding` is forwarded. This applies to
+  HTTP/2 requests.
+- A write-back `PUT` with no `Content-Length` goes to origin, because the sync
+  worker cannot replay the body.
 
 ### Retry policy and request identifiers
 
@@ -248,7 +253,7 @@ metrics = true
 traces = true
 logs = true
 trace_sample_ratio = 1.0        # 0.0 disables root traces.
-record_object_keys = false      # Redact object keys in spans. Off for privacy.
+record_object_keys = false      # Redact object keys in spans and logs. Off for privacy.
 service_name = "s3-sidecar"
 service_version = "0.1.0"
 endpoint = "http://127.0.0.1:4317"
@@ -283,7 +288,9 @@ A trace starts at `s3.request`. The sidecar extracts W3C `traceparent` and
 S3, cache, peer, raft, and Consul request. Log records carry the trace and span
 ids of the current span. `record_object_keys = false` redacts the object part
 of `url.path` as `/{bucket}/[redacted]` on server and upstream spans and omits
-`s3.object.key`. Control paths are unchanged. See the operations guide for the
+`s3.object.key`. Control paths are unchanged. The setting also redacts the
+`path` field in the request log and the object key fields in the cache sync,
+orphan, eviction, journal, and quarantine logs. See the operations guide for the
 span and attribute list and the object-key privacy note.
 
 Use `otel.headers` or `otel.headers_file` for collector authentication. The
@@ -335,6 +342,12 @@ name an allowed source bucket.
 each chunk signature. The unsigned trailer mode does not verify the payload.
 Do not use it without TLS.
 
+If a `[[clients]]` entry has `session_token`, the request must send the same
+token. Header authentication reads `x-amz-security-token`. Presigned
+authentication reads `X-Amz-Security-Token` from the query. A missing or wrong
+token returns `403 Forbidden` with code `InvalidToken`. A client entry with no
+configured token ignores a supplied token.
+
 ## Cache mode
 
 The cache is a second S3 endpoint. Use a different endpoint, region, or
@@ -366,6 +379,14 @@ not process each other's journals.
 `read` mode is a pure read cache. `write` mode is a write buffer.
 `read_write` does both.
 
+### Server-side encryption with customer keys
+
+Cache mode `write` and `read_write` reject a request that carries SSE-C headers
+with `501 NotImplemented`. The sidecar cannot store the customer key safely.
+Cache mode `read` keeps the cache out of the path and forwards the request to
+origin. Cache mode `off` forwards the request unchanged. Pure proxy mode is the
+supported way to use SSE-C.
+
 ### Read path
 
 A fresh entry is served without an origin request. A stale entry sends a
@@ -384,6 +405,31 @@ response. A client disconnect cancels the cache write. A bounded channel
 applies backpressure from the cache to the client stream.
 
 `HEAD` serves metadata only. It never fills a cache body.
+
+### Object headers
+
+The cache persists and replays a fixed allowlist of object headers:
+`x-amz-meta-*`, `Content-Type`, `Content-Encoding`, `Content-Disposition`,
+`Cache-Control`, `Content-Language`, `Expires`, and `x-amz-storage-class`.
+
+The headers survive a cache fill, a cached `GET` or `HEAD`, a write-back sync,
+and a write-through write. The cache does not store object tags, object lock
+headers, website redirect headers, or encryption headers.
+
+### Conditional requests
+
+A cached `GET` or `HEAD` evaluates client conditions against the cached entry.
+`If-None-Match` and `If-Modified-Since` return `304 Not Modified` when the
+condition says not modified. `If-Match` and `If-Unmodified-Since` return
+`412 PreconditionFailed` when the condition fails. A stale entry with a client
+condition goes to origin. Revalidation adds `If-None-Match` only when the client
+did not send one.
+
+A write-back `PUT` checks `If-None-Match` and `If-Match` against the cached
+entry. If the cache has no entry, the sidecar sends the request to origin so
+origin checks the condition. A write-back `DELETE` checks `If-Match` against the
+cached entry. If the cache has no entry, the sidecar sends the request to
+origin.
 
 ### Write-back contract
 
@@ -776,6 +822,21 @@ The replica set starts with the owner. The other members are chosen from
 `cluster.nodes` by a hash of `bucket/key`. The same key always selects the same
 peers.
 
+### Object headers
+
+Cluster mode preserves `Content-Language`, `Expires`, and `x-amz-storage-class`
+on `PutObject`, on `CopyObject` with `COPY` or `REPLACE`, and on multipart
+upload. `GetObject` and `HeadObject` return the headers. The sidecar omits
+`x-amz-storage-class` for `STANDARD`.
+
+### Encryption headers
+
+Cluster mode rejects a server-side encryption request header with
+`501 NotImplemented`. This covers SSE-C and SSE-S3 or SSE-KMS headers. The
+rejection applies to `PutObject`, `CopyObject`, `CreateMultipartUpload`,
+`UploadPart`, and `CompleteMultipartUpload`. The backing bucket must use default
+encryption.
+
 ### Read and list path
 
 GET and HEAD resolve metadata from the applied state. A committed key with a
@@ -997,8 +1058,8 @@ and is not part of the pull request gate.
 - `bootstrap = true` belongs on one node. A restart of that node keeps the
   existing cluster. A fresh second node with `bootstrap = false` waits for the
   leader and does not form a cluster alone.
-- Multipart and CopyObject pass through to origin. The sidecar does not cache
-  multipart parts.
+- In cache mode, multipart and CopyObject pass through to origin. The sidecar
+  does not cache multipart parts.
 - The TLS listener serves one certificate. Client certificate authentication and
   automatic certificate reload are not implemented.
 - The sidecar retries only idempotent requests. It never replays a request body.
@@ -1014,6 +1075,26 @@ and is not part of the pull request gate.
   the upstream request, but the upstream can receive the full body first.
 - The readiness endpoint reports the sidecar process, not the origin.
 - `ListBuckets` is not supported.
+- A cache entry is two S3 objects: a blob and a metadata object. There is no
+  atomic switch between them. A different sidecar that reads the shared cache
+  bucket during a write can observe old metadata with new bytes. The accepting
+  sidecar hides the window after it installs the pending entry. A read before
+  that install can still observe the mix.
+- Cache mode does not evaluate `If-Range`. A conditional range request can
+  return `206 PartialContent` when the validator does not match.
+- The cache header allowlist is fixed. The cache does not preserve object tags,
+  object lock headers, website redirect headers, or encryption headers.
+- SSE-C works only in pure proxy mode, or in cache mode `read` where the cache
+  is bypassed. Cache write modes return `501 NotImplemented`.
+- Cluster mode requires default encryption on the backing bucket. Client
+  encryption headers are not supported.
+- Cluster mode rejects encryption headers on `PutObject`, `CopyObject`,
+  `CreateMultipartUpload`, `UploadPart`, and `CompleteMultipartUpload`.
+- There is no local metrics endpoint. Metrics export over OTLP only.
+- A slow client can hold a connection permit for a long time. The idle timeout
+  bounds only the gap between chunks. There is no total response deadline.
+- Object tagging, versioning, ACLs, bucket policies, and `Select` are not
+  supported.
 
 ## Design choices
 
@@ -1027,7 +1108,7 @@ and is not part of the pull request gate.
 
 `tests/proxy.rs` runs the full proxy path against an in-process fake origin.
 It covers streaming, ranges, list, multipart, copy, presigned URLs, invalid
-credentials, and the bucket allow-list.
+credentials, the bucket allow-list, and `.` and `..` segments in object keys.
 
 `tests/runtime.rs` covers the TLS handshake with a self-signed certificate,
 TLS startup rejection, graceful drain and shutdown timeout, `413` from a
@@ -1037,19 +1118,21 @@ retry after `503`, no retry for a streamed PUT body, and request identifiers.
 `tests/cache.rs` runs cache mode against an in-process fake origin and fake
 cache. It covers repeat reads, TTL revalidation, pending read-your-write,
 restart recovery, retry, quarantine, delete of a pending write, coalescing,
-cache-outage fallback, eviction, and the metrics endpoint.
+cache-outage fallback, eviction, the metrics endpoint, object header
+persistence, conditional requests, and SSE-C rejection and bypass.
 
 `tests/cluster.rs` runs single-node cluster mode against an in-process fake
 backing S3. It covers PUT, GET, HEAD, DELETE, ListObjectsV2, conditional writes,
-CopyObject, tombstones, restart persistence, multipart, wrong-node upload ids,
-leader reads, bucket config seeding, GC, and startup validation.
+CopyObject, object headers, encryption rejection, tombstones, restart
+persistence, multipart, wrong-node upload ids, leader reads, bucket config
+seeding, GC, and startup validation.
 
 `tests/replication.rs` runs a three-node raft cluster and a two-node single
 backend. It covers replica placement, blob copy, local and peer reads, read
 repair on and off, a read with no replica, delete propagation, restart resume,
-the blob transport token, the `409` reference check, `Range`, the replication
-queue, quorum writes after raft leader loss, and a write without a metadata
-quorum.
+the blob transport token, invalid blob identifiers, the `409` reference check,
+`Range`, the replication queue, quorum writes after raft leader loss, and a
+write without a metadata quorum.
 
 `tests/consistency.rs` runs Consul clusters with an in-memory authority. It
 covers the write acknowledgement matrix: quorum with one peer down, quorum and
