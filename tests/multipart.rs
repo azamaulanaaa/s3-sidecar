@@ -804,6 +804,53 @@ async fn client_multipart_abort_removes_cache_state() {
 }
 
 #[tokio::test]
+async fn client_multipart_write_back_rejects_object_above_cache_limit() {
+    let (origin_url, _origin) = support::fake_s3::spawn().await;
+    let (cache_url, cache) = support::fake_s3::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = multipart_cache_config(
+        &origin_url,
+        &cache_url,
+        &dir.path().join("index.redb"),
+        CacheMode::ReadWrite,
+        WritePolicy::WriteBack,
+    );
+    config.cache.max_object_bytes = 64;
+    let sidecar = spawn_sidecar(config).await;
+    let client = reqwest::Client::new();
+    let upload_id = client_create_upload(&client, &sidecar.url).await;
+    let etag_one = client_upload_part(&client, &sidecar.url, &upload_id, 1, vec![8_u8; 40]).await;
+    let over_limit = signed_request(
+        &client,
+        Method::PUT,
+        &format!(
+            "{}/media/item?partNumber=2&uploadId={upload_id}",
+            sidecar.url
+        ),
+        Some(vec![9_u8; 40]),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(over_limit.status(), reqwest::StatusCode::BAD_REQUEST);
+    let error = over_limit.text().await.unwrap();
+    assert!(error.contains("<Code>EntityTooLarge</Code>"));
+    assert_eq!(cache.completes(), 0);
+    assert_eq!(cache.keys(), Vec::<String>::new());
+    let complete = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media/item?uploadId={upload_id}", sidecar.url),
+        Some(complete_xml(&[(1, etag_one)])),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(!complete.status().is_success());
+    sidecar.stop().await;
+}
+
+#[tokio::test]
 async fn cache_write_back_sync_uses_multipart() {
     let (origin_url, origin) = support::fake_s3::spawn().await;
     let (cache_url, cache) = support::fake_s3::spawn().await;
