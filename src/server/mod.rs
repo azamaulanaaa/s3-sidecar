@@ -1053,6 +1053,11 @@ async fn read_path(
     if let Some(meta) = cache.pending_entry(bucket, key) {
         lookup.record("cache.hit", true);
         lookup.record("cache.entry.state", meta.state.as_str());
+        match evaluate_read_conditions(headers, &meta) {
+            CacheCondition::NotModified => return Ok(not_modified_response(&meta)),
+            CacheCondition::Failed => return Err(precondition_failed()),
+            CacheCondition::Ok => {}
+        }
         match serve_cached(state, cache, method, range.as_deref(), &meta, bucket, key).await {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
@@ -1124,7 +1129,13 @@ async fn read_path(
     lookup.record("cache.entry.state", meta.state.as_str());
 
     let ttl = cache.ttl_for(bucket);
-    if meta.is_fresh(unix_now(), ttl) || meta.state == EntryState::Failed {
+    let fresh = meta.is_fresh(unix_now(), ttl) || meta.state == EntryState::Failed;
+    if fresh {
+        match evaluate_read_conditions(headers, &meta) {
+            CacheCondition::NotModified => return Ok(not_modified_response(&meta)),
+            CacheCondition::Failed => return Err(precondition_failed()),
+            CacheCondition::Ok => {}
+        }
         match serve_cached(state, cache, method, range.as_deref(), &meta, bucket, key).await {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
@@ -1135,9 +1146,9 @@ async fn read_path(
                 state.metrics.fallback();
             }
         }
-    } else if range.is_some() {
-        // A range is only served from a fresh complete entry. A stale entry
-        // passes the range to origin and does not cache the partial body.
+    } else if range.is_some() || has_client_condition(headers) {
+        // A condition or a range is only served from a fresh complete entry.
+        // The stale entry does not answer it.
         state.metrics.miss();
         return origin_read(
             state,
@@ -1197,6 +1208,7 @@ async fn origin_read(
     let mut request_headers = headers.clone();
     if let Some(meta) = revalidate
         && !meta.etag.is_empty()
+        && !request_headers.contains_key(header::IF_NONE_MATCH)
         && let Ok(value) = HeaderValue::from_str(&meta.etag)
     {
         request_headers.insert(header::IF_NONE_MATCH, value);
@@ -1237,6 +1249,11 @@ async fn origin_read(
             let range = headers
                 .get(header::RANGE)
                 .and_then(|value| value.to_str().ok());
+            match evaluate_read_conditions(headers, &meta) {
+                CacheCondition::NotModified => return Ok(not_modified_response(&meta)),
+                CacheCondition::Failed => return Err(precondition_failed()),
+                CacheCondition::Ok => {}
+            }
             if let Ok(Some(response)) =
                 serve_cached(state, cache, method, range, &meta, bucket, key).await
             {
@@ -1539,7 +1556,7 @@ fn response_from_stream(
 }
 
 // The write path needs the request context and the cache policy.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn write_put(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -1562,6 +1579,37 @@ async fn write_put(
             path_and_query,
         )
         .await;
+    }
+
+    let if_none_match = header_string(headers, header::IF_NONE_MATCH);
+    let if_match = header_string(headers, header::IF_MATCH);
+    if if_none_match.is_some() || if_match.is_some() {
+        if let Some(meta) = cached_metadata(cache, bucket, key).await {
+            if let Some(condition) = &if_none_match
+                && etag_condition_matches(condition, &meta.etag)
+            {
+                return Err(precondition_failed());
+            }
+            if let Some(condition) = &if_match
+                && !etag_condition_matches(condition, &meta.etag)
+            {
+                return Err(precondition_failed());
+            }
+        } else {
+            // Origin must evaluate the condition. The cache has no entry.
+            let response = proxy_request(
+                state,
+                &Method::PUT,
+                credential,
+                prepared,
+                path_and_query.to_owned(),
+            )
+            .await?;
+            if response.status().is_success() {
+                cache.invalidate(bucket, key).await;
+            }
+            return Ok(response);
+        }
     }
 
     let Some(length) = prepared.content_length else {
@@ -1644,7 +1692,6 @@ async fn write_put(
     if let Ok(value) = HeaderValue::from_str(&meta.etag) {
         response.headers_mut().insert(header::ETAG, value);
     }
-    let _ = headers;
     Ok(response)
 }
 
@@ -1779,6 +1826,27 @@ async fn write_delete(
     key: &str,
     path_and_query: &str,
 ) -> Result<Response, S3Error> {
+    if let Some(condition) = header_string(&prepared.headers, header::IF_MATCH) {
+        if let Some(meta) = cached_metadata(cache, bucket, key).await {
+            if !etag_condition_matches(&condition, &meta.etag) {
+                return Err(precondition_failed());
+            }
+        } else {
+            // The cache cannot evaluate the condition. Origin must do it.
+            let response = proxy_request(
+                state,
+                method,
+                credential,
+                prepared,
+                path_and_query.to_owned(),
+            )
+            .await?;
+            if response.status().is_success() {
+                cache.invalidate(bucket, key).await;
+            }
+            return Ok(response);
+        }
+    }
     if cache.pending_entry(bucket, key).is_some() {
         cache
             .delete_pending(bucket, key)
