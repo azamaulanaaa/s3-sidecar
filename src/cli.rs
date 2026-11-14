@@ -247,6 +247,39 @@ pub struct ConfigFlags {
     /// Cluster nodes as a JSON array.
     #[arg(long = "cluster-nodes-json", value_name = "JSON")]
     pub cluster_nodes_json: Option<String>,
+    /// Export metrics over OTLP.
+    #[arg(long = "otel-enabled")]
+    pub otel_enabled: bool,
+    /// Service name for exported telemetry.
+    #[arg(long = "otel-service-name", value_name = "NAME")]
+    pub otel_service_name: Option<String>,
+    /// Service version for exported telemetry.
+    #[arg(long = "otel-service-version", value_name = "VERSION")]
+    pub otel_service_version: Option<String>,
+    /// OTLP collector URL.
+    #[arg(long = "otel-endpoint", value_name = "URL")]
+    pub otel_endpoint: Option<String>,
+    /// OTLP transport: `grpc` or `http/protobuf`.
+    #[arg(long = "otel-protocol", value_name = "PROTOCOL")]
+    pub otel_protocol: Option<String>,
+    /// OTLP request headers as a JSON object.
+    #[arg(long = "otel-headers-json", value_name = "JSON")]
+    pub otel_headers_json: Option<String>,
+    /// File that contains a JSON object of OTLP request headers.
+    #[arg(long = "otel-headers-file", value_name = "PATH")]
+    pub otel_headers_file: Option<PathBuf>,
+    /// Timeout for one OTLP export request.
+    #[arg(long = "otel-timeout", value_name = "DURATION")]
+    pub otel_timeout: Option<String>,
+    /// Interval between metrics exports.
+    #[arg(long = "otel-export-interval", value_name = "DURATION")]
+    pub otel_export_interval: Option<String>,
+    /// Bound for the final flush during shutdown.
+    #[arg(long = "otel-export-timeout", value_name = "DURATION")]
+    pub otel_export_timeout: Option<String>,
+    /// OTLP resource attributes as a JSON object.
+    #[arg(long = "otel-resource-attributes-json", value_name = "JSON")]
+    pub otel_resource_attributes_json: Option<String>,
     /// Buckets as a JSON array.
     #[arg(long = "buckets-json", value_name = "JSON")]
     pub buckets_json: Option<String>,
@@ -661,6 +694,74 @@ impl ConfigFlags {
             set(&mut object, &["cluster", "nodes"], parsed);
         }
 
+        if self.otel_enabled {
+            set(&mut object, &["otel", "enabled"], Value::Bool(true));
+        }
+        if let Some(value) = &self.otel_service_name {
+            set(
+                &mut object,
+                &["otel", "service_name"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.otel_service_version {
+            set(
+                &mut object,
+                &["otel", "service_version"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.otel_endpoint {
+            set(
+                &mut object,
+                &["otel", "endpoint"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.otel_protocol {
+            set(
+                &mut object,
+                &["otel", "protocol"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.otel_headers_json {
+            let parsed = parse_json_object("--otel-headers-json", value)?;
+            set(&mut object, &["otel", "headers"], parsed);
+        }
+        if let Some(path) = &self.otel_headers_file {
+            set(
+                &mut object,
+                &["otel", "headers_file"],
+                Value::String(path.display().to_string()),
+            );
+        }
+        if let Some(value) = &self.otel_timeout {
+            set(
+                &mut object,
+                &["otel", "timeout"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.otel_export_interval {
+            set(
+                &mut object,
+                &["otel", "export_interval"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.otel_export_timeout {
+            set(
+                &mut object,
+                &["otel", "export_timeout"],
+                Value::String(value.clone()),
+            );
+        }
+        if let Some(value) = &self.otel_resource_attributes_json {
+            let parsed = parse_json_object("--otel-resource-attributes-json", value)?;
+            set(&mut object, &["otel", "resource_attributes"], parsed);
+        }
+
         if let Some(value) = &self.buckets_json {
             let parsed = parse_json_array("--buckets-json", value)?;
             set(&mut object, &["buckets"], parsed);
@@ -735,6 +836,21 @@ fn parse_json_array(name: &str, value: &str) -> Result<Value, ConfigError> {
         Err(ConfigError::FlagsType {
             name: name.to_owned(),
             expected: "array".to_owned(),
+        })
+    }
+}
+
+fn parse_json_object(name: &str, value: &str) -> Result<Value, ConfigError> {
+    let parsed: Value = serde_json::from_str(value).map_err(|source| ConfigError::FlagsJson {
+        name: name.to_owned(),
+        source,
+    })?;
+    if parsed.is_object() {
+        Ok(parsed)
+    } else {
+        Err(ConfigError::FlagsType {
+            name: name.to_owned(),
+            expected: "object".to_owned(),
         })
     }
 }

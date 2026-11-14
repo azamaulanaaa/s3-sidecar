@@ -390,6 +390,83 @@ pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
         serde_json::to_string(&config.cluster.nodes).unwrap_or_else(|_| "[]".to_owned()),
     );
 
+    push_row(
+        &mut rows,
+        sources,
+        "otel.enabled",
+        config.otel.enabled.to_string(),
+    );
+    push_optional(
+        &mut rows,
+        sources,
+        "otel.service_name",
+        config.otel.service_name.clone().unwrap_or_default(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.service_version",
+        config.otel.service_version.clone(),
+    );
+    push_optional(
+        &mut rows,
+        sources,
+        "otel.endpoint",
+        config.otel.endpoint.clone().unwrap_or_default(),
+    );
+    push_optional(
+        &mut rows,
+        sources,
+        "otel.protocol",
+        config
+            .otel
+            .protocol
+            .map_or_else(String::new, |value| value.to_string()),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.headers",
+        redacted_headers(&config.otel.headers),
+    );
+    push_optional(
+        &mut rows,
+        sources,
+        "otel.headers_file",
+        config
+            .otel
+            .headers_file
+            .as_ref()
+            .map_or_else(String::new, |path| path.display().to_string()),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.timeout",
+        config.otel.timeout.to_string(),
+    );
+    push_optional(
+        &mut rows,
+        sources,
+        "otel.export_interval",
+        config
+            .otel
+            .export_interval
+            .map_or_else(String::new, |value| value.to_string()),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.export_timeout",
+        config.otel.export_timeout.to_string(),
+    );
+    push_row(
+        &mut rows,
+        sources,
+        "otel.resource_attributes",
+        serde_json::to_string(&config.otel.resource_attributes).unwrap_or_else(|_| "{}".to_owned()),
+    );
+
     if config.clients.is_empty() {
         push_row(&mut rows, sources, "clients", "[]".to_owned());
     } else {
@@ -602,4 +679,14 @@ fn source_at(sources: &SourceMap, field: &str) -> Option<Source> {
 
 fn redact_option(value: Option<&super::secret::SecretString>) -> String {
     value.map_or_else(String::new, |secret| secret.redacted().to_owned())
+}
+
+fn redacted_headers(
+    headers: &std::collections::BTreeMap<String, super::secret::SecretString>,
+) -> String {
+    let redacted: std::collections::BTreeMap<&str, &str> = headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.redacted()))
+        .collect();
+    serde_json::to_string(&redacted).unwrap_or_else(|_| "{}".to_owned())
 }

@@ -108,6 +108,8 @@ pub fn load(options: &LoadOptions) -> Result<LoadedConfig, ConfigError> {
 
     let config: Config = serde_json::from_value(merged)
         .map_err(|error| ConfigError::Deserialize(error.to_string()))?;
+    let mut config = config;
+    load_otel_headers(&mut config)?;
     let warnings = validate(&config)?;
 
     Ok(LoadedConfig {
@@ -116,6 +118,42 @@ pub fn load(options: &LoadOptions) -> Result<LoadedConfig, ConfigError> {
         config_path,
         warnings,
     })
+}
+
+fn load_otel_headers(config: &mut Config) -> Result<(), ConfigError> {
+    let Some(path) = config.otel.headers_file.clone() else {
+        return Ok(());
+    };
+    let text = fs::read_to_string(&path).map_err(|source| ConfigError::ReadHeaders {
+        path: path.clone(),
+        source,
+    })?;
+    let value: Value = serde_json::from_str(&text).map_err(|error| {
+        ConfigError::invalid(format!(
+            "OTLP headers file {} is not valid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    let Value::Object(headers) = value else {
+        return Err(ConfigError::invalid(format!(
+            "OTLP headers file {} must contain a JSON object",
+            path.display()
+        )));
+    };
+    for (name, value) in headers {
+        let Some(value) = value.as_str() else {
+            return Err(ConfigError::invalid(format!(
+                "OTLP header \"{name}\" in {} must be a string",
+                path.display()
+            )));
+        };
+        config
+            .otel
+            .headers
+            .entry(name)
+            .or_insert_with(|| SecretString::new(value));
+    }
+    Ok(())
 }
 
 fn index_env(env: &[(String, String)]) -> HashMap<String, String> {
@@ -325,6 +363,17 @@ fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
         "CLUSTER__REPLICATE_TIMEOUT" => (EnvKind::Text, vec!["cluster", "replicate_timeout"]),
         "CLUSTER__RECONCILE_INTERVAL" => (EnvKind::Text, vec!["cluster", "reconcile_interval"]),
         "CLUSTER__NODES" => (EnvKind::Json, vec!["cluster", "nodes"]),
+        "OTEL__ENABLED" => (EnvKind::Bool, vec!["otel", "enabled"]),
+        "OTEL__SERVICE_NAME" => (EnvKind::Text, vec!["otel", "service_name"]),
+        "OTEL__SERVICE_VERSION" => (EnvKind::Text, vec!["otel", "service_version"]),
+        "OTEL__ENDPOINT" => (EnvKind::Text, vec!["otel", "endpoint"]),
+        "OTEL__PROTOCOL" => (EnvKind::Text, vec!["otel", "protocol"]),
+        "OTEL__HEADERS" => (EnvKind::Json, vec!["otel", "headers"]),
+        "OTEL__HEADERS_FILE" => (EnvKind::Text, vec!["otel", "headers_file"]),
+        "OTEL__TIMEOUT" => (EnvKind::Text, vec!["otel", "timeout"]),
+        "OTEL__EXPORT_INTERVAL" => (EnvKind::Text, vec!["otel", "export_interval"]),
+        "OTEL__EXPORT_TIMEOUT" => (EnvKind::Text, vec!["otel", "export_timeout"]),
+        "OTEL__RESOURCE_ATTRIBUTES" => (EnvKind::Json, vec!["otel", "resource_attributes"]),
         "CLIENTS" => (EnvKind::Json, vec!["clients"]),
         "BUCKETS" => (EnvKind::Json, vec!["buckets"]),
         _ => return None,
@@ -454,6 +503,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{LoadOptions, Source, load};
+    use crate::config::secret::SecretString;
 
     fn load_with(
         dir: &std::path::Path,
@@ -706,6 +756,54 @@ buckets = ["media"]
         let env = vec![("S3_SIDECAR_BUCKETS".to_owned(), "not-json".to_owned())];
         let error = load_with(dir.path(), None, env, json!({})).unwrap_err();
         assert!(error.to_string().contains("S3_SIDECAR_BUCKETS"));
+    }
+
+    #[test]
+    fn otel_headers_file_environment_variable_is_read() {
+        let dir = tempdir().unwrap();
+        let headers_path = dir.path().join("otel-headers.json");
+        std::fs::write(&headers_path, r#"{"x-api-key":"header-secret"}"#).unwrap();
+        let env = vec![(
+            "S3_SIDECAR_OTEL__HEADERS_FILE".to_owned(),
+            headers_path.display().to_string(),
+        )];
+        let loaded = load_with(dir.path(), None, env, json!({})).unwrap();
+        assert_eq!(
+            loaded
+                .config
+                .otel
+                .headers
+                .get("x-api-key")
+                .map(SecretString::expose_secret),
+            Some("header-secret")
+        );
+    }
+
+    #[test]
+    fn inline_otel_headers_win_over_the_headers_file() {
+        let dir = tempdir().unwrap();
+        let headers_path = dir.path().join("otel-headers.json");
+        std::fs::write(&headers_path, r#"{"x-api-key":"from-file"}"#).unwrap();
+        let env = vec![
+            (
+                "S3_SIDECAR_OTEL__HEADERS_FILE".to_owned(),
+                headers_path.display().to_string(),
+            ),
+            (
+                "S3_SIDECAR_OTEL__HEADERS".to_owned(),
+                r#"{"x-api-key":"from-env"}"#.to_owned(),
+            ),
+        ];
+        let loaded = load_with(dir.path(), None, env, json!({})).unwrap();
+        assert_eq!(
+            loaded
+                .config
+                .otel
+                .headers
+                .get("x-api-key")
+                .map(SecretString::expose_secret),
+            Some("from-env")
+        );
     }
 }
 

@@ -5,8 +5,9 @@ pub mod loader;
 pub mod secret;
 pub mod show;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -164,6 +165,88 @@ impl fmt::Display for ReadMode {
             Self::Local => f.write_str("local"),
             Self::LocalThenPeer => f.write_str("local_then_peer"),
             Self::Leader => f.write_str("leader"),
+        }
+    }
+}
+
+/// OTLP transport protocol for metrics export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum OtelProtocol {
+    /// gRPC over HTTP/2.
+    #[serde(rename = "grpc")]
+    Grpc,
+    /// Protobuf over HTTP.
+    #[serde(rename = "http/protobuf")]
+    HttpProtobuf,
+}
+
+impl fmt::Display for OtelProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Grpc => f.write_str("grpc"),
+            Self::HttpProtobuf => f.write_str("http/protobuf"),
+        }
+    }
+}
+
+impl OtelProtocol {
+    /// Parse a protocol name. The name must be `grpc` or `http/protobuf`.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "grpc" => Some(Self::Grpc),
+            "http/protobuf" => Some(Self::HttpProtobuf),
+            _ => None,
+        }
+    }
+}
+
+/// OpenTelemetry metrics export settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OtelConfig {
+    /// Export metrics over OTLP. The default is off.
+    pub enabled: bool,
+    /// Name of this service. An empty value uses `OTEL_SERVICE_NAME`, then
+    /// `s3-sidecar`.
+    pub service_name: Option<String>,
+    /// Version of this service.
+    pub service_version: String,
+    /// OTLP collector URL. An empty value uses `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    pub endpoint: Option<String>,
+    /// OTLP transport. An empty value uses `OTEL_EXPORTER_OTLP_PROTOCOL`, then
+    /// `grpc`.
+    pub protocol: Option<OtelProtocol>,
+    /// Extra OTLP request headers. An empty map uses
+    /// `OTEL_EXPORTER_OTLP_HEADERS`.
+    pub headers: BTreeMap<String, SecretString>,
+    /// File that contains a JSON object of OTLP request headers.
+    pub headers_file: Option<PathBuf>,
+    /// Timeout for one OTLP export request.
+    pub timeout: HumanDuration,
+    /// Interval between exports. An empty value uses
+    /// `OTEL_METRIC_EXPORT_INTERVAL`, then `60s`.
+    pub export_interval: Option<HumanDuration>,
+    /// Bound for the final flush during shutdown.
+    pub export_timeout: HumanDuration,
+    /// Extra resource attributes. Each value is sent as a string.
+    pub resource_attributes: BTreeMap<String, String>,
+}
+
+impl Default for OtelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_name: None,
+            service_version: "0.1.0".to_owned(),
+            endpoint: None,
+            protocol: None,
+            headers: BTreeMap::new(),
+            headers_file: None,
+            timeout: HumanDuration::new(Duration::from_secs(10)),
+            export_interval: None,
+            export_timeout: HumanDuration::new(Duration::from_secs(10)),
+            resource_attributes: BTreeMap::new(),
         }
     }
 }
@@ -589,6 +672,8 @@ pub struct Config {
     pub consensus: ConsensusConfig,
     /// Cluster garbage collection and metadata settings.
     pub cluster: ClusterConfig,
+    /// OpenTelemetry metrics export settings.
+    pub otel: OtelConfig,
     /// Client credentials.
     pub clients: Vec<ClientConfig>,
     /// Per-bucket settings.
@@ -617,6 +702,14 @@ pub enum ConfigError {
     /// A secret file could not be read.
     #[error("cannot read secret file {path}: {source}")]
     ReadSecret {
+        /// File path.
+        path: std::path::PathBuf,
+        /// I/O error.
+        source: std::io::Error,
+    },
+    /// The OTLP headers file could not be read.
+    #[error("cannot read OTLP headers file {path}: {source}")]
+    ReadHeaders {
         /// File path.
         path: std::path::PathBuf,
         /// I/O error.
@@ -680,9 +773,67 @@ pub fn validate(config: &Config) -> Result<Vec<String>, ConfigError> {
     validate_cache(config, &mut warnings)?;
     validate_endpoints(config)?;
     validate_cluster(config)?;
+    validate_otel(config)?;
     validate_buckets(config)?;
     validate_clients(config)?;
     Ok(warnings)
+}
+
+fn validate_otel(config: &Config) -> Result<(), ConfigError> {
+    let otel = &config.otel;
+    if let Some(endpoint) = &otel.endpoint
+        && !endpoint.trim().is_empty()
+        && !is_http_url(endpoint)
+    {
+        return Err(ConfigError::invalid(
+            "otel.endpoint must be an absolute http:// or https:// URL",
+        ));
+    }
+    for (name, duration) in [
+        ("otel.timeout", otel.timeout),
+        ("otel.export_timeout", otel.export_timeout),
+    ] {
+        if duration.as_duration() == Duration::ZERO {
+            return Err(ConfigError::invalid(format!(
+                "{name} must be greater than 0"
+            )));
+        }
+    }
+    if let Some(interval) = otel.export_interval
+        && interval.as_duration() == Duration::ZERO
+    {
+        return Err(ConfigError::invalid(
+            "otel.export_interval must be greater than 0",
+        ));
+    }
+    for name in otel.headers.keys() {
+        if name.trim().is_empty() {
+            return Err(ConfigError::invalid("otel header name must not be empty"));
+        }
+        if name != &name.to_ascii_lowercase() {
+            return Err(ConfigError::invalid(format!(
+                "otel header name \"{name}\" must be lowercase"
+            )));
+        }
+        if name.ends_with("-bin") {
+            return Err(ConfigError::invalid(format!(
+                "otel header name \"{name}\" must not end with -bin"
+            )));
+        }
+        if axum::http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(ConfigError::invalid(format!(
+                "otel header name \"{name}\" is not valid"
+            )));
+        }
+    }
+    for key in otel.resource_attributes.keys() {
+        if key.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "otel.resource_attributes key must not be empty",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_server(config: &Config) -> Result<(), ConfigError> {
@@ -1664,5 +1815,58 @@ mod tests {
         assert_eq!(value.as_duration(), Duration::from_mins(30));
         let value: HumanDuration = serde_json::from_str("15").unwrap();
         assert_eq!(value.as_duration(), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn otel_endpoint_must_be_absolute() {
+        let mut config = base();
+        config.otel.endpoint = Some("127.0.0.1:4317".to_owned());
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("otel.endpoint"));
+    }
+
+    #[test]
+    fn otel_durations_must_be_positive() {
+        let mut config = base();
+        config.otel.timeout = HumanDuration::new(Duration::ZERO);
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("otel.timeout"));
+
+        let mut config = base();
+        config.otel.export_interval = Some(HumanDuration::new(Duration::ZERO));
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("export_interval"));
+    }
+
+    #[test]
+    fn otel_header_names_must_be_valid_and_lowercase() {
+        let mut config = base();
+        config
+            .otel
+            .headers
+            .insert("X-Api-Key".to_owned(), secret::SecretString::new("secret"));
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("lowercase"));
+
+        let mut config = base();
+        config
+            .otel
+            .headers
+            .insert("x api key".to_owned(), secret::SecretString::new("secret"));
+        let error = validate(&config).unwrap_err();
+        assert!(error.to_string().contains("not valid"));
+    }
+
+    #[test]
+    fn otel_headers_are_redacted() {
+        let mut config = base();
+        config.otel.headers.insert(
+            "x-api-key".to_owned(),
+            secret::SecretString::new("header-secret"),
+        );
+        let table = show_table(&config, &SourceMap::new());
+        assert!(!table.contains("header-secret"));
+        assert!(table.contains("otel.headers"));
+        assert!(table.contains("****"));
     }
 }
