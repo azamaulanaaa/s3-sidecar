@@ -294,3 +294,15 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+  custom-release-container-image:
+    needs:
+      - plan
+      - announce
+    uses: $/.github/workflows/release-container-image.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
+    permissions:
+      "contents": "read"
+      "packages": "write"
