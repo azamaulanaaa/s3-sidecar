@@ -20,7 +20,8 @@ use futures_util::{StreamExt, TryStreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::auth::body::{BodyFailure, BodyStream, failure, failure_flag, limit, verify_hash};
 use crate::auth::chunked::{ChunkMode, decode};
@@ -374,7 +375,25 @@ impl Server {
 /// the TLS files are not valid, the state cannot be built, or the listener
 /// cannot bind.
 pub async fn serve(config: Config, warnings: &[String]) -> Result<(), ServeError> {
-    start(config, warnings).await?.wait().await
+    serve_with_telemetry(config, warnings, None).await
+}
+
+/// Start the HTTP server with explicit telemetry and wait for shutdown.
+///
+/// # Errors
+///
+/// Returns an error when the configuration is not supported in this build,
+/// the TLS files are not valid, the state cannot be built, or the listener
+/// cannot bind.
+pub async fn serve_with_telemetry(
+    config: Config,
+    warnings: &[String],
+    telemetry: Option<Telemetry>,
+) -> Result<(), ServeError> {
+    start_with_telemetry(config, warnings, telemetry)
+        .await?
+        .wait()
+        .await
 }
 
 /// Start the HTTP server and return a handle before it stops.
@@ -385,6 +404,21 @@ pub async fn serve(config: Config, warnings: &[String]) -> Result<(), ServeError
 /// the TLS files are not valid, the state cannot be built, or the listener
 /// cannot bind.
 pub async fn start(config: Config, warnings: &[String]) -> Result<Server, ServeError> {
+    start_with_telemetry(config, warnings, None).await
+}
+
+/// Start the HTTP server with explicit telemetry.
+///
+/// # Errors
+///
+/// Returns an error when the configuration is not supported in this build,
+/// the TLS files are not valid, the state cannot be built, or the listener
+/// cannot bind.
+pub async fn start_with_telemetry(
+    config: Config,
+    warnings: &[String],
+    telemetry: Option<Telemetry>,
+) -> Result<Server, ServeError> {
     if config.mode != Mode::Cluster && config.origin.endpoint.trim().is_empty() {
         return Err(ServeError::Config(
             "origin.endpoint is required for serve".to_owned(),
@@ -395,9 +429,6 @@ pub async fn start(config: Config, warnings: &[String]) -> Result<Server, ServeE
     }
 
     let tls = load_tls(config.server.tls.as_ref()).await?;
-    let node_id = telemetry_node_id(&config);
-    let telemetry = Telemetry::new(&config.otel, node_id.as_deref())
-        .map_err(|error| ServeError::Config(error.message))?;
     let metrics = match &telemetry {
         Some(telemetry) => Arc::new(metrics::Metrics::new(&telemetry.meter())),
         None => Arc::new(metrics::Metrics::default()),
@@ -447,7 +478,9 @@ pub async fn start(config: Config, warnings: &[String]) -> Result<Server, ServeE
     })
 }
 
-fn telemetry_node_id(config: &Config) -> Option<String> {
+/// Return the cluster node id for the telemetry resource, when present.
+#[must_use]
+pub fn telemetry_node_id(config: &Config) -> Option<String> {
     if config.mode != Mode::Cluster {
         return None;
     }
@@ -616,23 +649,52 @@ async fn handle_s3(
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         headers.insert(REQUEST_ID_HEADER, value);
     }
+    let span = tracing::info_span!(
+        "s3.request",
+        "http.request.method" = %method,
+        "url.path" = uri.path(),
+        "s3.bucket.name" = tracing::field::Empty,
+        "s3.operation" = s3_operation(&method, &uri, &headers),
+        "s3.object.key" = tracing::field::Empty,
+        "http.response.status_code" = tracing::field::Empty,
+        "otel.kind" = "server",
+    );
+    if let Ok(bucket) = bucket_name(uri.path()) {
+        span.record("s3.bucket.name", bucket.as_str());
+    }
+    if state.config.otel.record_object_keys {
+        let key = object_key(uri.path());
+        if !key.is_empty() {
+            span.record("s3.object.key", key.as_str());
+        }
+    }
+    let parent = crate::telemetry::extract_context(&headers);
+    let _ = span.set_parent(parent);
+
     let started = Instant::now();
-    let mut response =
-        match limited_forward(state, method.clone(), uri.clone(), headers, body).await {
-            Ok(response) => response,
-            Err(error) => error.into_response(&request_id),
-        };
+    let mut response = match limited_forward(state, method.clone(), uri.clone(), headers, body)
+        .instrument(span.clone())
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => error.into_response(&request_id),
+    };
+    span.record("http.response.status_code", response.status().as_u16());
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
-    info!(
-        request_id = %request_id,
-        method = %method,
-        path = %uri.path(),
-        status = response.status().as_u16(),
-        elapsed_ms = started.elapsed().as_millis(),
-        "request"
-    );
+    let status = response.status().as_u16();
+    let elapsed_ms = started.elapsed().as_millis();
+    span.in_scope(|| {
+        info!(
+            request_id = %request_id,
+            method = %method,
+            path = %uri.path(),
+            status,
+            elapsed_ms,
+            "request"
+        );
+    });
     response
 }
 
@@ -975,6 +1037,12 @@ async fn read_path(
         ));
     }
 
+    let lookup = tracing::info_span!(
+        "cache.lookup",
+        "s3.bucket.name" = bucket,
+        "cache.hit" = false,
+        "cache.entry.state" = "none",
+    );
     let origin_headers = prepared.headers.clone();
     let range = headers
         .get(header::RANGE)
@@ -982,6 +1050,8 @@ async fn read_path(
         .map(str::to_owned);
 
     if let Some(meta) = cache.pending_entry(bucket, key) {
+        lookup.record("cache.hit", true);
+        lookup.record("cache.entry.state", meta.state.as_str());
         match serve_cached(state, cache, method, range.as_deref(), &meta, bucket, key).await {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
@@ -1008,7 +1078,11 @@ async fn read_path(
         .await;
     }
 
-    let meta = match cache.read_meta(bucket, key).await {
+    let meta = match cache
+        .read_meta(bucket, key)
+        .instrument(lookup.clone())
+        .await
+    {
         Ok(meta) => meta,
         Err(error) => {
             if !cache_error_fallback(cache, &error) {
@@ -1020,6 +1094,8 @@ async fn read_path(
     };
 
     let Some(meta) = meta else {
+        lookup.record("cache.hit", false);
+        lookup.record("cache.entry.state", "absent");
         state.metrics.miss();
         return origin_read(
             state,
@@ -1042,6 +1118,9 @@ async fn read_path(
             "The key does not exist.",
         ));
     }
+
+    lookup.record("cache.hit", true);
+    lookup.record("cache.entry.state", meta.state.as_str());
 
     let ttl = cache.ttl_for(bucket);
     if meta.is_fresh(unix_now(), ttl) || meta.state == EntryState::Failed {
@@ -1102,7 +1181,7 @@ async fn read_path(
 }
 
 // The read path passes request headers, credentials, and cache metadata.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn origin_read(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -1121,6 +1200,14 @@ async fn origin_read(
     {
         request_headers.insert(header::IF_NONE_MATCH, value);
     }
+    let revalidate_span = revalidate.map(|meta| {
+        tracing::info_span!(
+            "cache.revalidate",
+            "s3.bucket.name" = bucket,
+            "cache.hit" = false,
+            "cache.entry.state" = meta.state.as_str(),
+        )
+    });
     let request = ForwardRequest {
         method: method.clone(),
         path_and_query: path_and_query.to_owned(),
@@ -1128,11 +1215,16 @@ async fn origin_read(
         body: None,
         content_length: None,
     };
-    let response = state
-        .client
-        .execute(credential, request)
-        .await
-        .map_err(|error| map_storage_error(error, None))?;
+    let execute = state.client.execute(credential, request);
+    let response = if let Some(span) = &revalidate_span {
+        execute.instrument(span.clone()).await
+    } else {
+        execute.await
+    }
+    .map_err(|error| map_storage_error(error, None))?;
+    if let Some(span) = &revalidate_span {
+        span.record("cache.hit", response.status() == StatusCode::NOT_MODIFIED);
+    }
 
     if revalidate.is_some() && response.status() == StatusCode::NOT_MODIFIED {
         state.metrics.revalidated();
@@ -1871,6 +1963,52 @@ fn object_key(path: &str) -> String {
             .decode_utf8_lossy()
             .into_owned(),
         None => String::new(),
+    }
+}
+
+fn s3_operation(method: &Method, uri: &Uri, headers: &HeaderMap) -> &'static str {
+    let trimmed = uri.path().trim_start_matches('/');
+    if trimmed.is_empty() {
+        return "ListBuckets";
+    }
+    let query = uri.query().unwrap_or_default();
+    let key = object_key(uri.path());
+    if key.is_empty() {
+        if method == Method::GET && query_param(query, "list-type").as_deref() == Some("2") {
+            return "ListObjectsV2";
+        }
+        return match *method {
+            Method::HEAD => "HeadBucket",
+            Method::PUT => "CreateBucket",
+            Method::DELETE => "DeleteBucket",
+            Method::GET => "ListObjects",
+            _ => "Unknown",
+        };
+    }
+    if method == Method::PUT && headers.contains_key("x-amz-copy-source") {
+        return "CopyObject";
+    }
+    if method == Method::POST && query_has(query, "uploads") {
+        return "CreateMultipartUpload";
+    }
+    if method == Method::PUT && query_has(query, "partNumber") {
+        return "UploadPart";
+    }
+    if method == Method::POST && query_has(query, "uploadId") {
+        return "CompleteMultipartUpload";
+    }
+    if method == Method::DELETE && query_has(query, "uploadId") {
+        return "AbortMultipartUpload";
+    }
+    if method == Method::GET && query_has(query, "uploadId") {
+        return "ListParts";
+    }
+    match *method {
+        Method::GET => "GetObject",
+        Method::HEAD => "HeadObject",
+        Method::PUT => "PutObject",
+        Method::DELETE => "DeleteObject",
+        _ => "Unknown",
     }
 }
 

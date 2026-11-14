@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use reqwest::{Client, Response, Url};
+use tracing::Instrument;
 use tracing::warn;
 
 use crate::auth::body::BodyStream;
@@ -12,6 +13,7 @@ use crate::auth::sign::sign_request;
 use crate::auth::{ClientCredential, EMPTY_SHA256, now};
 use crate::config::{EndpointConfig, UpstreamConfig};
 use crate::errors::S3Error;
+use crate::telemetry;
 
 /// A request to the upstream S3 endpoint.
 pub struct ForwardRequest {
@@ -161,6 +163,30 @@ impl S3Client {
         let url = Url::parse(&format!("{base}{}", request.path_and_query))
             .map_err(|_| StorageError::Sign(S3Error::internal()))?;
 
+        let span = tracing::info_span!(
+            "s3.upstream",
+            "http.request.method" = %request.method,
+            "server.address" = url.host_str().unwrap_or_default(),
+            "url.path" = url.path(),
+            "http.response.status_code" = tracing::field::Empty,
+            "otel.kind" = "client",
+        );
+        let result = self
+            .execute_url(credential, request, url)
+            .instrument(span.clone())
+            .await;
+        if let Ok(response) = &result {
+            span.record("http.response.status_code", response.status().as_u16());
+        }
+        result
+    }
+
+    async fn execute_url(
+        &self,
+        credential: &ClientCredential,
+        request: ForwardRequest,
+        url: Url,
+    ) -> Result<Response, StorageError> {
         if request.body.is_some() {
             return self.send_once(credential, request, url, false).await;
         }
@@ -215,6 +241,7 @@ impl S3Client {
         apply_timeout: bool,
     ) -> Result<Response, StorageError> {
         let mut headers = request.headers;
+        telemetry::inject_context(&mut headers);
         sign_request(
             &request.method,
             &url,
@@ -252,6 +279,7 @@ impl S3Client {
         mut headers: HeaderMap,
         content_length: Option<u64>,
     ) -> Result<Response, StorageError> {
+        telemetry::inject_context(&mut headers);
         sign_request(
             method,
             url,
