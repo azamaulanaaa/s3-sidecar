@@ -1011,7 +1011,7 @@ async fn multipart_request(
                     prepared.content_length,
                 )
                 .await
-                .map_err(|error| cache_error(&error))?;
+                .map_err(|error| multipart_cache_error(&error))?;
             return forward_response(method, response, state.idle_timeout()).await;
         }
         return proxy_request(state, method, credential, prepared, path_and_query).await;
@@ -1027,7 +1027,7 @@ async fn multipart_request(
             let complete = cache
                 .complete_client_upload(id, &request_headers, body)
                 .await
-                .map_err(|error| cache_error(&error))?;
+                .map_err(|error| multipart_cache_error(&error))?;
             return Ok(client_complete_response(complete));
         }
         let response = proxy_request(state, method, credential, prepared, path_and_query).await?;
@@ -2179,6 +2179,15 @@ fn cache_error_fallback(cache: &Cache, error: &crate::cache::CacheError) -> bool
 fn cache_error(error: &crate::cache::CacheError) -> S3Error {
     warn!(%error, "cache request failed");
     S3Error::service_unavailable()
+}
+
+/// Map one cache multipart error to an S3 error.
+fn multipart_cache_error(error: &crate::cache::CacheError) -> S3Error {
+    if matches!(error, crate::cache::CacheError::TooLarge) {
+        S3Error::cache_object_too_large()
+    } else {
+        cache_error(error)
+    }
 }
 
 fn unix_now() -> i64 {

@@ -7,7 +7,7 @@ pub mod meta;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -110,6 +110,8 @@ struct ClientUpload {
     content_encoding: Option<String>,
     /// Object headers that the cache may store and replay.
     headers: BTreeMap<String, String>,
+    /// Size of each uploaded part, keyed by part number.
+    part_sizes: Arc<Mutex<HashMap<u32, u64>>>,
 }
 
 struct SyncJobs {
@@ -1309,6 +1311,7 @@ impl Cache {
                 content_type,
                 content_encoding,
                 headers,
+                part_sizes: Arc::new(Mutex::new(HashMap::new())),
             },
         );
         Ok(id)
@@ -1329,6 +1332,22 @@ impl Cache {
         length: Option<u64>,
     ) -> Result<reqwest::Response, CacheError> {
         let upload = self.client_upload(upload_id)?;
+        let part_number = part_number
+            .parse::<u32>()
+            .map_err(|_| CacheError::Metadata)?;
+        let (body, counted, overflow) = if let Some(length) = length {
+            if let Err(error) = self.check_part_total(&upload, part_number, length) {
+                return Err(self.reject_client_upload(upload_id, &upload, error).await);
+            }
+            (body, None, None)
+        } else {
+            let remaining = self.remaining_part_bytes(&upload, part_number);
+            let counted = Arc::new(AtomicU64::new(0));
+            let overflow = Arc::new(AtomicBool::new(false));
+            let body =
+                count_part_bytes(body, Arc::clone(&counted), Arc::clone(&overflow), remaining);
+            (body, Some(counted), Some(overflow))
+        };
         let request = ForwardRequest {
             method: Method::PUT,
             path_and_query: format!(
@@ -1340,16 +1359,25 @@ impl Cache {
             body: Some(body),
             content_length: length,
         };
-        let response = self
-            .client
-            .execute(&self.credential, request)
-            .await
-            .map_err(storage_error)?;
-        if response.status().is_success() {
-            Ok(response)
-        } else {
-            Err(CacheError::Status(response.status().as_u16()))
+        let result = self.client.execute(&self.credential, request).await;
+        if let Some(overflow) = &overflow
+            && overflow.load(Ordering::Acquire)
+        {
+            return Err(self
+                .reject_client_upload(upload_id, &upload, CacheError::TooLarge)
+                .await);
         }
+        let response = result.map_err(storage_error)?;
+        if !response.status().is_success() {
+            return Err(CacheError::Status(response.status().as_u16()));
+        }
+        let size = match (counted, length) {
+            (Some(counted), _) => counted.load(Ordering::Acquire),
+            (_, Some(length)) => length,
+            _ => 0,
+        };
+        lock(&upload.part_sizes).insert(part_number, size);
+        Ok(response)
     }
 
     /// Complete a client multipart upload at the cache endpoint.
@@ -1368,6 +1396,11 @@ impl Cache {
         body: Bytes,
     ) -> Result<ClientComplete, CacheError> {
         let upload = self.client_upload(upload_id)?;
+        if client_upload_total(&upload) > self.max_object_bytes() {
+            return Err(self
+                .reject_client_upload(upload_id, &upload, CacheError::TooLarge)
+                .await);
+        }
         let length = u64::try_from(body.len()).map_err(|_| CacheError::Body)?;
         let stream: BodyStream = Box::pin(futures_util::stream::once(async move { Ok(body) }));
         let request = ForwardRequest {
@@ -1434,25 +1467,7 @@ impl Cache {
         headers: &HeaderMap,
     ) -> Result<reqwest::Response, CacheError> {
         let upload = self.client_upload(upload_id)?;
-        let request = ForwardRequest {
-            method: Method::DELETE,
-            path_and_query: format!(
-                "{}?uploadId={}",
-                object_path(self.cache_bucket(), &upload.cache_key),
-                encode_query_value(&upload.upload_id)
-            ),
-            headers: headers.clone(),
-            body: None,
-            content_length: None,
-        };
-        let response = self
-            .client
-            .execute(&self.credential, request)
-            .await
-            .map_err(storage_error)?;
-        if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
-            return Err(CacheError::Status(response.status().as_u16()));
-        }
+        let response = self.delete_cache_upload(&upload, headers).await?;
         lock(&self.client_uploads).remove(upload_id);
         Ok(response)
     }
@@ -1544,6 +1559,70 @@ impl Cache {
             .get(upload_id)
             .cloned()
             .ok_or(CacheError::Status(StatusCode::NOT_FOUND.as_u16()))
+    }
+
+    /// Check the total size after one part replaces an older part.
+    fn check_part_total(
+        &self,
+        upload: &ClientUpload,
+        part_number: u32,
+        length: u64,
+    ) -> Result<(), CacheError> {
+        let sizes = lock(&upload.part_sizes);
+        let base = part_total(&sizes).saturating_sub(sizes.get(&part_number).copied().unwrap_or(0));
+        if base.saturating_add(length) > self.max_object_bytes() {
+            return Err(CacheError::TooLarge);
+        }
+        Ok(())
+    }
+
+    /// Return the bytes that a new part may add.
+    fn remaining_part_bytes(&self, upload: &ClientUpload, part_number: u32) -> u64 {
+        let sizes = lock(&upload.part_sizes);
+        let base = part_total(&sizes).saturating_sub(sizes.get(&part_number).copied().unwrap_or(0));
+        self.max_object_bytes().saturating_sub(base)
+    }
+
+    /// Abort one cache upload and remove its sidecar state.
+    async fn reject_client_upload(
+        &self,
+        upload_id: &str,
+        upload: &ClientUpload,
+        error: CacheError,
+    ) -> CacheError {
+        if let Err(abort_error) = self.delete_cache_upload(upload, &HeaderMap::new()).await {
+            warn!(%abort_error, "cache multipart abort failed");
+        }
+        lock(&self.client_uploads).remove(upload_id);
+        error
+    }
+
+    /// Send one abort request for a cache upload.
+    async fn delete_cache_upload(
+        &self,
+        upload: &ClientUpload,
+        headers: &HeaderMap,
+    ) -> Result<reqwest::Response, CacheError> {
+        let request = ForwardRequest {
+            method: Method::DELETE,
+            path_and_query: format!(
+                "{}?uploadId={}",
+                object_path(self.cache_bucket(), &upload.cache_key),
+                encode_query_value(&upload.upload_id)
+            ),
+            headers: headers.clone(),
+            body: None,
+            content_length: None,
+        };
+        let response = self
+            .client
+            .execute(&self.credential, request)
+            .await
+            .map_err(storage_error)?;
+        if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
+            return Err(CacheError::Status(response.status().as_u16()));
+        }
+        Ok(response)
     }
 
     /// Write the journal and metadata for a pending cache entry.
@@ -2180,6 +2259,43 @@ fn receiver_stream(mut receiver: mpsc::Receiver<Result<Bytes, io::Error>>) -> Bo
     let stream = async_stream::try_stream! {
         while let Some(item) = receiver.recv().await {
             yield item?;
+        }
+    };
+    Box::pin(stream)
+}
+
+/// Return the total size of the stored parts.
+fn part_total(sizes: &HashMap<u32, u64>) -> u64 {
+    sizes.values().copied().fold(0_u64, u64::saturating_add)
+}
+
+/// Return the total size of one client upload.
+fn client_upload_total(upload: &ClientUpload) -> u64 {
+    part_total(&lock(&upload.part_sizes))
+}
+
+/// Count the bytes of one part and stop when the limit is exceeded.
+fn count_part_bytes(
+    mut body: BodyStream,
+    counted: Arc<AtomicU64>,
+    overflow: Arc<AtomicBool>,
+    limit: u64,
+) -> BodyStream {
+    let stream = async_stream::try_stream! {
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            let length = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            let total = counted
+                .fetch_add(length, Ordering::AcqRel)
+                .saturating_add(length);
+            if total > limit {
+                overflow.store(true, Ordering::Release);
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the part is too large for the cache",
+                ))?;
+            }
+            yield chunk;
         }
     };
     Box::pin(stream)
