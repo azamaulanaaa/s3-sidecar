@@ -426,6 +426,7 @@ impl Cluster {
         headers: &HeaderMap,
         input: WriteBody,
     ) -> Result<Response, S3Error> {
+        reject_encryption_headers(headers)?;
         let current = self
             .state
             .get_metadata(bucket, key)
@@ -614,6 +615,7 @@ impl Cluster {
         key: &str,
         headers: &HeaderMap,
     ) -> Result<Response, S3Error> {
+        reject_encryption_headers(headers)?;
         let source_value = header_text(headers, "x-amz-copy-source")
             .ok_or_else(|| S3Error::invalid_request("The copy source header is required."))?;
         let (source_bucket, source_key) = parse_copy_source(&source_value)
@@ -957,6 +959,7 @@ impl Cluster {
         key: &str,
         headers: &HeaderMap,
     ) -> Result<Response, S3Error> {
+        reject_encryption_headers(headers)?;
         let object = ObjectMetadata::from_headers(headers);
         let blob = next_id();
         let upload_id = format!("{}-{}", hex::encode(self.node_id.as_bytes()), next_id());
@@ -1592,6 +1595,34 @@ fn stream_response(response: reqwest::Response, metadata: &Metadata) -> Response
     copy_headers(&headers, output.headers_mut());
     set_metadata_headers(metadata, output.headers_mut());
     output
+}
+
+/// Headers that select server-side encryption for a request.
+const ENCRYPTION_HEADERS: [&str; 7] = [
+    "x-amz-server-side-encryption",
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-context",
+    "x-amz-server-side-encryption-bucket-key-enabled",
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key",
+    "x-amz-server-side-encryption-customer-key-md5",
+];
+
+/// Reject encryption headers that cluster mode cannot honor.
+///
+/// # Errors
+///
+/// Returns `NotImplemented` when the request carries an encryption header.
+fn reject_encryption_headers(headers: &HeaderMap) -> Result<(), S3Error> {
+    for name in ENCRYPTION_HEADERS {
+        if headers.contains_key(name) {
+            return Err(S3Error::not_implemented(
+                "Cluster mode cannot honor server-side encryption headers. \
+                 The backing bucket must use default encryption.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Object metadata values that a write can set.

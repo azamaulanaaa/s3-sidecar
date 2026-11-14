@@ -1111,6 +1111,88 @@ async fn multipart_upload_preserves_object_headers() {
 }
 
 #[tokio::test]
+async fn encryption_headers_return_not_implemented() {
+    let (backing, handle) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let sse_customer = [
+        ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ("x-amz-server-side-encryption-customer-key", "c2VjcmV0"),
+        ("x-amz-server-side-encryption-customer-key-md5", "bWQ1"),
+    ];
+
+    let before = handle.put_count();
+    let response = put(
+        &client,
+        &format!("{}/media/sse-put", sidecar.url),
+        b"body",
+        &sse_customer,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let text = body_text(response).await;
+    assert!(text.contains("NotImplemented"));
+    assert!(text.contains("default encryption"));
+    assert_eq!(handle.put_count(), before);
+
+    let response = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/sse-copy", sidecar.url),
+        None,
+        &[
+            ("x-amz-copy-source", "/media/sse-put"),
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+    let response = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media/sse-multipart?uploads", sidecar.url),
+        Some(Vec::new()),
+        &[("x-amz-server-side-encryption-customer-algorithm", "AES256")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        sidecar
+            .state
+            .cluster()
+            .unwrap()
+            .state()
+            .uploads()
+            .unwrap()
+            .is_empty()
+    );
+
+    let response = put(
+        &client,
+        &format!("{}/media/sse-managed", sidecar.url),
+        b"body",
+        &[("x-amz-server-side-encryption", "AES256")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(handle.put_count(), before);
+}
+
+#[tokio::test]
 async fn list_hides_staging_and_upload_objects() {
     let (backing, handle) = spawn_backing().await;
     handle.insert("staged-orphan", b"x", "2000-01-01T00:00:00Z");
