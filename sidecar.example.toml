@@ -125,14 +125,23 @@ backend = "single"             # single | raft | consul
 # addr = "http://127.0.0.1:9200"
 
 [otel]
-# OpenTelemetry metrics export over OTLP. The default is off.
+# OpenTelemetry export over OTLP. The default is off.
 enabled = false
+# metrics = true               # Metrics are on when OpenTelemetry is enabled.
+# traces = false               # Server and upstream spans.
+# logs = false                 # tracing events with trace correlation.
+# trace_sample_ratio = 1.0     # 0.0 disables root traces. 1.0 samples every root.
+# record_object_keys = false   # Add s3.object.key to server spans. Off for privacy.
 # service_name = "s3-sidecar"
 # service_version = "0.1.0"
 # endpoint = "http://127.0.0.1:4317"
+# trace_endpoint = "http://127.0.0.1:4317"
+# logs_endpoint = "http://127.0.0.1:4317"
 # protocol = "grpc"             # grpc | http/protobuf
 # timeout = "10s"               # Timeout for one export request.
-# export_interval = "60s"       # Interval between exports.
+# export_interval = "60s"       # Interval between metric exports.
+# trace_schedule_delay = "5s"   # Delay between trace exports.
+# log_schedule_delay = "5s"     # Delay between log exports.
 # export_timeout = "10s"        # Bound for the final flush at shutdown.
 # headers = { "x-api-key" = "..." }
 # Prefer --otel-headers-file or S3_SIDECAR_OTEL__HEADERS_FILE for a header

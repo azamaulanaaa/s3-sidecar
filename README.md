@@ -21,7 +21,8 @@ single-node foundation of M2 (coordination):
 - Asynchronous blob replication to a deterministic replica set, peer blob
   fetch, read repair, delete propagation, and replica reconciliation.
 - Health and readiness endpoints.
-- OpenTelemetry metrics export over OTLP.
+- OpenTelemetry metrics, traces, and logs over OTLP, with W3C context
+  propagation.
 - `s3-sidecar check --show-config` with redacted secrets and field sources.
 
 Raft and Consul replicate metadata. Each node also copies blobs to its intended
@@ -234,20 +235,30 @@ s3-sidecar serve --server-bind 0.0.0.0:9001 \
 The convenience flag `--bucket media` adds a bucket name. Repeat it to add
 more buckets.
 
-### OpenTelemetry metrics
+### OpenTelemetry metrics, traces, and logs
 
-Metrics export is off by default. Set `otel.enabled = true` to send metrics to
-an OTLP collector.
+Export is off by default. Set `otel.enabled = true` to send signals to an OTLP
+collector. Metrics are on by default when OpenTelemetry is enabled. Traces and
+logs are opt-in.
 
 ```toml
 [otel]
 enabled = true
+metrics = true
+traces = true
+logs = true
+trace_sample_ratio = 1.0        # 0.0 disables root traces.
+record_object_keys = false      # Off for privacy.
 service_name = "s3-sidecar"
 service_version = "0.1.0"
 endpoint = "http://127.0.0.1:4317"
+trace_endpoint = "http://127.0.0.1:4317"
+logs_endpoint = "http://127.0.0.1:4317"
 protocol = "grpc"                # grpc | http/protobuf
 timeout = "10s"
 export_interval = "60s"
+trace_schedule_delay = "5s"
+log_schedule_delay = "5s"
 export_timeout = "10s"
 resource_attributes = { "deployment.environment.name" = "production" }
 ```
@@ -257,12 +268,21 @@ For HTTP, set `protocol = "http/protobuf"` and use the HTTP collector port.
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
-s3-sidecar serve --otel-enabled --config sidecar.toml
+s3-sidecar serve --otel-enabled --otel-traces --otel-logs --config sidecar.toml
 ```
 
 An unset `otel.endpoint` uses `OTEL_EXPORTER_OTLP_ENDPOINT`. An unset
+`otel.trace_endpoint` uses `otel.endpoint`, then
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. An unset `otel.logs_endpoint` uses
+`otel.endpoint`, then `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`. An unset
 `otel.protocol` uses `OTEL_EXPORTER_OTLP_PROTOCOL`, then `grpc`. An unset
 `otel.export_interval` uses `OTEL_METRIC_EXPORT_INTERVAL`, then `60s`.
+
+A trace starts at `s3.request`. The sidecar extracts W3C `traceparent` and
+`tracestate` from incoming requests and injects the context into every upstream
+S3, cache, peer, raft, and Consul request. Log records carry the trace and span
+ids of the current span. See the operations guide for the span and attribute
+list and the object-key privacy note.
 
 Use `otel.headers` or `otel.headers_file` for collector authentication. The
 headers file contains a JSON object. `check --show-config` redacts header values.

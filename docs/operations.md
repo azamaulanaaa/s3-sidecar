@@ -118,17 +118,28 @@ A read that finds committed metadata but no reachable copy returns `404
 NoSuchKey` with `x-s3-sidecar-owner`. Do not treat this `404` as proof that the
 key never existed.
 
-## Metrics
+## OpenTelemetry
 
-The sidecar exports metrics with OpenTelemetry over OTLP. Export is off by
-default. There is no local metrics endpoint. `GET /healthz` reports the process.
-`GET /readyz` reports readiness.
+The sidecar exports metrics, traces, and logs with OpenTelemetry over OTLP.
+Export is off by default. There is no local metrics endpoint. `GET /healthz`
+reports the process. `GET /readyz` reports readiness.
 
-Set `otel.enabled = true` to start export.
+`otel.enabled` is the master switch. `otel.metrics` defaults to `true`, so an
+existing metrics configuration keeps working. `otel.traces` and `otel.logs`
+default to `false`.
 
 ```toml
 [otel]
 enabled = true
+metrics = true
+traces = true
+logs = true
+trace_sample_ratio = 1.0
+trace_endpoint = "http://127.0.0.1:4317"
+logs_endpoint = "http://127.0.0.1:4317"
+trace_schedule_delay = "5s"
+log_schedule_delay = "5s"
+record_object_keys = false
 service_name = "s3-sidecar"
 service_version = "0.1.0"
 endpoint = "http://127.0.0.1:4317"
@@ -142,23 +153,34 @@ resource_attributes = { "deployment.environment.name" = "production" }
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `otel.enabled` | `false` | Send metrics over OTLP. |
+| `otel.enabled` | `false` | Master switch for all OTLP export. |
+| `otel.metrics` | `true` | Export metrics over OTLP. |
+| `otel.traces` | `false` | Export traces over OTLP. |
+| `otel.logs` | `false` | Export logs over OTLP. |
 | `otel.service_name` | `s3-sidecar` | The `service.name` resource attribute. |
 | `otel.service_version` | `0.1.0` | The `service.version` resource attribute. |
-| `otel.endpoint` | unset | Collector URL. |
+| `otel.endpoint` | unset | Collector URL for every enabled signal. |
+| `otel.trace_endpoint` | unset | Trace collector URL. Falls back to `otel.endpoint`. |
+| `otel.logs_endpoint` | unset | Log collector URL. Falls back to `otel.endpoint`. |
+| `otel.trace_sample_ratio` | `1.0` | Fraction of root traces to sample, from `0.0` to `1.0`. |
 | `otel.protocol` | `grpc` | `grpc` or `http/protobuf`. |
 | `otel.headers` | empty | OTLP request headers. Values are secret. |
 | `otel.headers_file` | unset | File with a JSON object of OTLP headers. |
 | `otel.timeout` | `10s` | Timeout for one export request. |
-| `otel.export_interval` | `60s` | Interval between exports. |
+| `otel.export_interval` | `60s` | Interval between metric exports. |
+| `otel.trace_schedule_delay` | `5s` | Delay between trace exports. |
+| `otel.log_schedule_delay` | `5s` | Delay between log exports. |
 | `otel.export_timeout` | `10s` | Bound for the final flush at shutdown. |
 | `otel.resource_attributes` | empty | Extra resource attributes. |
+| `otel.record_object_keys` | `false` | Add `s3.object.key` to server spans. |
 
 Environment fallbacks apply when a setting is unset:
 
 | Setting | Fallback |
 |---|---|
 | `otel.endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `otel.trace_endpoint` | `otel.endpoint`, then `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` |
+| `otel.logs_endpoint` | `otel.endpoint`, then `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` |
 | `otel.headers` | `OTEL_EXPORTER_OTLP_HEADERS` |
 | `otel.service_name` | `OTEL_SERVICE_NAME`, then `s3-sidecar` |
 | `otel.protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL`, then `grpc` |
@@ -166,16 +188,66 @@ Environment fallbacks apply when a setting is unset:
 
 The exporter adds `service.name`, `service.version`, and `service.instance.id`
 to the resource. `service.instance.id` is the cluster node id when present,
-otherwise the hostname. The SDK adds the `telemetry.sdk.*` attributes.
+otherwise the hostname. The SDK adds the `telemetry.sdk.*` attributes. Metrics,
+traces, and logs use the same resource.
 
-For HTTP, use the HTTP collector port. The sidecar appends `/v1/metrics` to the
-configured endpoint when the path is not already present.
+For HTTP, use the HTTP collector port. The sidecar appends `/v1/metrics`,
+`/v1/traces`, or `/v1/logs` when the path is not already present.
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
-s3-sidecar serve --otel-enabled
+s3-sidecar serve --otel-enabled --otel-traces --otel-logs
 ```
+
+### Traces
+
+A trace starts at `s3.request`. The sidecar extracts the W3C `traceparent` and
+`tracestate` headers from an incoming S3 request and sets the server span
+parent. It injects the current W3C context into every upstream S3 request,
+cache request, backing S3 request, peer blob request, raft RPC, and Consul RPC.
+The origin receives `traceparent`.
+
+Sampling uses `ParentBased(TraceIdRatioBased(ratio))`. A ratio of `0.0` turns
+root spans off. A ratio of `1.0` samples every root span. A child follows the
+sampling decision of its parent.
+
+| Span | Kind | Attributes |
+|---|---|---|
+| `s3.request` | server | `http.request.method`, `url.path`, `s3.bucket.name`, `s3.operation`, `http.response.status_code`, `otel.kind`, and `s3.object.key` when enabled. |
+| `s3.upstream` | client | `http.request.method`, `server.address`, `url.path`, `http.response.status_code`, `otel.kind`. |
+| `cache.lookup` | internal | `cache.hit`, `s3.bucket.name`, `cache.entry.state`. |
+| `cache.revalidate` | internal | `cache.hit`, `s3.bucket.name`, `cache.entry.state`. |
+| `cache.tee` | internal | `cache.hit`, `s3.bucket.name`, `cache.entry.state`. |
+| `cache.sync` | internal | `s3.bucket.name`, `cache.entry.state`. |
+| `cluster.stage` | internal | `s3.bucket.name`, `cluster.node_id`, `cluster.result`. |
+| `cluster.commit` | internal | `s3.bucket.name`, `cluster.node_id`, `cluster.write_ack`, `cluster.result`. |
+| `cluster.read_index` | internal | `s3.bucket.name`, `cluster.node_id`, `cluster.result`. |
+| `cluster.replicate` | internal | `cluster.node_id`, `cluster.peer_id`, `cluster.result`. |
+| `cluster.peer_fetch` | internal | `cluster.node_id`, `cluster.peer_id`, `cluster.result`. |
+| `replication.copy` | internal | `cluster.node_id`, `cluster.peer_id`, `cluster.result`. |
+| `gc.cycle` | internal | None. |
+| `consul.reconcile` | internal | None. |
+| `raft.apply` | internal | None. |
+
+Span names are fixed. Object keys, UUIDs, and free-form error strings are never
+part of a span name. Bounded values belong in attributes.
+
+`record_object_keys = false` is the default. Object keys can identify private
+data, so the sidecar does not add `s3.object.key` unless the operator turns it
+on. `url.path` always contains the request path and may contain an object key.
+Treat exported traces as sensitive when keys are private.
+
+### Logs
+
+When `otel.logs = true`, the sidecar exports `tracing` events through the
+OpenTelemetry log appender. It keeps stderr output. Every record carries the
+trace id and span id of the current span. The appender maps `tracing` levels to
+OpenTelemetry severity: `TRACE`, `DEBUG`, `INFO`, `WARN`, and `ERROR`.
+
+`check` does not start OpenTelemetry and does not export any signal.
+
+### Metrics
 
 All instrument names start with `s3_sidecar.` and use dots. The tables below
 use that prefix once per table.
