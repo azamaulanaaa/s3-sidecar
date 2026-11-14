@@ -14,6 +14,18 @@ use crate::cluster::coordinator::{CoordError, Coordinator, Entry};
 use crate::cluster::state::{Applied, ApplyOutcome, ApplyResult, MetadataStore};
 use crate::metrics::Metrics;
 
+/// Delay between write attempts while the cluster elects a leader.
+const PROPOSE_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Header that reports why a leader refused a forwarded proposal.
+pub const PROPOSE_ERROR_HEADER: &str = "x-s3-sidecar-raft-error";
+
+/// Header value for a proposal that the leader did not accept.
+pub const PROPOSE_ERROR_UNAVAILABLE: &str = "unavailable";
+
+/// Header value for a proposal with an unknown commit status.
+pub const PROPOSE_ERROR_INDETERMINATE: &str = "indeterminate";
+
 /// Reply from the leader for one forwarded proposal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposeReply {
@@ -87,6 +99,22 @@ impl RaftCoordinator {
         applied_from_reply(&response.log_id, response.data)
     }
 
+    async fn propose_once(
+        &self,
+        node: &Arc<RaftNode>,
+        entry: &Entry,
+    ) -> Result<Applied, CoordError> {
+        if node.is_leader() {
+            match self.write_local(node, entry.clone()).await {
+                Ok(applied) => Ok(applied),
+                Err(CoordError::Unavailable) => self.forward_propose(entry.clone()).await,
+                Err(error) => Err(error),
+            }
+        } else {
+            self.forward_propose(entry.clone()).await
+        }
+    }
+
     async fn forward_propose(&self, entry: Entry) -> Result<Applied, CoordError> {
         let node = self.node().ok_or(CoordError::Unavailable)?;
         let leader = node.leader().ok_or(CoordError::Unavailable)?;
@@ -110,7 +138,17 @@ impl RaftCoordinator {
             .await
             .map_err(|_| CoordError::Unavailable)?;
         if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            return Err(CoordError::Unavailable);
+            let reason = response
+                .headers()
+                .get(PROPOSE_ERROR_HEADER)
+                .and_then(|value| value.to_str().ok());
+            return if reason == Some(PROPOSE_ERROR_INDETERMINATE) {
+                Err(CoordError::Indeterminate(
+                    "the raft leader discarded the proposal".to_owned(),
+                ))
+            } else {
+                Err(CoordError::Unavailable)
+            };
         }
         if !response.status().is_success() {
             return Err(CoordError::Storage(format!(
@@ -192,14 +230,16 @@ impl Coordinator for RaftCoordinator {
             let Some(node) = self.node().cloned() else {
                 return Err(CoordError::Unavailable);
             };
-            if node.is_leader() {
-                match self.write_local(&node, entry.clone()).await {
-                    Ok(applied) => Ok(applied),
-                    Err(CoordError::Unavailable) => self.forward_propose(entry).await,
-                    Err(error) => Err(error),
+            let deadline = tokio::time::Instant::now() + node.timeout().max(PROPOSE_RETRY_DELAY);
+            loop {
+                let result = self.propose_once(&node, &entry).await;
+                match result {
+                    Ok(applied) => return Ok(applied),
+                    Err(CoordError::Unavailable) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(PROPOSE_RETRY_DELAY).await;
+                    }
+                    Err(error) => return Err(error),
                 }
-            } else {
-                self.forward_propose(entry).await
             }
         })
     }

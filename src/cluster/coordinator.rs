@@ -48,6 +48,9 @@ pub enum CoordError {
     /// The cluster has no leader.
     #[error("the cluster has no leader")]
     Unavailable,
+    /// The cluster changed leader and the commit status is unknown.
+    #[error("the commit status is unknown: {0}")]
+    Indeterminate(String),
     /// The metadata store or raft backend failed.
     #[error("the metadata store failed: {0}")]
     Storage(String),

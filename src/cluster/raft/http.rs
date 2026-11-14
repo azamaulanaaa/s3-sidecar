@@ -5,7 +5,8 @@ use std::sync::Arc;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, VoteRequest, VoteResponse,
 };
@@ -13,10 +14,13 @@ use openraft::{ReadPolicy, Snapshot};
 use serde::de::DeserializeOwned;
 use subtle::ConstantTimeEq;
 
-use super::coordinator::{ProposeReply, ReadIndexReply};
+use super::coordinator::{
+    PROPOSE_ERROR_HEADER, PROPOSE_ERROR_INDETERMINATE, PROPOSE_ERROR_UNAVAILABLE, ProposeReply,
+    ReadIndexReply,
+};
 use super::network::{SnapshotRequest, TOKEN_HEADER};
 use super::{RaftNode, TypeConfig};
-use crate::cluster::coordinator::Entry;
+use crate::cluster::coordinator::{CoordError, Entry};
 use crate::server::AppState;
 
 fn raft_node(state: &AppState, headers: &HeaderMap) -> Result<Arc<RaftNode>, StatusCode> {
@@ -104,22 +108,45 @@ pub async fn snapshot(
 ///
 /// # Errors
 ///
-/// Returns an error status when the token is wrong or the raft call fails.
+/// Returns an error status when the token is wrong, the node has no leader,
+/// or the proposal result is unknown.
 pub async fn propose(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<ProposeReply>, StatusCode> {
-    let node = raft_node(&state, &headers)?;
-    let entry: Entry = parse(&body)?;
-    let response = node
-        .client_write(entry)
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok(Json(ProposeReply {
-        log_id: response.log_id,
-        outcome: response.data,
-    }))
+) -> Response {
+    let node = match raft_node(&state, &headers) {
+        Ok(node) => node,
+        Err(status) => return status.into_response(),
+    };
+    let entry: Entry = match parse(&body) {
+        Ok(entry) => entry,
+        Err(status) => return status.into_response(),
+    };
+    match node.client_write(entry).await {
+        Ok(response) => Json(ProposeReply {
+            log_id: response.log_id,
+            outcome: response.data,
+        })
+        .into_response(),
+        Err(CoordError::Unavailable) => {
+            propose_error(StatusCode::SERVICE_UNAVAILABLE, PROPOSE_ERROR_UNAVAILABLE)
+        }
+        Err(CoordError::Indeterminate(_)) => {
+            propose_error(StatusCode::SERVICE_UNAVAILABLE, PROPOSE_ERROR_INDETERMINATE)
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+fn propose_error(status: StatusCode, reason: &'static str) -> Response {
+    let mut response = status.into_response();
+    if let Ok(value) = HeaderValue::from_str(reason) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(PROPOSE_ERROR_HEADER), value);
+    }
+    response
 }
 
 /// Handle one forwarded read index request.

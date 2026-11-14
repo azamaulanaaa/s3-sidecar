@@ -53,9 +53,9 @@ pub async fn propose(
     match coordinator.apply_forwarded(entry).await {
         Ok(applied) => Json(ProposeReply::Applied(applied)).into_response(),
         Err(CoordError::Rejected(reason)) => Json(ProposeReply::Rejected(reason)).into_response(),
-        Err(CoordError::StaleTerm { .. } | CoordError::Unavailable) => {
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
+        Err(
+            CoordError::StaleTerm { .. } | CoordError::Unavailable | CoordError::Indeterminate(_),
+        ) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(CoordError::Storage(message)) => {
             warn!(error = %message, "consul proposal failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
