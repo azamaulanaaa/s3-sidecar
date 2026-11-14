@@ -91,6 +91,15 @@ pub struct CommitRequest {
     pub content_encoding: Option<String>,
     /// Content-Disposition value.
     pub content_disposition: Option<String>,
+    /// Content-Language value.
+    #[serde(default)]
+    pub content_language: Option<String>,
+    /// Expires value.
+    #[serde(default)]
+    pub expires: Option<String>,
+    /// Storage class value.
+    #[serde(default)]
+    pub storage_class: Option<String>,
     /// Commit time in Unix seconds. The state machine applies this value.
     pub committed_at: i64,
 }

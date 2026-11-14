@@ -953,6 +953,9 @@ fn commit_metadata(current: Option<&Metadata>, request: &CommitRequest) -> Metad
         cache_control: request.cache_control.clone(),
         content_encoding: request.content_encoding.clone(),
         content_disposition: request.content_disposition.clone(),
+        content_language: request.content_language.clone(),
+        expires: request.expires.clone(),
+        storage_class: request.storage_class.clone(),
     }
 }
 
@@ -974,6 +977,9 @@ fn tombstone_metadata(current: Option<&Metadata>, owner: &str, deleted_at: i64) 
         cache_control: None,
         content_encoding: None,
         content_disposition: None,
+        content_language: None,
+        expires: None,
+        storage_class: None,
     }
 }
 
@@ -1052,6 +1058,9 @@ mod tests {
             cache_control: None,
             content_encoding: None,
             content_disposition: None,
+            content_language: None,
+            expires: None,
+            storage_class: None,
         }
     }
 
