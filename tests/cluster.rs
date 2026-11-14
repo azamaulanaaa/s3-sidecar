@@ -1743,6 +1743,231 @@ async fn bucket_config_is_seeded_once() {
 }
 
 #[tokio::test]
+async fn list_buckets_and_head_bucket_use_cluster_metadata() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+
+    let response = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(body.contains("<ListAllMyBucketsResult"));
+    assert!(body.contains("<ID>AKIA</ID>"));
+    assert!(body.contains("<Name>media</Name>"));
+
+    let response = signed_request(
+        &client,
+        Method::HEAD,
+        &format!("{}/media", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = signed_request(
+        &client,
+        Method::HEAD,
+        &format!("{}/forbidden", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn list_objects_v1_supports_marker_and_delimiter() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    for key in ["alpha/one", "alpha/two", "beta/one", "beta/two", "gamma"] {
+        let response = put(
+            &client,
+            &format!("{}/media/{key}", sidecar.url),
+            b"body",
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(body.contains("<ListBucketResult"));
+    assert!(body.contains("<Key>alpha/one</Key>"));
+    assert!(body.contains("<Key>gamma</Key>"));
+    assert!(!body.contains("<KeyCount>"));
+    assert!(!body.contains("<NextContinuationToken>"));
+
+    let response = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?delimiter=/", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    let body = body_text(response).await;
+    assert!(body.contains("<CommonPrefixes><Prefix>alpha/</Prefix></CommonPrefixes>"));
+    assert!(body.contains("<CommonPrefixes><Prefix>beta/</Prefix></CommonPrefixes>"));
+    assert!(body.contains("<Key>gamma</Key>"));
+    assert!(!body.contains("<Key>alpha/one</Key>"));
+    assert!(body.contains("<Delimiter>/</Delimiter>"));
+
+    let response = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?delimiter=/&marker=alpha/", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    let body = body_text(response).await;
+    assert!(!body.contains("<CommonPrefixes><Prefix>alpha/</Prefix></CommonPrefixes>"));
+    assert!(body.contains("<CommonPrefixes><Prefix>beta/</Prefix></CommonPrefixes>"));
+    assert!(body.contains("<Marker>alpha/</Marker>"));
+
+    let response = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?marker=beta/one", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    let body = body_text(response).await;
+    assert!(!body.contains("<Key>alpha/one</Key>"));
+    assert!(!body.contains("<Key>beta/one</Key>"));
+    assert!(body.contains("<Key>beta/two</Key>"));
+    assert!(body.contains("<Key>gamma</Key>"));
+
+    let response = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?max-keys=1", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    let body = body_text(response).await;
+    assert!(body.contains("<IsTruncated>true</IsTruncated>"));
+    assert!(body.contains("<NextMarker>alpha/one</NextMarker>"));
+    assert!(!body.contains("<KeyCount>"));
+}
+
+#[tokio::test]
+async fn cluster_create_and_delete_bucket_are_not_implemented() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let create = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(create.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        body_text(create)
+            .await
+            .contains("<Code>NotImplemented</Code>")
+    );
+
+    let delete = signed_request(
+        &client,
+        Method::DELETE,
+        &format!("{}/media", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(delete.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        body_text(delete)
+            .await
+            .contains("<Code>NotImplemented</Code>")
+    );
+
+    let subresource = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?acl", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(subresource.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
 async fn gc_removes_orphan_and_tombstoned_blobs() {
     let (backing, handle) = spawn_backing().await;
     handle.insert("orphan", b"orphan", "2000-01-01T00:00:00Z");

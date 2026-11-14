@@ -871,11 +871,7 @@ impl Cluster {
     /// Returns an error for an invalid token or a metadata read failure.
     pub async fn list_objects(&self, bucket: &str, query: &str) -> Result<Response, S3Error> {
         let pairs = query_pairs(query);
-        if query_value(&pairs, "list-type") != Some("2") {
-            return Err(S3Error::not_implemented(
-                "Only ListObjectsV2 is supported in cluster mode.",
-            ));
-        }
+        let version2 = query_value(&pairs, "list-type") == Some("2");
         if self.bucket_config(bucket)?.read == ReadMode::Leader {
             self.read_index_for(bucket, None).await?;
         }
@@ -885,9 +881,16 @@ impl Cluster {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(1_000)
             .min(1_000);
-        let start_after = match query_value(&pairs, "continuation-token") {
-            Some(token) => Some(decode_token(token)?),
-            None => query_value(&pairs, "start-after").map(str::to_owned),
+        let marker = query_value(&pairs, "marker").unwrap_or_default();
+        let start_after = if version2 {
+            match query_value(&pairs, "continuation-token") {
+                Some(token) => Some(decode_token(token)?),
+                None => query_value(&pairs, "start-after").map(str::to_owned),
+            }
+        } else if marker.is_empty() {
+            None
+        } else {
+            Some(marker.to_owned())
         };
         let rows = self.state.scan_bucket(bucket).map_err(map_coord_error)?;
         let mut contents = Vec::new();
@@ -936,13 +939,27 @@ impl Cluster {
             contents.push((key, metadata));
             count += 1;
         }
-        let token = last.as_deref().map(encode_token);
-        Ok(list_response(
+        if version2 {
+            let token = last.as_deref().map(encode_token);
+            return Ok(list_response(
+                bucket,
+                prefix,
+                max_keys,
+                truncated,
+                token.as_deref(),
+                &contents,
+                &prefixes,
+            ));
+        }
+        let next_marker = if truncated { last.as_deref() } else { None };
+        Ok(list_response_v1(
             bucket,
             prefix,
+            marker,
+            delimiter,
             max_keys,
             truncated,
-            token.as_deref(),
+            next_marker,
             &contents,
             &prefixes,
         ))
@@ -1758,6 +1775,58 @@ fn list_response(
         xml.push_str(&format!(
             "<NextContinuationToken>{}</NextContinuationToken>",
             xml_escape(token)
+        ));
+    }
+    for (key, metadata) in contents {
+        xml.push_str("<Contents>");
+        xml.push_str(&format!("<Key>{}</Key>", xml_escape(key)));
+        if let Some(committed) = metadata.committed_at {
+            xml.push_str(&format!(
+                "<LastModified>{}</LastModified>",
+                unix_timestamp(committed)
+            ));
+        }
+        xml.push_str(&format!("<ETag>\"{}\"</ETag>", xml_escape(&metadata.etag)));
+        xml.push_str(&format!("<Size>{}</Size>", metadata.size));
+        xml.push_str("<StorageClass>STANDARD</StorageClass>");
+        xml.push_str("</Contents>");
+    }
+    for prefix in prefixes {
+        xml.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            xml_escape(prefix)
+        ));
+    }
+    xml.push_str("</ListBucketResult>");
+    xml_response(StatusCode::OK, xml)
+}
+
+#[allow(clippy::too_many_arguments, clippy::format_push_string)]
+fn list_response_v1(
+    bucket: &str,
+    prefix: &str,
+    marker: &str,
+    delimiter: Option<&str>,
+    max_keys: usize,
+    truncated: bool,
+    next_marker: Option<&str>,
+    contents: &[(String, Metadata)],
+    prefixes: &[String],
+) -> Response {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    xml.push_str("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    xml.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
+    xml.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(prefix)));
+    xml.push_str(&format!("<Marker>{}</Marker>", xml_escape(marker)));
+    xml.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    if let Some(delimiter) = delimiter {
+        xml.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(delimiter)));
+    }
+    xml.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+    if let Some(next_marker) = next_marker {
+        xml.push_str(&format!(
+            "<NextMarker>{}</NextMarker>",
+            xml_escape(next_marker)
         ));
     }
     for (key, metadata) in contents {

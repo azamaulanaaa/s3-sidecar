@@ -183,10 +183,35 @@ async fn origin_handler(
 ) -> Response {
     let (bucket, key) = split_path(uri.path());
     if key.is_empty() {
-        return xml(
-            StatusCode::NOT_FOUND,
-            "<Error><Code>NoSuchKey</Code></Error>",
-        );
+        let query = uri.query().unwrap_or_default();
+        return match method {
+            Method::HEAD | Method::PUT => Response::builder()
+                .status(StatusCode::OK)
+                .body(Body::empty())
+                .unwrap(),
+            Method::GET => {
+                let marker = query_value(query, "marker").unwrap_or_default();
+                let prefix = query_value(query, "prefix").unwrap_or_default();
+                xml(
+                    StatusCode::OK,
+                    &format!(
+                        "<ListBucketResult><Name>{}</Name><Marker>{}</Marker>\
+                         <Prefix>{}</Prefix></ListBucketResult>",
+                        escape_xml(&bucket),
+                        escape_xml(&marker),
+                        escape_xml(&prefix)
+                    ),
+                )
+            }
+            Method::DELETE => Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Body::empty())
+                .unwrap(),
+            _ => xml(
+                StatusCode::NOT_IMPLEMENTED,
+                "<Error><Code>NotImplemented</Code></Error>",
+            ),
+        };
     }
     let object_key = format!("{bucket}/{key}");
     match method {
@@ -566,6 +591,15 @@ fn client_config() -> ClientConfig {
     }
 }
 
+fn other_client_config() -> ClientConfig {
+    ClientConfig {
+        access_key_id: "SECOND".to_owned(),
+        secret_access_key: SecretString::new("second-secret"),
+        session_token: None,
+        buckets: vec!["other".to_owned(), "second".to_owned()],
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn config(
     origin: String,
@@ -690,8 +724,18 @@ fn signed_request_with_headers(
     body: Option<Vec<u8>>,
     extra: &[(&str, &str)],
 ) -> reqwest::RequestBuilder {
+    signed_request_with_credential(client, &credential(), method, url, body, extra)
+}
+
+fn signed_request_with_credential(
+    client: &reqwest::Client,
+    credential: &Arc<ClientCredential>,
+    method: Method,
+    url: &str,
+    body: Option<Vec<u8>>,
+    extra: &[(&str, &str)],
+) -> reqwest::RequestBuilder {
     let parsed = Url::parse(url).unwrap();
-    let credential = credential();
     let mut headers = HeaderMap::new();
     for (name, value) in extra {
         headers.insert(
@@ -709,7 +753,7 @@ fn signed_request_with_headers(
         &parsed,
         &mut headers,
         payload_hash,
-        &credential,
+        credential,
         "us-east-1",
         OffsetDateTime::now_utc(),
     )
@@ -1974,6 +2018,197 @@ async fn write_mode_rejects_sse_c() {
     .unwrap();
     assert_eq!(put.status(), StatusCode::NOT_IMPLEMENTED);
     assert_eq!(origin.put_count(), 0);
+}
+
+#[tokio::test]
+async fn list_buckets_returns_only_allowed_buckets() {
+    let (origin_url, _origin) = spawn_origin().await;
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let response = signed_request(&client, Method::GET, &format!("{}/", sidecar.url), None)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/xml"
+    );
+    let body = body_text(response).await;
+    assert!(body.contains("<ListAllMyBucketsResult"));
+    assert!(body.contains("<ID>AKIA</ID>"));
+    assert!(body.contains("<Name>media</Name>"));
+    assert!(!body.contains("<Name>other</Name>"));
+}
+
+#[tokio::test]
+async fn list_buckets_uses_the_client_allow_list() {
+    let (origin_url, _origin) = spawn_origin().await;
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    );
+    config.clients = vec![client_config(), other_client_config()];
+    let sidecar = spawn_sidecar(config).await;
+    let client = reqwest::Client::new();
+    let credential = CredentialStore::new(&[other_client_config()])
+        .lookup("SECOND")
+        .unwrap();
+    let response = signed_request_with_credential(
+        &client,
+        &credential,
+        Method::GET,
+        &format!("{}/", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_text(response).await;
+    assert!(body.contains("<Name>other</Name>"));
+    assert!(body.contains("<Name>second</Name>"));
+    assert!(!body.contains("<Name>media</Name>"));
+}
+
+#[tokio::test]
+async fn cache_mode_bucket_operations_pass_through_to_origin() {
+    let (origin_url, _origin) = spawn_origin().await;
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let head = signed_request(
+        &client,
+        Method::HEAD,
+        &format!("{}/media", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+
+    let list = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?marker=item-2&prefix=item-", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = body_text(list).await;
+    assert!(body.contains("<Marker>item-2</Marker>"));
+    assert!(body.contains("<Prefix>item-</Prefix>"));
+
+    let create = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let delete = signed_request(
+        &client,
+        Method::DELETE,
+        &format!("{}/media", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn bucket_access_is_limited_to_the_client_allow_list() {
+    let (origin_url, _origin) = spawn_origin().await;
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    );
+    config.clients = vec![client_config(), other_client_config()];
+    let sidecar = spawn_sidecar(config).await;
+    let client = reqwest::Client::new();
+    let unknown = Arc::new(ClientCredential::new(
+        "UNKNOWN",
+        SecretString::new("unknown-secret"),
+        None,
+        Vec::new(),
+    ));
+    let response = signed_request_with_credential(
+        &client,
+        &unknown,
+        Method::GET,
+        &format!("{}/", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let second = CredentialStore::new(&[other_client_config()])
+        .lookup("SECOND")
+        .unwrap();
+    let response = signed_request_with_credential(
+        &client,
+        &second,
+        Method::HEAD,
+        &format!("{}/media", sidecar.url),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
