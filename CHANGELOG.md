@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog. This project uses Semantic Versioning.
 
+## [0.3.0-rc.1] - 2026-11-15
+
+This candidate contains the changes for 0.3.0. The final 0.3.0 release follows
+after the candidate passes.
+
 ## [0.3.0] - 2026-11-15
 
 ### Added
