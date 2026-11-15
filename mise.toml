@@ -27,6 +27,14 @@ run = "cargo deny check"
 description = "Print the cargo-dist release plan"
 run = "dist plan"
 
+[tasks.set-version]
+description = "Set the crate version in Cargo.toml and Cargo.lock"
+run = "bash scripts/set-version.sh"
+
+[tasks.check-release-tag]
+description = "Check that a release tag matches the crate version"
+run = "bash scripts/check-release-tag.sh"
+
 [tasks.ci]
 description = "Run the local CI checks that the pre-push hook runs"
 run = ".githooks/ci-check.sh push"
