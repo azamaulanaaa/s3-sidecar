@@ -55,6 +55,9 @@ and commit the result.
 Run `mise exec -- <command>` when `mise.toml` supplies the tool. Do not use
 `--locked` before you update `Cargo.lock`.
 
+The `cargo-dist` version in `mise.toml` equals `cargo-dist-version` in
+`dist-workspace.toml`, and a version change updates both files.
+
 ## Release candidate
 
 1. Set the candidate version.

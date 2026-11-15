@@ -1,6 +1,6 @@
 [tools]
 cargo-deny = "latest"
-cargo-dist = "latest"
+cargo-dist = "0.34.0"
 rust = "stable"
 
 [tasks.build]
