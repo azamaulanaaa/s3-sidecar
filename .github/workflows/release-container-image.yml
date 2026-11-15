@@ -1,10 +1,12 @@
 name: Release Container Image
 
-# Publish the multi-arch container image when a GitHub release is published.
+# Publish the multi-arch container image when the Release workflow announces a
+# release. A human can also publish a release in the GitHub UI, which uses the
+# `release: published` event, or dispatch the workflow by hand.
 #
-# Use the `release: published` event. The release event gives the tag directly.
-# Do not use a `workflow_run` trigger on release.yml. That trigger can also
-# start from a pull request run.
+# The Release workflow calls this workflow through a cargo-dist custom job. A
+# called workflow gets the caller's event. Thus the default path resolves the
+# tag from `github.ref_name`.
 on:
   release:
     types:
@@ -15,12 +17,22 @@ on:
         description: Release tag to publish, for example 0.2.0
         required: true
         type: string
+      prerelease:
+        description: Set to true for a prerelease. A prerelease does not update the latest tag.
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      plan:
+        description: The cargo-dist plan from the Release workflow.
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   BINARY_NAME: s3-sidecar
-  TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 permissions:
   contents: read
@@ -28,18 +40,68 @@ permissions:
 # Use one run for each tag. Never cancel a run that started. A second run for
 # the same tag must not remove images that the first run pushed.
 concurrency:
-  group: release-container-image-${{ github.event.release.tag_name || inputs.tag }}
+  group: release-container-image-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
+  resolve:
+    name: Resolve the release information
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - name: Resolve the tag and prerelease flag
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+            prerelease="${INPUT_PRERELEASE:-false}"
+            publish=true
+          elif [ "$EVENT_NAME" = "release" ]; then
+            tag="$RELEASE_TAG"
+            prerelease="${RELEASE_PRERELEASE:-false}"
+            publish=true
+          else
+            tag="$GITHUB_REF_NAME"
+            prerelease=false
+            publish=false
+            if prerelease=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease' 2>/dev/null); then
+              publish=true
+            else
+              prerelease=false
+              echo "::notice::The release $tag does not exist or is not accessible. The image build is skipped."
+            fi
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::The tag is empty. Set the tag input or run the workflow from a tag."
+            exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
   build-arch-images:
     name: Build the ${{ matrix.arch }} image
+    needs: resolve
+    if: ${{ needs.resolve.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-    outputs:
-      tag: ${{ github.event.release.tag_name || inputs.tag }}
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +116,7 @@ jobs:
       - name: Check out the release tag
         uses: actions/checkout@v7
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ needs.resolve.outputs.tag }}
           persist-credentials: false
 
       - name: Set up Docker Buildx
@@ -71,6 +133,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TARGET: ${{ matrix.target }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir -p download
@@ -107,19 +170,38 @@ jobs:
           echo "Moved $BINARY_NAME to the project root."
 
       - name: Build and push the architecture image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: .github/Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.TAG }}-${{ matrix.arch }}
-          build-args: |
-            BINARY_NAME=${{ env.BINARY_NAME }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.resolve.outputs.tag }}-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          attempt=1
+          max_attempts=3
+          while true; do
+            if docker buildx build \
+              --file .github/Dockerfile \
+              --platform "$PLATFORM" \
+              --tag "$IMAGE" \
+              --build-arg "BINARY_NAME=$BINARY_NAME" \
+              --push .; then
+              echo "Pushed $IMAGE."
+              exit 0
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::Cannot push $IMAGE. The push failed $max_attempts times. The token may have no package write access. The package may not be linked to this repository. A human must grant this repository write access to the package in the package settings."
+              exit 1
+            fi
+            echo "Push attempt $attempt failed. Retry the push."
+            sleep $((attempt * 5))
+            attempt=$((attempt + 1))
+          done
 
   create-manifest:
     name: Create the multi-arch manifest
-    needs: build-arch-images
+    needs:
+      - resolve
+      - build-arch-images
+    if: ${{ needs.resolve.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -134,7 +216,7 @@ jobs:
 
       - name: Create the version manifest
         env:
-          TAG: ${{ needs.build-arch-images.outputs.tag }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           set -euo pipefail
           base="${REGISTRY}/${IMAGE_NAME}"
@@ -145,8 +227,8 @@ jobs:
 
       - name: Update the latest tag
         env:
-          TAG: ${{ needs.build-arch-images.outputs.tag }}
-          PRERELEASE: ${{ github.event.release.prerelease }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
         run: |
           set -euo pipefail
           if [ "${PRERELEASE:-false}" = "true" ]; then

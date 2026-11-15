@@ -88,6 +88,24 @@ Run `mise exec -- <command>` when `mise.toml` supplies the tool. Do not use
 
 8. Verify the published checksums.
 
+## Container image workflow
+
+The `dist-workspace.toml` file declares the container image workflow as a
+cargo-dist `post-announce-jobs` custom job. cargo-dist runs this custom job
+after the release is created and after the announce phase. Do not edit
+`.github/workflows/release.yml` by hand. That file is generated. Run
+`mise exec -- dist generate --mode ci` after you change `dist-workspace.toml`.
+
+A human can publish a release in the GitHub UI. That action starts the image
+workflow through the `release: published` event.
+
+### Container registry access
+
+The first push creates the GHCR package. The first push can return `denied`
+while GitHub links the package to the repository. The workflow retries the push
+three times. If the retries still fail, a human grants this repository write
+access to the package in the package settings.
+
 ## Human-only steps
 
 A human performs these steps:
