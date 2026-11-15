@@ -69,6 +69,9 @@ pub enum CacheError {
     /// The request body could not be read.
     #[error("the request body could not be read")]
     Body,
+    /// The entry has no readable cache blob.
+    #[error("the cache blob for the entry is absent")]
+    BlobMissing,
 }
 
 impl CacheError {
@@ -78,7 +81,7 @@ impl CacheError {
         match self {
             Self::Unavailable | Self::Body => true,
             Self::Status(status) => *status >= 500 || *status == 408 || *status == 429,
-            Self::Metadata | Self::Index(_) | Self::TooLarge => false,
+            Self::Metadata | Self::Index(_) | Self::TooLarge | Self::BlobMissing => false,
         }
     }
 }
@@ -376,6 +379,22 @@ impl Cache {
         lock(&self.tombstones).contains_key(&(bucket.to_owned(), key.to_owned()))
     }
 
+    /// Return one snapshot of the pending writes and tombstones for a bucket.
+    #[must_use]
+    pub fn write_state(&self, bucket: &str) -> (Vec<CacheMetadata>, Vec<String>) {
+        let pending = lock(&self.pending)
+            .iter()
+            .filter(|((name, _), _)| name == bucket)
+            .map(|(_, entry)| entry.meta.clone())
+            .collect();
+        let tombstones = lock(&self.tombstones)
+            .keys()
+            .filter(|(name, _)| name == bucket)
+            .map(|(_, key)| key.clone())
+            .collect();
+        (pending, tombstones)
+    }
+
     /// Read one cache entry from the metadata object.
     ///
     /// # Errors
@@ -413,6 +432,16 @@ impl Cache {
         let cache_key = self.cache_key(bucket, key);
         self.get_object(self.cache_bucket(), &cache_key, range)
             .await
+    }
+
+    /// Return true when the cache blob for one origin object exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache endpoint is not available.
+    pub async fn blob_exists(&self, bucket: &str, key: &str) -> Result<bool, CacheError> {
+        let cache_key = self.cache_key(bucket, key);
+        self.head_object(self.cache_bucket(), &cache_key).await
     }
 
     /// Store updated metadata for an entry.

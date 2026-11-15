@@ -141,12 +141,27 @@ A cached `GET` or `HEAD` evaluates conditional headers against the cached entry.
 The cache does not evaluate `If-Range`. A conditional range request can return
 `206 PartialContent` when the validator does not match.
 
+A pending entry or a fresh entry must have a readable cache body. When the body
+is absent, the read returns `503 ServiceUnavailable` and does not read origin.
+An entry above `cache.max_object_bytes` still falls back to origin.
+
 ## Bucket operations
 
 Cache mode answers `ListBuckets` from the client allow list. It does not send
-the request to origin. `CreateBucket`, `DeleteBucket`, `HeadBucket`,
-`ListObjects` V1, `ListObjects` V2, and bucket sub-resources go to origin. A
-successful `DeleteBucket` does not remove cached objects.
+the request to origin. `CreateBucket`, `DeleteBucket`, `HeadBucket`, and bucket
+sub-resources go to origin. A successful `DeleteBucket` does not remove cached
+objects.
+
+Cache mode `ListObjects` V1 and V2 use the origin listing as the base. The
+sidecar reads origin one page at a time. A key with a pending write-back entry
+appears in the merged view before its sync completes. A key with a staged delete
+or a tombstone does not appear. `Prefix`, `Delimiter`, `Marker`, `MaxKeys`,
+`ContinuationToken`, and `StartAfter` apply to the merged view. A sidecar token
+resumes the merge across a restart. A V2 token that is not a sidecar token goes
+to origin for that page. `encoding-type=url` encodes the key values. The sidecar
+rejects any other `encoding-type` value with `400 InvalidArgument`. When the
+bucket has no pending entry and no tombstone, the request goes to origin
+unchanged.
 
 Cluster mode answers `ListBuckets` from the client allow list. `HeadBucket`
 returns `200` for an allowed bucket. `ListObjects` V1 and V2 read committed
@@ -717,8 +732,14 @@ S3 client was available.
   bucket during a write can observe old metadata with new bytes. The accepting
   sidecar hides the window after it installs the pending entry. A read before
   that install can still observe the mix.
-- Cache-mode `ListObjects` reads origin. A key with a pending write-back is not
-  listed until the sync completes.
+- Cache-mode `ListObjects` reads origin and merges the local pending writes and
+  tombstones. A pending write appears before its sync completes. A key with a
+  staged delete or a tombstone does not appear.
+- A merged V2 listing uses a sidecar-owned continuation token. The token resumes
+  the merge across a restart. A V2 token that is not a sidecar token goes to
+  origin for that page and can omit local pending writes on that page.
+- The merged list view shows the local pending writes and tombstones only.
+  Another sidecar sees the write after the sync completes.
 - Batch delete invalidation is best effort. A failed or quarantined journal can
   recreate a deleted key after a restart. The single-object delete path has the
   same limit.

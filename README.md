@@ -403,6 +403,10 @@ applies backpressure from the cache to the client stream.
 
 `HEAD` serves metadata only. It never fills a cache body.
 
+A pending entry or a fresh entry must have a readable cache body. When the body
+is absent, the read returns `503 ServiceUnavailable` and does not read origin.
+An entry above `cache.max_object_bytes` still falls back to origin.
+
 ### Object headers
 
 The cache persists and replays a fixed allowlist of object headers:
@@ -483,9 +487,19 @@ the key from reads. In `read` mode the delete goes to origin first.
 ### Bucket operations
 
 Cache mode answers `ListBuckets` from the client allow list. It does not send
-this request to origin. `CreateBucket`, `DeleteBucket`, `HeadBucket`,
-`ListObjects` V1, `ListObjects` V2, and bucket sub-resource requests go to
-origin. The cache does not store bucket responses.
+this request to origin. `CreateBucket`, `DeleteBucket`, `HeadBucket`, and bucket
+sub-resource requests go to origin. The cache does not store bucket responses.
+
+`ListObjects` V1 and V2 use the origin listing as the base. The sidecar reads
+origin one page at a time. A key with a pending write-back entry appears in the
+merged view before its sync completes. A key with a staged delete or a tombstone
+does not appear. `Prefix`, `Delimiter`, `Marker`, `MaxKeys`,
+`ContinuationToken`, and `StartAfter` apply to the merged view. A sidecar token
+resumes the merge across a restart. A V2 token that is not a sidecar token goes
+to origin for that page. `encoding-type=url` encodes the key values. The sidecar
+rejects any other `encoding-type` value with `400 InvalidArgument`. When the
+bucket has no pending entry and no tombstone, the request goes to origin
+unchanged.
 
 A successful `DeleteBucket` does not purge cached objects for that bucket. The
 cache can still serve an entry until its TTL expires or an eviction removes it.
@@ -1101,6 +1115,11 @@ and is not part of the pull request gate.
   bucket during a write can observe old metadata with new bytes. The accepting
   sidecar hides the window after it installs the pending entry. A read before
   that install can still observe the mix.
+- A merged V2 listing uses a sidecar-owned continuation token. The token resumes
+  the merge across a restart. A V2 token that is not a sidecar token goes to
+  origin for that page and can omit local pending writes on that page.
+- The merged list view shows the local pending writes and tombstones only.
+  Another sidecar sees the write after the sync completes.
 - Cache mode does not evaluate `If-Range`. A conditional range request can
   return `206 PartialContent` when the validator does not match.
 - The cache header allowlist is fixed. The cache does not preserve object tags,

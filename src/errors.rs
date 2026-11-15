@@ -138,6 +138,16 @@ impl S3Error {
         )
     }
 
+    /// A cache entry exists but its body is not readable.
+    #[must_use]
+    pub fn cached_blob_missing() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "The cache entry exists but its object body is not readable.",
+        )
+    }
+
     /// No leader or metadata quorum is available. The client can retry.
     #[must_use]
     pub fn no_leader() -> Self {

@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog. This project uses Semantic Versioning.
 
+## [Unreleased]
+
+### Added
+
+- Cache mode `ListObjects` V1 and V2 merge pending write-back keys into the
+  origin listing and hide keys with a staged delete or a tombstone. The merge
+  reads origin one page at a time and resumes with a stateless sidecar token.
+  `Prefix`, `Delimiter`, `Marker`, `MaxKeys`, `ContinuationToken`, and
+  `StartAfter` apply to the merged view.
+- Cache mode merged listings support `encoding-type=url`. Any other
+  `encoding-type` value returns `400 InvalidArgument`.
+
+### Fixed
+
+- A pending or fresh cached `GET` or `HEAD` returns `503 ServiceUnavailable`
+  when the cache entry has no readable body.
+
 ## [0.3.0-rc.1] - 2026-11-15
 
 This candidate contains the changes for 0.3.0. The final 0.3.0 release follows
