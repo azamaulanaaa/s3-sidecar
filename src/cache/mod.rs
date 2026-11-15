@@ -707,6 +707,7 @@ impl Cache {
 
     async fn gc_bucket(&self, bucket: &str) -> Result<(), CacheError> {
         let prefix = blob_prefix(&self.config.cache.prefix);
+        let journal_root = journal_prefix(&self.config.cache.prefix);
         let listing = self.list_keys(bucket, &prefix).await?;
         let journals = self.journal_entries(bucket).await?;
         let referenced: HashSet<String> = journals
@@ -717,6 +718,11 @@ impl Cache {
         let staging = self.config.cache.staging_ttl.as_duration();
         let orphan = self.config.cache.orphan_ttl.as_duration();
         for key in listing {
+            if key.starts_with(&journal_root) {
+                // A journal record is not an orphan blob. The failed-entry loop
+                // below removes it after cache.orphan_ttl.
+                continue;
+            }
             if is_meta_key(&key) {
                 let blob = key.trim_end_matches(".meta").to_owned();
                 if !self.head_object(bucket, &blob).await? {

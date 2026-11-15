@@ -997,6 +997,97 @@ async fn crash_after_ack_resumes_on_restart() {
     .await;
 }
 
+#[tokio::test]
+async fn gc_keeps_journal_records_for_retry() {
+    let (origin_url, _origin) = spawn_origin().await;
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = AppState::new(config(
+        origin_url,
+        cache_url.clone(),
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .unwrap();
+    let cache_api = state.cache().unwrap().clone();
+    let now = unix_now();
+
+    let orphan = blob_key("cache", "media", "orphan");
+    seed_cache(&cache_url, "cachebucket", &orphan, b"orphan body").await;
+
+    let blob = blob_key("cache", "media", "quarantined");
+    let journal = journal_key("cache", "failed-id");
+    seed_cache(&cache_url, "cachebucket", &blob, b"quarantine body").await;
+    seed_cache(
+        &cache_url,
+        "cachebucket",
+        &journal,
+        failed_journal("failed-id", "quarantined", &blob, now).as_bytes(),
+    )
+    .await;
+
+    cache_api.gc_once().await.unwrap();
+
+    assert!(
+        cache.has(&journal),
+        "GC deleted the journal record. A restart cannot retry the write."
+    );
+    assert!(!cache.has(&orphan), "GC did not remove a real orphan blob");
+
+    let stale_blob = blob_key("cache", "media", "stale-quarantine");
+    let stale_journal = journal_key("cache", "stale-id");
+    seed_cache(
+        &cache_url,
+        "cachebucket",
+        &stale_blob,
+        b"stale quarantine body",
+    )
+    .await;
+    seed_cache(
+        &cache_url,
+        "cachebucket",
+        &stale_journal,
+        failed_journal("stale-id", "stale-quarantine", &stale_blob, now - 172_800).as_bytes(),
+    )
+    .await;
+
+    cache_api.gc_once().await.unwrap();
+
+    assert!(
+        !cache.has(&stale_journal),
+        "GC did not remove a failed journal record after cache.orphan_ttl"
+    );
+    assert!(
+        cache.has(&journal),
+        "GC removed a recent failed journal record"
+    );
+}
+
+fn failed_journal(id: &str, origin_key: &str, blob: &str, created_at: i64) -> String {
+    let meta = CacheMetadata {
+        version: 1,
+        origin_bucket: "media".to_owned(),
+        origin_key: origin_key.to_owned(),
+        etag: "\"etag-failed\"".to_owned(),
+        last_modified: None,
+        validated_at: created_at,
+        size: 4,
+        checksum: String::new(),
+        content_type: Some("text/plain".to_owned()),
+        content_encoding: None,
+        headers: std::collections::BTreeMap::new(),
+        state: EntryState::Failed,
+        created_at,
+    };
+    let mut entry = JournalEntry::put(id.to_owned(), blob.to_owned(), &meta);
+    entry.state = EntryState::Failed;
+    serde_json::to_string(&entry).unwrap()
+}
+
 async fn seed_cache(base: &str, bucket: &str, key: &str, body: &[u8]) {
     let response = reqwest::Client::new()
         .put(format!("{base}{}", object_path(bucket, key)))
