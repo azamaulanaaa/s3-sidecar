@@ -1808,13 +1808,15 @@ async fn serve_cached(
         return Ok(None);
     }
     if method == Method::HEAD {
+        if !cache.blob_exists(bucket, key).await? {
+            return Err(crate::cache::CacheError::BlobMissing);
+        }
         state.metrics.hit();
         cache.touch(bucket, key);
         return Ok(Some(metadata_response(meta)));
     }
     let Some(response) = cache.get_blob(bucket, key, range).await? else {
-        cache.invalidate(bucket, key).await;
-        return Ok(None);
+        return Err(crate::cache::CacheError::BlobMissing);
     };
     let status = if range.is_some() && response.status() == StatusCode::PARTIAL_CONTENT {
         StatusCode::PARTIAL_CONTENT
@@ -2389,7 +2391,10 @@ fn cache_error_fallback(cache: &Cache, error: &crate::cache::CacheError) -> bool
 
 fn cache_error(error: &crate::cache::CacheError) -> S3Error {
     warn!(%error, "cache request failed");
-    S3Error::service_unavailable()
+    match error {
+        crate::cache::CacheError::BlobMissing => S3Error::cached_blob_missing(),
+        _ => S3Error::service_unavailable(),
+    }
 }
 
 /// Map one cache multipart error to an S3 error.

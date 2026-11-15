@@ -187,6 +187,10 @@ impl CacheHandle {
     fn fail_puts(&self) {
         *self.put_status.lock().unwrap() = Some(StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    fn remove(&self, key: &str) {
+        self.objects.lock().unwrap().remove(key);
+    }
 }
 
 async fn spawn_origin() -> (String, OriginHandle) {
@@ -2025,6 +2029,128 @@ async fn write_through_origin_failure_discards_cache() {
         async move { !cache.has(&blob) && !cache.has(&format!("{blob}.meta")) }
     })
     .await;
+}
+
+#[tokio::test]
+async fn missing_blob_returns_503_for_a_pending_entry() {
+    let (origin_url, origin) = spawn_origin().await;
+    let permit = origin.block_puts();
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/missing-blob", sidecar.url),
+        Some(b"pending body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    cache.remove(&blob_key("cache", "media", "missing-blob"));
+
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/missing-blob", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(get.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_text(get).await;
+    assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+    assert!(body.contains("object body is not readable"));
+
+    let head = signed_request(
+        &client,
+        Method::HEAD,
+        &format!("{}/media/missing-blob", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(head.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(origin.get_count(), 0);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn missing_blob_returns_503_for_a_fresh_entry() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/fresh", b"fresh body", "\"etag-fresh\"");
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let first = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/fresh", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(body_text(first).await, "fresh body");
+    let blob = blob_key("cache", "media", "fresh");
+    wait_for(Duration::from_secs(2), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { cache.has(&blob) && cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
+    cache.remove(&blob);
+    assert_eq!(origin.get_count(), 1);
+
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/fresh", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(get.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_text(get).await;
+    assert!(body.contains("<Code>ServiceUnavailable</Code>"));
+
+    let head = signed_request(
+        &client,
+        Method::HEAD,
+        &format!("{}/media/fresh", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(head.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(origin.get_count(), 1);
 }
 
 #[tokio::test]
