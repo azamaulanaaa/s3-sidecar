@@ -2,8 +2,8 @@
 
 An S3 sidecar proxy in Rust.
 
-This build implements milestones M0 (proxy core), M1 (cache), and the
-single-node foundation of M2 (coordination):
+This build provides an S3 proxy, a read-through and write-back cache, and
+cluster coordination with the `single`, `raft`, and `consul` backends:
 
 - Layered configuration: defaults, TOML file, environment, and flags.
 - SigV4 authentication: header auth and presigned query auth.
@@ -254,7 +254,7 @@ logs = true
 trace_sample_ratio = 1.0        # 0.0 disables root traces.
 record_object_keys = false      # Redact object keys in spans and logs. Off for privacy.
 service_name = "s3-sidecar"
-service_version = "0.2.0"
+service_version = "0.3.0"
 endpoint = "http://127.0.0.1:4317"
 trace_endpoint = "http://127.0.0.1:4317"
 logs_endpoint = "http://127.0.0.1:4317"
@@ -501,7 +501,7 @@ logs a warning. A read of a quarantined entry returns `404` unless
 `cache.serve_quarantined = true`.
 
 The default conflict policy is last-write-wins. Origin receives the latest
-body. There is no conflict knob in M1. This is a documented limitation.
+body. There is no conflict knob. This is a documented limitation.
 
 If the cache is down, `cache.on_cache_error = "origin"` sends the write to
 origin and returns success. `"fail"` returns an error.

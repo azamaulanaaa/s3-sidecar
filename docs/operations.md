@@ -177,7 +177,7 @@ trace_schedule_delay = "5s"
 log_schedule_delay = "5s"
 record_object_keys = false
 service_name = "s3-sidecar"
-service_version = "0.2.0"
+service_version = "0.3.0"
 endpoint = "http://127.0.0.1:4317"
 protocol = "grpc"                # grpc | http/protobuf
 headers = { "x-api-key" = "..." }
@@ -618,6 +618,26 @@ write transaction, and a raw copy can be inconsistent.
 
 Do not change a bucket consistency knob and the binary in the same step.
 
+### 0.2.0 to 0.3.0
+
+The 0.3.0 release removes the cache `off` mode and the `cache.node_id` field.
+The cache key layout also changes. Read every step before you start.
+
+1. Remove `cache.mode = "off"` and `cache.node_id` from each cache config. A
+   config with either field fails to start.
+2. Set `cache.mode` to `read`, `write`, or `read_write`. The default is
+   `read_write`.
+3. Set a unique `cache.prefix` for each sidecar. Sidecars that share a cache
+   bucket must not share a prefix.
+4. Set `cache.max_bytes`. The field is required. `0` means unlimited.
+5. Expect a cold cache after the upgrade. The new binary does not read the old
+   cache entries. Old blobs and old journal records remain in the cache bucket.
+   Add an S3 lifecycle rule on the old prefixes, or purge them.
+6. Drain pending writes before the upgrade, or upgrade all cache nodes
+   together. A mixed-version set does not share cache entries.
+7. Check `GET /readyz`, the pending-write metric, and the journal after the
+   upgrade.
+
 ### Cache mode
 
 1. Stop new traffic to one sidecar.
@@ -689,12 +709,19 @@ S3 client was available.
 ## Known limits
 
 - Object tagging, versioning, ACLs, bucket policies, and `Select` are not
-  supported.
+  supported. Cluster mode rejects object tagging, ACL, retention, legal hold,
+  object attribute, and `versionId` requests with `501 NotImplemented`. The
+  sidecar does not delete or overwrite the object.
 - A cache entry is two S3 objects: a blob and a metadata object. There is no
   atomic switch between them. A different sidecar that reads the shared cache
   bucket during a write can observe old metadata with new bytes. The accepting
   sidecar hides the window after it installs the pending entry. A read before
   that install can still observe the mix.
+- Cache-mode `ListObjects` reads origin. A key with a pending write-back is not
+  listed until the sync completes.
+- Batch delete invalidation is best effort. A failed or quarantined journal can
+  recreate a deleted key after a restart. The single-object delete path has the
+  same limit.
 - Cache mode does not evaluate `If-Range`. A conditional range request can
   return `206 PartialContent` when the validator does not match.
 - The cache header allowlist is fixed. The cache does not preserve object tags,
@@ -714,6 +741,9 @@ S3 client was available.
 - No negative cache. A missing key returns to origin on each read.
 - Multipart upload records are node-local. A request must reach the same node
   for the whole upload.
+- An in-flight write-back multipart upload lives in memory. A restart loses it.
+  An abandoned upload has no expiry until a restart.
+- `ListMultipartUploads` reads origin. It does not list a cache upload.
 - A forwarded cluster proposal has no idempotency key. A commit followed by a
   lost response can repeat a non-idempotent operation on a client retry.
 - The raft snapshot threshold is fixed at 64 log entries.
@@ -733,3 +763,5 @@ S3 client was available.
   not a live inventory.
 - A TLS listener serves one certificate. Client certificate authentication and
   automatic certificate reload are not implemented.
+- The first container image push may be denied until GitHub links the GHCR
+  package to the repository. The workflow retries three times.

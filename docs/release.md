@@ -6,7 +6,8 @@ instruction.
 
 ## Purpose and version policy
 
-The repository has no `v0.1.0` tag. `v0.2.0` is the first public release tag.
+The repository has no `v0.1.0` tag. `v0.2.0` was the first public release tag.
+`v0.3.0` is the next release tag.
 
 The version follows Semantic Versioning. The `package.version` field in
 `Cargo.toml` is the source of truth. Update `Cargo.lock` in the same change.
@@ -28,9 +29,13 @@ cargo test --all-targets --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 cargo deny check
 dist plan --output-format=human
+dist generate --mode ci --check
 ```
 
-`dist plan --output-format=human` must show version `0.2.0`.
+`dist plan --output-format=human` must show version `0.3.0`.
+`dist generate --mode ci --check` must report no difference. A difference means
+the generated workflow is stale. Run `mise exec -- dist generate --mode ci` and
+commit the result.
 
 Run `mise exec -- <command>` when `mise.toml` supplies the tool. Do not use
 `--locked` before you update `Cargo.lock`.
@@ -40,13 +45,13 @@ Run `mise exec -- <command>` when `mise.toml` supplies the tool. Do not use
 1. Create the candidate tag.
 
    ```bash
-   git tag -a v0.2.0-rc.1 -m "v0.2.0-rc.1"
+   git tag -a v0.3.0-rc.1 -m "v0.3.0-rc.1"
    ```
 
 2. Push the tag.
 
    ```bash
-   git push origin v0.2.0-rc.1
+   git push origin v0.3.0-rc.1
    ```
 
 3. Wait for the release workflow to complete.
@@ -69,20 +74,20 @@ Run `mise exec -- <command>` when `mise.toml` supplies the tool. Do not use
 2. Create the final tag.
 
    ```bash
-   git tag -a v0.2.0 -m "v0.2.0"
+   git tag -a v0.3.0 -m "v0.3.0"
    ```
 
 3. Push the tag.
 
    ```bash
-   git push origin v0.2.0
+   git push origin v0.3.0
    ```
 
 4. Wait for the release workflow to complete.
 
 5. Verify the GitHub release assets.
 
-6. Verify the `v0.2.0` container manifest.
+6. Verify the `v0.3.0` container manifest.
 
 7. Verify the `latest` container tag.
 
@@ -92,9 +97,16 @@ Run `mise exec -- <command>` when `mise.toml` supplies the tool. Do not use
 
 The `dist-workspace.toml` file declares the container image workflow as a
 cargo-dist `post-announce-jobs` custom job. cargo-dist runs this custom job
-after the release is created and after the announce phase. Do not edit
-`.github/workflows/release.yml` by hand. That file is generated. Run
-`mise exec -- dist generate --mode ci` after you change `dist-workspace.toml`.
+after the release is created and after the announce phase. The Release workflow
+calls `.github/workflows/release-container-image.yml` through that custom job.
+Do not edit `.github/workflows/release.yml` by hand. That file is generated.
+Run `mise exec -- dist generate --mode ci` after you change
+`dist-workspace.toml`.
+
+A release created with `GITHUB_TOKEN` does not trigger a separate `release:
+published` workflow. GitHub does not start a new workflow run from an event
+that the `GITHUB_TOKEN` caused. The custom job in the Release workflow is the
+path that publishes the image for an automated release.
 
 A human can publish a release in the GitHub UI. That action starts the image
 workflow through the `release: published` event.

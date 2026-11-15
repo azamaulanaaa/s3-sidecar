@@ -146,7 +146,7 @@ enabled = false
 # record_object_keys = false   # Add s3.object.key and keep object keys in spans and logs.
 #                              # Off redacts span paths and log key fields.
 # service_name = "s3-sidecar"
-# service_version = "0.2.0"
+# service_version = "0.3.0"
 # endpoint = "http://127.0.0.1:4317"
 # trace_endpoint = "http://127.0.0.1:4317"
 # logs_endpoint = "http://127.0.0.1:4317"
