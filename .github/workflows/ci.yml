@@ -43,6 +43,15 @@ jobs:
       - name: Run the test suite
         run: cargo test --all-targets --all-features --locked
 
+  release-scripts:
+    name: Release scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - name: Run the release script tests
+        run: cargo test --test release_scripts --locked
+
   doc:
     name: Doc
     runs-on: ubuntu-latest
