@@ -177,7 +177,7 @@ trace_schedule_delay = "5s"
 log_schedule_delay = "5s"
 record_object_keys = false
 service_name = "s3-sidecar"
-service_version = "0.2.0"
+service_version = "0.3.0"
 endpoint = "http://127.0.0.1:4317"
 protocol = "grpc"                # grpc | http/protobuf
 headers = { "x-api-key" = "..." }
