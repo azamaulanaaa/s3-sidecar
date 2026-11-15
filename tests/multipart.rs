@@ -547,6 +547,17 @@ fn xml_value(xml: &str, tag: &str) -> Option<String> {
     rest.get(..end).map(str::to_owned)
 }
 
+fn xml_text(xml: &str, tag: &str) -> Option<String> {
+    xml_value(xml, tag).map(|value| {
+        value
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
+    })
+}
+
 fn complete_xml(parts: &[(u32, String)]) -> Vec<u8> {
     let mut xml = String::from("<CompleteMultipartUpload>");
     for (number, etag) in parts {
@@ -727,6 +738,128 @@ async fn client_multipart_write_back_completes_in_cache_then_syncs() {
     .unwrap();
     assert!(get.status().is_success());
     assert_eq!(get.bytes().await.unwrap(), Bytes::from(body));
+    sidecar.stop().await;
+}
+
+#[tokio::test]
+async fn client_multipart_write_back_complete_names_the_origin_object() {
+    let (origin_url, _origin) = support::fake_s3::spawn().await;
+    let (cache_url, _cache) = support::fake_s3::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(multipart_cache_config(
+        &origin_url,
+        &cache_url,
+        &dir.path().join("index.redb"),
+        CacheMode::ReadWrite,
+        WritePolicy::WriteBack,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let upload_id = client_create_upload(&client, &sidecar.url).await;
+    let etag_one = client_upload_part(&client, &sidecar.url, &upload_id, 1, vec![1_u8; 40]).await;
+    let complete = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media/item?uploadId={upload_id}", sidecar.url),
+        Some(complete_xml(&[(1, etag_one)])),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(complete.status().is_success());
+    let body = complete.text().await.unwrap();
+    assert_eq!(xml_value(&body, "Bucket").as_deref(), Some("media"));
+    assert_eq!(xml_value(&body, "Key").as_deref(), Some("item"));
+    let etag = xml_text(&body, "ETag").expect("the complete response has an ETag");
+    assert!(etag.starts_with('"'));
+    assert!(etag.ends_with("-1\""));
+    assert!(!body.contains("cachebucket"));
+    assert!(!body.contains("cache/"));
+    sidecar.stop().await;
+}
+
+#[tokio::test]
+async fn client_multipart_write_back_list_parts_names_the_origin_object() {
+    let (origin_url, _origin) = support::fake_s3::spawn().await;
+    let (cache_url, _cache) = support::fake_s3::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(multipart_cache_config(
+        &origin_url,
+        &cache_url,
+        &dir.path().join("index.redb"),
+        CacheMode::ReadWrite,
+        WritePolicy::WriteBack,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let upload_id = client_create_upload(&client, &sidecar.url).await;
+    let etag_one = client_upload_part(&client, &sidecar.url, &upload_id, 1, vec![2_u8; 40]).await;
+    let etag_two = client_upload_part(&client, &sidecar.url, &upload_id, 2, vec![3_u8; 60]).await;
+    let parts = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/item?uploadId={upload_id}", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(parts.status().is_success());
+    let body = parts.text().await.unwrap();
+    assert_eq!(xml_value(&body, "Bucket").as_deref(), Some("media"));
+    assert_eq!(xml_value(&body, "Key").as_deref(), Some("item"));
+    assert_eq!(
+        xml_value(&body, "UploadId").as_deref(),
+        Some(upload_id.as_str())
+    );
+    assert!(body.contains(&etag_one));
+    assert!(body.contains(&etag_two));
+    assert!(!body.contains("upload-0"));
+    assert!(!body.contains("cachebucket"));
+    assert!(!body.contains("cache/"));
+    sidecar.stop().await;
+}
+
+#[tokio::test]
+async fn client_multipart_completes_with_the_list_parts_upload_id() {
+    let (origin_url, origin) = support::fake_s3::spawn().await;
+    let (cache_url, cache) = support::fake_s3::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(multipart_cache_config(
+        &origin_url,
+        &cache_url,
+        &dir.path().join("index.redb"),
+        CacheMode::ReadWrite,
+        WritePolicy::WriteBack,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let upload_id = client_create_upload(&client, &sidecar.url).await;
+    let etag_one = client_upload_part(&client, &sidecar.url, &upload_id, 1, vec![4_u8; 40]).await;
+    let parts = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/item?uploadId={upload_id}", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(parts.status().is_success());
+    let listed = parts.text().await.unwrap();
+    let listed_id = xml_value(&listed, "UploadId").expect("the list response has an upload id");
+    let complete = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media/item?uploadId={listed_id}", sidecar.url),
+        Some(complete_xml(&[(1, etag_one)])),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(complete.status().is_success());
+    assert_eq!(cache.completes(), 1);
+    assert_eq!(origin.uploads(), 0);
     sidecar.stop().await;
 }
 

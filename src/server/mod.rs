@@ -1036,7 +1036,7 @@ async fn multipart_request(
                 .complete_client_upload(id, &request_headers, body)
                 .await
                 .map_err(|error| multipart_cache_error(&error))?;
-            return Ok(client_complete_response(complete));
+            return Ok(client_complete_response(&complete));
         }
         let response = proxy_request(state, method, credential, prepared, path_and_query).await?;
         if response.status().is_success() {
@@ -1067,11 +1067,11 @@ async fn multipart_request(
             && write_back
             && cache.has_client_upload(id)
         {
-            let response = cache
+            let parts = cache
                 .list_client_parts(id, query, &prepared.headers)
                 .await
                 .map_err(|error| cache_error(&error))?;
-            return forward_response(method, response, state.idle_timeout()).await;
+            return Ok(client_list_parts_response(&parts, bucket, key, id));
         }
         return proxy_request(state, method, credential, prepared, path_and_query).await;
     }
@@ -1100,16 +1100,86 @@ fn initiate_multipart_response(bucket: &str, key: &str, upload_id: &str) -> Resp
 }
 
 /// Build the complete response from a cache upload.
-fn client_complete_response(complete: crate::cache::ClientComplete) -> Response {
-    let length = complete.body.len();
-    let mut response = Response::new(Body::from(complete.body));
+fn client_complete_response(complete: &crate::cache::ClientComplete) -> Response {
+    let body = format!(
+        "<CompleteMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key>\
+         <ETag>{}</ETag></CompleteMultipartUploadResult>",
+        escape_xml(&complete.bucket),
+        escape_xml(&complete.key),
+        escape_xml(&complete.etag)
+    );
+    cache_xml_response(&complete.headers, body)
+}
+
+/// Build the list parts response for an origin object.
+fn client_list_parts_response(
+    parts: &crate::cache::ClientListParts,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Response {
+    let text = String::from_utf8_lossy(&parts.body);
+    let body = rewrite_xml_tag(&text, "Bucket", bucket);
+    let body = rewrite_xml_tag(&body, "Key", key);
+    let body = rewrite_xml_tag(&body, "UploadId", upload_id);
+    cache_xml_response(&parts.headers, body)
+}
+
+/// Build one XML response with the cache response headers.
+fn cache_xml_response(headers: &HeaderMap, body: String) -> Response {
+    let length = body.len();
+    let mut response = Response::new(Body::from(body));
     *response.status_mut() = StatusCode::OK;
-    copy_response_headers(&complete.headers, response.headers_mut());
+    copy_response_headers(headers, response.headers_mut());
     response.headers_mut().remove(header::CONTENT_LENGTH);
     if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
         response.headers_mut().insert(header::CONTENT_LENGTH, value);
     }
     response
+        .headers_mut()
+        .entry(header::CONTENT_TYPE)
+        .or_insert_with(|| HeaderValue::from_static("application/xml"));
+    response
+}
+
+/// Replace one XML element value.
+///
+/// The function adds the element after the root open tag when the document has
+/// no such element.
+fn rewrite_xml_tag(xml: &str, tag: &str, value: &str) -> String {
+    let element = format!("<{tag}>{}</{tag}>", escape_xml(value));
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    if let Some(start) = xml.find(&open)
+        && let Some(offset) = xml[start + open.len()..].find(&close)
+    {
+        let end = start + open.len() + offset + close.len();
+        let mut output = String::with_capacity(xml.len() + element.len());
+        output.push_str(&xml[..start]);
+        output.push_str(&element);
+        output.push_str(&xml[end..]);
+        return output;
+    }
+    insert_after_root(xml, &element)
+}
+
+/// Insert one XML element after the root open tag.
+fn insert_after_root(xml: &str, element: &str) -> String {
+    let mut search = 0;
+    if xml.trim_start().starts_with("<?")
+        && let Some(end) = xml.find("?>")
+    {
+        search = end + 2;
+    }
+    let Some(offset) = xml[search..].find('>') else {
+        return format!("{xml}{element}");
+    };
+    let index = search + offset + 1;
+    let mut output = String::with_capacity(xml.len() + element.len());
+    output.push_str(&xml[..index]);
+    output.push_str(element);
+    output.push_str(&xml[index..]);
+    output
 }
 
 /// Read a small request body, such as one complete request.
@@ -2895,6 +2965,22 @@ mod tests {
 
         let body = prepared_body_bytes(prepared).await.unwrap();
         assert_eq!(&body[..], b"payload");
+    }
+
+    #[test]
+    fn rewrite_xml_tag_replaces_the_cache_value() {
+        let xml =
+            "<ListPartsResult><Bucket>cachebucket</Bucket><Key>cache/x</Key></ListPartsResult>";
+        let output = rewrite_xml_tag(xml, "Bucket", "media");
+        assert!(output.contains("<Bucket>media</Bucket>"));
+        assert!(!output.contains("cachebucket"));
+    }
+
+    #[test]
+    fn rewrite_xml_tag_adds_a_missing_element() {
+        let xml = "<ListPartsResult><IsTruncated>false</IsTruncated></ListPartsResult>";
+        let output = rewrite_xml_tag(xml, "Key", "a&b");
+        assert!(output.contains("<Key>a&amp;b</Key>"));
     }
 
     #[tokio::test]
