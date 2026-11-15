@@ -356,6 +356,22 @@ async fn handler(
         return empty(StatusCode::NO_CONTENT);
     }
 
+    if method == Method::POST && key.is_empty() && has(&query, "delete") {
+        let mut result = String::from("<DeleteResult>");
+        for key in parse_keys(&body) {
+            let removed = state
+                .objects
+                .lock()
+                .is_ok_and(|mut objects| objects.remove(&format!("{bucket}/{key}")).is_some());
+            if removed {
+                state.counts.deletes.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = write!(result, "<Deleted><Key>{}</Key></Deleted>", escape_xml(&key));
+        }
+        result.push_str("</DeleteResult>");
+        return xml(StatusCode::OK, &result);
+    }
+
     if key.is_empty() {
         return empty(StatusCode::OK);
     }
@@ -466,6 +482,30 @@ fn get<'a>(query: &'a [(String, String)], name: &str) -> Option<&'a str> {
 
 fn md5_hex(body: &[u8]) -> String {
     hex::encode(Md5::digest(body))
+}
+
+fn parse_keys(body: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(body);
+    let mut keys = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find("<Key>") {
+        rest = &rest[start + "<Key>".len()..];
+        let Some(end) = rest.find("</Key>") else {
+            break;
+        };
+        keys.push(unescape_xml(&rest[..end]));
+        rest = &rest[end + "</Key>".len()..];
+    }
+    keys
+}
+
+fn unescape_xml(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 fn escape_xml(value: &str) -> String {

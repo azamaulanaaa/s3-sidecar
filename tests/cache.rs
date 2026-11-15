@@ -48,12 +48,51 @@ struct Counts {
 }
 
 #[derive(Clone)]
+struct PutHold {
+    started: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct PutHoldHandle {
+    started: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+impl PutHold {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+
+    fn handle(&self) -> PutHoldHandle {
+        PutHoldHandle {
+            started: Arc::clone(&self.started),
+            release: Arc::clone(&self.release),
+        }
+    }
+}
+
+impl PutHoldHandle {
+    async fn wait_started(&self) {
+        let _permit = self.started.acquire().await.unwrap();
+    }
+
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+#[derive(Clone)]
 struct OriginState {
     objects: Arc<Mutex<HashMap<String, Stored>>>,
     counts: Arc<Counts>,
     gate: Arc<Semaphore>,
     put_status: Arc<Mutex<Option<StatusCode>>>,
     put_headers: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
+    put_holds: Arc<Mutex<HashMap<String, PutHold>>>,
 }
 
 #[derive(Clone)]
@@ -73,6 +112,7 @@ struct OriginHandle {
     gate: Arc<Semaphore>,
     put_status: Arc<Mutex<Option<StatusCode>>>,
     put_headers: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
+    put_holds: Arc<Mutex<HashMap<String, PutHold>>>,
 }
 
 #[derive(Clone)]
@@ -126,6 +166,13 @@ impl OriginHandle {
     fn put_headers(&self, key: &str) -> Option<HashMap<String, String>> {
         self.put_headers.lock().unwrap().get(key).cloned()
     }
+
+    fn hold_put(&self, key: &str) -> PutHoldHandle {
+        let hold = PutHold::new();
+        let handle = hold.handle();
+        self.put_holds.lock().unwrap().insert(key.to_owned(), hold);
+        handle
+    }
 }
 
 impl CacheHandle {
@@ -150,12 +197,14 @@ async fn spawn_origin() -> (String, OriginHandle) {
     let gate = Arc::new(Semaphore::new(1));
     let put_status = Arc::new(Mutex::new(None));
     let put_headers = Arc::new(Mutex::new(HashMap::new()));
+    let put_holds = Arc::new(Mutex::new(HashMap::new()));
     let state = OriginState {
         objects: Arc::clone(&objects),
         counts: Arc::clone(&counts),
         gate: Arc::clone(&gate),
         put_status: Arc::clone(&put_status),
         put_headers: Arc::clone(&put_headers),
+        put_holds: Arc::clone(&put_holds),
     };
     let app = Router::new().fallback(origin_handler).with_state(state);
     tokio::spawn(async move {
@@ -169,6 +218,7 @@ async fn spawn_origin() -> (String, OriginHandle) {
             gate,
             put_status,
             put_headers,
+            put_holds,
         },
     )
 }
@@ -184,6 +234,21 @@ async fn origin_handler(
     let (bucket, key) = split_path(uri.path());
     if key.is_empty() {
         let query = uri.query().unwrap_or_default();
+        if method == Method::POST && has_query(query, "delete") {
+            let mut result = String::from("<DeleteResult>");
+            for key in parse_delete_keys(&body) {
+                let object_key = format!("{bucket}/{key}");
+                let removed = state.objects.lock().unwrap().remove(&object_key).is_some();
+                if removed {
+                    state.counts.delete.fetch_add(1, Ordering::Relaxed);
+                }
+                result.push_str("<Deleted><Key>");
+                result.push_str(&escape_xml(&key));
+                result.push_str("</Key></Deleted>");
+            }
+            result.push_str("</DeleteResult>");
+            return xml(StatusCode::OK, &result);
+        }
         return match method {
             Method::HEAD | Method::PUT => Response::builder()
                 .status(StatusCode::OK)
@@ -267,6 +332,11 @@ async fn origin_handler(
             response
         }
         Method::PUT => {
+            let hold = state.put_holds.lock().unwrap().get(&object_key).cloned();
+            if let Some(hold) = hold {
+                hold.started.add_permits(1);
+                let _release = hold.release.acquire().await.unwrap();
+            }
             let _permit = state.gate.acquire().await.unwrap();
             state.counts.put.fetch_add(1, Ordering::Relaxed);
             if let Some(status) = *state.put_status.lock().unwrap() {
@@ -564,6 +634,36 @@ fn query_value(query: &str, name: &str) -> Option<String> {
     })
 }
 
+fn has_query(query: &str, name: &str) -> bool {
+    query
+        .split('&')
+        .any(|pair| pair.split_once('=').map_or(pair, |(key, _)| key) == name)
+}
+
+fn parse_delete_keys(body: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(body);
+    let mut keys = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(start) = rest.find("<Key>") {
+        rest = &rest[start + "<Key>".len()..];
+        let Some(end) = rest.find("</Key>") else {
+            break;
+        };
+        keys.push(unescape_xml(&rest[..end]));
+        rest = &rest[end + "</Key>".len()..];
+    }
+    keys
+}
+
+fn unescape_xml(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 fn escape_xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -770,6 +870,17 @@ fn signed_request_with_credential(
 
 async fn body_text(response: reqwest::Response) -> String {
     response.text().await.unwrap()
+}
+
+fn delete_objects_body(keys: &[&str]) -> Vec<u8> {
+    let mut xml = String::from("<Delete>");
+    for key in keys {
+        xml.push_str("<Object><Key>");
+        xml.push_str(&escape_xml(key));
+        xml.push_str("</Key></Object>");
+    }
+    xml.push_str("</Delete>");
+    xml.into_bytes()
 }
 
 async fn wait_for<F, Fut>(timeout: Duration, mut check: F)
@@ -1460,6 +1571,268 @@ async fn read_mode_put_invalidates_the_cache() {
     .unwrap();
     assert_eq!(body_text(second).await, "new");
     assert_eq!(origin.get_count(), 2);
+}
+
+#[tokio::test]
+async fn batch_delete_invalidates_cached_keys() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/one", b"first", "\"etag-1\"");
+    origin.put("media/two", b"second", "\"etag-2\"");
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    for (key, body) in [("one", "first"), ("two", "second")] {
+        let get = signed_request(
+            &client,
+            Method::GET,
+            &format!("{}/media/{key}", sidecar.url),
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(body_text(get).await, body);
+    }
+    for key in ["one", "two"] {
+        let blob = blob_key("cache", "media", key);
+        wait_for(Duration::from_secs(2), || {
+            let cache = cache.clone();
+            let blob = blob.clone();
+            async move { cache.has(&blob) && cache.has(&format!("{blob}.meta")) }
+        })
+        .await;
+    }
+    let batch = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media?delete", sidecar.url),
+        Some(delete_objects_body(&["one", "two"])),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(batch.status(), StatusCode::OK);
+    assert!(origin.body("media/one").is_none());
+    assert!(origin.body("media/two").is_none());
+    for key in ["one", "two"] {
+        let get = signed_request(
+            &client,
+            Method::GET,
+            &format!("{}/media/{key}", sidecar.url),
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn batch_delete_invalidates_fifty_keys() {
+    let (origin_url, origin) = spawn_origin().await;
+    let keys: Vec<String> = (0..50).map(|index| format!("item-{index}")).collect();
+    for key in &keys {
+        origin.put(&format!("media/{key}"), b"payload", "\"etag\"");
+    }
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    for key in &keys {
+        let get = signed_request(
+            &client,
+            Method::GET,
+            &format!("{}/media/{key}", sidecar.url),
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(body_text(get).await, "payload");
+    }
+    wait_for(Duration::from_secs(5), || {
+        let cache = cache.clone();
+        let keys = keys.clone();
+        async move {
+            keys.iter().all(|key| {
+                let blob = blob_key("cache", "media", key);
+                cache.has(&blob) && cache.has(&format!("{blob}.meta"))
+            })
+        }
+    })
+    .await;
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let batch = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media?delete", sidecar.url),
+        Some(delete_objects_body(&refs)),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(batch.status(), StatusCode::OK);
+    for key in &keys {
+        assert!(origin.body(&format!("media/{key}")).is_none());
+        let get = signed_request(
+            &client,
+            Method::GET,
+            &format!("{}/media/{key}", sidecar.url),
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[tokio::test]
+async fn batch_delete_orders_a_delete_after_an_in_flight_write_back() {
+    let (origin_url, origin) = spawn_origin().await;
+    let hold = origin.hold_put("media/recreate");
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    );
+    config.cache.sync_debounce_ms = 10;
+    let sidecar = spawn_sidecar(config).await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/recreate", sidecar.url),
+        Some(b"pending body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    hold.wait_started().await;
+    let batch = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media?delete", sidecar.url),
+        Some(delete_objects_body(&["recreate"])),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(batch.status(), StatusCode::OK);
+    hold.release();
+    wait_for(Duration::from_secs(5), || {
+        let origin = origin.clone();
+        let cache = cache.clone();
+        async move {
+            origin.delete_count() >= 1
+                && cache
+                    .keys()
+                    .iter()
+                    .all(|key| !key.starts_with("cache/journal/"))
+        }
+    })
+    .await;
+    assert_eq!(origin.put_count(), 1);
+    assert!(origin.body("media/recreate").is_none());
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/recreate", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(get.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn batch_delete_parses_escaped_and_repeated_keys() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/a&b", b"ampersand", "\"etag-1\"");
+    origin.put("media/a<b", b"angle", "\"etag-2\"");
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Read,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    for key in ["a%26b", "a%3Cb"] {
+        let get = signed_request(
+            &client,
+            Method::GET,
+            &format!("{}/media/{key}", sidecar.url),
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+    }
+    let batch = signed_request(
+        &client,
+        Method::POST,
+        &format!("{}/media?delete", sidecar.url),
+        Some(delete_objects_body(&["a&b", "a<b", "a&b"])),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(batch.status(), StatusCode::OK);
+    assert!(origin.body("media/a&b").is_none());
+    assert!(origin.body("media/a<b").is_none());
+    for key in ["a%26b", "a%3Cb"] {
+        let get = signed_request(
+            &client,
+            Method::GET,
+            &format!("{}/media/{key}", sidecar.url),
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(get.status(), StatusCode::NOT_FOUND);
+    }
 }
 
 #[tokio::test]

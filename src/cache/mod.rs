@@ -478,13 +478,15 @@ impl Cache {
     /// Invalidate one cache entry. Errors are logged and ignored.
     pub async fn invalidate(&self, bucket: &str, key: &str) {
         let cache_key = self.cache_key(bucket, key);
-        if let Err(error) = self
-            .delete_object(self.cache_bucket(), &meta_key(&cache_key))
-            .await
-        {
+        let meta_path = meta_key(&cache_key);
+        let (meta_result, blob_result) = tokio::join!(
+            self.delete_object(self.cache_bucket(), &meta_path),
+            self.delete_object(self.cache_bucket(), &cache_key)
+        );
+        if let Err(error) = meta_result {
             warn!(%error, "cache metadata delete failed");
         }
-        if let Err(error) = self.delete_object(self.cache_bucket(), &cache_key).await {
+        if let Err(error) = blob_result {
             warn!(%error, "cache blob delete failed");
         }
         self.index_remove(&cache_key);
@@ -982,15 +984,19 @@ impl Cache {
         if entry.kind == JournalKind::Put {
             let bucket = &entry.bucket;
             let cache_key = self.cache_key(bucket, &entry.key);
-            let mut meta = self
-                .read_meta(bucket, &entry.key)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| metadata_from_journal(entry));
-            meta.mark_synced(etag.unwrap_or_else(|| entry.etag.clone()), unix_now());
-            let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
-            let _ = self.index_upsert(&cache_key, &meta).await;
+            // A delete tombstone wins over a write that finished after the
+            // delete. Do not put the metadata back into the cache.
+            if !self.is_tombstoned(bucket, &entry.key) {
+                let mut meta = self
+                    .read_meta(bucket, &entry.key)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| metadata_from_journal(entry));
+                meta.mark_synced(etag.unwrap_or_else(|| entry.etag.clone()), unix_now());
+                let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
+                let _ = self.index_upsert(&cache_key, &meta).await;
+            }
             let mut pending = lock(&self.pending);
             remove_pending_if_current(&mut pending, &(bucket.clone(), entry.key.clone()), &path);
         } else {
@@ -2275,7 +2281,10 @@ fn is_retryable_status(status: StatusCode) -> bool {
         || status == StatusCode::TOO_MANY_REQUESTS
 }
 
-fn parse_keys(body: &str) -> Vec<String> {
+/// Return every `<Key>` element value in one XML body.
+///
+/// The parser unescapes XML entities and keeps repeated keys.
+pub(crate) fn parse_keys(body: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let mut rest = body;
     while let Some(start) = rest.find("<Key>") {
@@ -2397,6 +2406,17 @@ mod tests {
         assert_eq!(
             parse_keys(xml),
             vec!["a&b.txt".to_owned(), "plain".to_owned()]
+        );
+    }
+
+    #[test]
+    fn key_parser_keeps_escaped_and_repeated_delete_keys() {
+        let xml = "<Delete><Object><Key>a&amp;b</Key></Object>\
+                   <Object><Key>a&lt;b</Key></Object>\
+                   <Object><Key>a&amp;b</Key></Object></Delete>";
+        assert_eq!(
+            parse_keys(xml),
+            vec!["a&b".to_owned(), "a<b".to_owned(), "a&b".to_owned()]
         );
     }
 

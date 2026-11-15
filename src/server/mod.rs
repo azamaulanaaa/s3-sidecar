@@ -844,6 +844,19 @@ async fn forward(
         return proxy_request(state, method, &credential, prepared, path_and_query).await;
     };
 
+    if !object && method == Method::POST && query_has(query, "delete") {
+        return batch_delete(
+            state,
+            cache,
+            &credential,
+            method,
+            prepared,
+            path_and_query,
+            &bucket,
+        )
+        .await;
+    }
+
     if has_sse_c(headers) {
         match cache.mode() {
             CacheMode::Write | CacheMode::ReadWrite => {
@@ -1323,6 +1336,86 @@ async fn proxy_request(
     let result = state.client.execute(credential, request).await;
     let response = result.map_err(|error| map_storage_error(error, failure_flag.as_ref()))?;
     forward_response(method, response, state.idle_timeout()).await
+}
+
+/// Forward one `DeleteObjects` request and invalidate the deleted keys.
+///
+/// Invalidation runs only after origin accepts the request. A cache failure
+/// is logged and does not change the origin response.
+#[allow(clippy::too_many_arguments)]
+async fn batch_delete(
+    state: &AppState,
+    cache: &Arc<Cache>,
+    credential: &Arc<ClientCredential>,
+    method: &Method,
+    prepared: PreparedRequest,
+    path_and_query: String,
+    bucket: &str,
+) -> Result<Response, S3Error> {
+    let content_length = prepared.content_length;
+    let had_body = prepared.body.is_some();
+    let failure = prepared.failure.clone();
+    let headers = prepared.headers;
+    let body = match collect_request_body(prepared.body).await {
+        Ok(body) => body,
+        Err(error) => {
+            return Err(body_failure_error(failure.as_ref()).unwrap_or(error));
+        }
+    };
+    if let Some(error) = body_failure_error(failure.as_ref()) {
+        return Err(error);
+    }
+    let keys = crate::cache::parse_keys(&String::from_utf8_lossy(&body));
+    let request = ForwardRequest {
+        method: method.clone(),
+        path_and_query,
+        headers,
+        body: had_body.then(|| bytes_body(body)),
+        content_length,
+    };
+    let response = state
+        .client
+        .execute(credential, request)
+        .await
+        .map_err(|error| map_storage_error(error, failure.as_ref()))?;
+    if response.status().is_success() {
+        invalidate_deleted_keys(cache, bucket, &keys).await;
+    }
+    forward_response(method, response, state.idle_timeout()).await
+}
+
+/// Number of batch-delete keys to invalidate at the same time.
+const DELETE_CONCURRENCY: usize = 16;
+
+/// Invalidate every key in one batch delete.
+///
+/// A pending write-back becomes a staged delete. Its running sync finishes
+/// first, then the queued delete removes the object at origin. The extra
+/// origin delete is idempotent. A key without a pending write loses only its
+/// cache entry, so a later read fetches the current object.
+async fn invalidate_deleted_keys(cache: &Arc<Cache>, bucket: &str, keys: &[String]) {
+    futures_util::stream::iter(keys)
+        .for_each_concurrent(DELETE_CONCURRENCY, |key| async move {
+            invalidate_deleted_key(cache, bucket, key).await;
+        })
+        .await;
+}
+
+async fn invalidate_deleted_key(cache: &Arc<Cache>, bucket: &str, key: &str) {
+    if cache.writes_cache() && cache.pending_entry(bucket, key).is_some() {
+        match cache.stage_delete(bucket, key).await {
+            Ok(()) => {}
+            Err(error) => {
+                warn!(%error, "cache staged delete failed; cancelling the pending write");
+                if let Err(error) = cache.delete_pending(bucket, key).await {
+                    warn!(%error, "cache pending delete failed; invalidating the entry");
+                }
+                cache.invalidate(bucket, key).await;
+            }
+        }
+    } else {
+        cache.invalidate(bucket, key).await;
+    }
 }
 
 // The read path needs the request context and the cache policy.
@@ -2203,6 +2296,12 @@ fn empty_body() -> BodyStream {
         }
     };
     Box::pin(stream)
+}
+
+fn bytes_body(bytes: Bytes) -> BodyStream {
+    Box::pin(futures_util::stream::once(async move {
+        Ok::<Bytes, io::Error>(bytes)
+    }))
 }
 
 fn cache_error_fallback(cache: &Cache, error: &crate::cache::CacheError) -> bool {
