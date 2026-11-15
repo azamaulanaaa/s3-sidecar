@@ -1318,6 +1318,11 @@ async fn forward_cluster(
             "This multipart operation is not supported in cluster mode.",
         ));
     }
+    if object_subresource(query) {
+        return Err(S3Error::not_implemented(
+            "This object sub-resource is not supported in cluster mode.",
+        ));
+    }
     if method == Method::PUT && headers.contains_key("x-amz-copy-source") {
         return cluster.copy_object(&bucket, &key, &headers).await;
     }
@@ -2878,6 +2883,22 @@ fn bucket_subresource(query: &str) -> bool {
         "versioning",
         "versions",
         "website",
+    ];
+    query.split('&').any(|pair| {
+        let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        SUBRESOURCES.contains(&key)
+    })
+}
+
+fn object_subresource(query: &str) -> bool {
+    const SUBRESOURCES: &[&str] = &[
+        "acl",
+        "attributes",
+        "legal-hold",
+        "retention",
+        "tagging",
+        "torrent",
+        "versionId",
     ];
     query.split('&').any(|pair| {
         let key = pair.split_once('=').map_or(pair, |(key, _)| key);
