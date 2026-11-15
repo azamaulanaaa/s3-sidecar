@@ -17,6 +17,7 @@ use axum::routing::{any, get, post};
 use axum_server::tls_rustls::RustlsConfig;
 use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, TryStreamExt};
+use time::format_description::well_known::Rfc3339;
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -797,6 +798,14 @@ async fn forward(
         state.auth_region(),
         now(),
     )?;
+    if uri.path().trim_start_matches('/').is_empty() {
+        if method == Method::GET {
+            return Ok(list_buckets_response(auth.credential()));
+        }
+        return Err(S3Error::not_implemented(
+            "This method is not supported for the bucket list.",
+        ));
+    }
     check_bucket(&auth, uri, headers)?;
 
     let (credential, payload) = auth.into_parts();
@@ -948,12 +957,7 @@ async fn forward_cluster(
     } = prepared;
 
     if key.is_empty() {
-        if method == Method::GET && query_param(query, "list-type").as_deref() == Some("2") {
-            return cluster.list_objects(&bucket, query).await;
-        }
-        return Err(S3Error::not_implemented(
-            "This bucket operation is not supported in cluster mode.",
-        ));
+        return forward_cluster_bucket(cluster, method, &bucket, query).await;
     }
 
     if method == Method::POST && query_has(query, "uploads") {
@@ -1030,6 +1034,36 @@ async fn forward_cluster(
         &Method::DELETE => cluster.delete(&bucket, &key).await,
         _ => Err(S3Error::not_implemented(
             "This operation is not supported in cluster mode.",
+        )),
+    }
+}
+
+async fn forward_cluster_bucket(
+    cluster: &Arc<Cluster>,
+    method: &Method,
+    bucket: &str,
+    query: &str,
+) -> Result<Response, S3Error> {
+    if bucket_subresource(query) {
+        return Err(S3Error::not_implemented(
+            "This bucket sub-resource is not supported in cluster mode.",
+        ));
+    }
+    match *method {
+        Method::HEAD => {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::OK;
+            Ok(response)
+        }
+        Method::GET => cluster.list_objects(bucket, query).await,
+        Method::PUT => Err(S3Error::not_implemented(
+            "CreateBucket is not supported in cluster mode. The bucket set comes from configuration.",
+        )),
+        Method::DELETE => Err(S3Error::not_implemented(
+            "DeleteBucket is not supported in cluster mode. The bucket set comes from configuration.",
+        )),
+        _ => Err(S3Error::not_implemented(
+            "This bucket operation is not supported in cluster mode.",
         )),
     }
 }
@@ -1965,6 +1999,50 @@ fn check_bucket(auth: &AuthContext, uri: &Uri, headers: &HeaderMap) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::format_push_string)]
+fn list_buckets_response(credential: &ClientCredential) -> Response {
+    let owner = credential.access_key_id();
+    let creation_date = now().format(&Rfc3339).unwrap_or_default();
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+    xml.push_str("<ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    xml.push_str("<Owner>");
+    xml.push_str(&format!("<ID>{}</ID>", xml_escape(owner)));
+    xml.push_str(&format!("<DisplayName>{}</DisplayName>", xml_escape(owner)));
+    xml.push_str("</Owner><Buckets>");
+    for bucket in credential.allowed_buckets() {
+        xml.push_str("<Bucket>");
+        xml.push_str(&format!("<Name>{}</Name>", xml_escape(&bucket)));
+        xml.push_str(&format!(
+            "<CreationDate>{}</CreationDate>",
+            xml_escape(&creation_date)
+        ));
+        xml.push_str("</Bucket>");
+    }
+    xml.push_str("</Buckets></ListAllMyBucketsResult>");
+    let mut response = Response::new(Body::from(xml));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    response
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&apos;"),
+            other => output.push(other),
+        }
+    }
+    output
+}
+
 struct PreparedRequest {
     headers: HeaderMap,
     body: Option<BodyStream>,
@@ -2456,6 +2534,39 @@ fn body_failure_error(failure_flag: Option<&Arc<std::sync::atomic::AtomicU8>>) -
         Some(BodyFailure::TooLarge) => Some(S3Error::entity_too_large()),
         _ => None,
     }
+}
+
+fn bucket_subresource(query: &str) -> bool {
+    const SUBRESOURCES: &[&str] = &[
+        "acl",
+        "accelerate",
+        "analytics",
+        "cors",
+        "delete",
+        "encryption",
+        "intelligent-tiering",
+        "inventory",
+        "lifecycle",
+        "location",
+        "logging",
+        "metrics",
+        "notification",
+        "object-lock",
+        "ownershipControls",
+        "policy",
+        "publicAccessBlock",
+        "replication",
+        "requestPayment",
+        "tagging",
+        "uploads",
+        "versioning",
+        "versions",
+        "website",
+    ];
+    query.split('&').any(|pair| {
+        let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        SUBRESOURCES.contains(&key)
+    })
 }
 
 fn query_has(query: &str, name: &str) -> bool {

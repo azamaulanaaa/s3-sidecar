@@ -73,6 +73,14 @@ impl ClientCredential {
     pub fn allows_bucket(&self, bucket: &str) -> bool {
         self.allowed_buckets.contains(bucket)
     }
+
+    /// Return the allowed bucket names in sorted order.
+    #[must_use]
+    pub fn allowed_buckets(&self) -> Vec<String> {
+        let mut buckets: Vec<String> = self.allowed_buckets.iter().cloned().collect();
+        buckets.sort();
+        buckets
+    }
 }
 
 /// A set of client credentials.
