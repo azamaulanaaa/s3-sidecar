@@ -45,6 +45,7 @@ struct Counts {
     put: AtomicU64,
     delete: AtomicU64,
     get_bytes: AtomicU64,
+    list: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -93,6 +94,7 @@ struct OriginState {
     put_status: Arc<Mutex<Option<StatusCode>>>,
     put_headers: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
     put_holds: Arc<Mutex<HashMap<String, PutHold>>>,
+    last_token: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -113,6 +115,7 @@ struct OriginHandle {
     put_status: Arc<Mutex<Option<StatusCode>>>,
     put_headers: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
     put_holds: Arc<Mutex<HashMap<String, PutHold>>>,
+    last_token: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -153,6 +156,14 @@ impl OriginHandle {
 
     fn delete_count(&self) -> u64 {
         self.counts.delete.load(Ordering::Relaxed)
+    }
+
+    fn list_count(&self) -> u64 {
+        self.counts.list.load(Ordering::Relaxed)
+    }
+
+    fn last_token(&self) -> Option<String> {
+        self.last_token.lock().unwrap().clone()
     }
 
     fn block_puts(&self) -> tokio::sync::OwnedSemaphorePermit {
@@ -202,6 +213,7 @@ async fn spawn_origin() -> (String, OriginHandle) {
     let put_status = Arc::new(Mutex::new(None));
     let put_headers = Arc::new(Mutex::new(HashMap::new()));
     let put_holds = Arc::new(Mutex::new(HashMap::new()));
+    let last_token = Arc::new(Mutex::new(None));
     let state = OriginState {
         objects: Arc::clone(&objects),
         counts: Arc::clone(&counts),
@@ -209,6 +221,7 @@ async fn spawn_origin() -> (String, OriginHandle) {
         put_status: Arc::clone(&put_status),
         put_headers: Arc::clone(&put_headers),
         put_holds: Arc::clone(&put_holds),
+        last_token: Arc::clone(&last_token),
     };
     let app = Router::new().fallback(origin_handler).with_state(state);
     tokio::spawn(async move {
@@ -223,6 +236,7 @@ async fn spawn_origin() -> (String, OriginHandle) {
             put_status,
             put_headers,
             put_holds,
+            last_token,
         },
     )
 }
@@ -259,18 +273,8 @@ async fn origin_handler(
                 .body(Body::empty())
                 .unwrap(),
             Method::GET => {
-                let marker = query_value(query, "marker").unwrap_or_default();
-                let prefix = query_value(query, "prefix").unwrap_or_default();
-                xml(
-                    StatusCode::OK,
-                    &format!(
-                        "<ListBucketResult><Name>{}</Name><Marker>{}</Marker>\
-                         <Prefix>{}</Prefix></ListBucketResult>",
-                        escape_xml(&bucket),
-                        escape_xml(&marker),
-                        escape_xml(&prefix)
-                    ),
-                )
+                state.counts.list.fetch_add(1, Ordering::Relaxed);
+                origin_list_response(&state, &bucket, query)
             }
             Method::DELETE => Response::builder()
                 .status(StatusCode::NO_CONTENT)
@@ -396,6 +400,142 @@ async fn origin_handler(
             "<Error><Code>NotImplemented</Code></Error>",
         ),
     }
+}
+
+#[allow(clippy::too_many_lines, clippy::format_push_string)]
+fn origin_list_response(state: &OriginState, bucket: &str, query: &str) -> Response {
+    if let Some(token) = query_text(query, "continuation-token") {
+        *state.last_token.lock().unwrap() = Some(token);
+    }
+    let version2 = query_value(query, "list-type").as_deref() == Some("2");
+    let prefix = query_text(query, "prefix").unwrap_or_default();
+    let delimiter = query_text(query, "delimiter").unwrap_or_default();
+    let max_keys = query_value(query, "max-keys")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_000)
+        .min(1_000);
+    let marker = query_text(query, "marker").unwrap_or_default();
+    let start_after = if version2 {
+        query_text(query, "continuation-token").or_else(|| query_text(query, "start-after"))
+    } else if marker.is_empty() {
+        None
+    } else {
+        Some(marker.clone())
+    };
+    let bucket_prefix = format!("{bucket}/");
+    let mut rows: Vec<(String, Stored)> = state
+        .objects
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(object, stored)| {
+            object
+                .strip_prefix(&bucket_prefix)
+                .map(|key| (key.to_owned(), stored.clone()))
+        })
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .collect();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut contents = Vec::new();
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut count = 0;
+    let mut last = None;
+    let mut truncated = false;
+    for (key, stored) in rows {
+        let rest = &key[prefix.len()..];
+        if !delimiter.is_empty()
+            && let Some(index) = rest.find(&delimiter)
+        {
+            let common = format!("{prefix}{}", &rest[..index + delimiter.len()]);
+            if start_after
+                .as_ref()
+                .is_some_and(|after| common.as_str() <= after.as_str())
+            {
+                continue;
+            }
+            if prefixes.last() == Some(&common) {
+                continue;
+            }
+            if count >= max_keys {
+                truncated = true;
+                break;
+            }
+            last = Some(common.clone());
+            prefixes.push(common);
+            count += 1;
+            continue;
+        }
+        if start_after
+            .as_ref()
+            .is_some_and(|after| key.as_str() <= after.as_str())
+        {
+            continue;
+        }
+        if count >= max_keys {
+            truncated = true;
+            break;
+        }
+        last = Some(key.clone());
+        contents.push((key, stored));
+        count += 1;
+    }
+
+    let mut body = String::from("<ListBucketResult>");
+    body.push_str(&format!("<Name>{}</Name>", escape_xml(bucket)));
+    body.push_str(&format!("<Prefix>{}</Prefix>", escape_xml(&prefix)));
+    if version2 {
+        body.push_str(&format!(
+            "<KeyCount>{}</KeyCount>",
+            contents.len() + prefixes.len()
+        ));
+    } else {
+        body.push_str(&format!("<Marker>{}</Marker>", escape_xml(&marker)));
+    }
+    if !delimiter.is_empty() {
+        body.push_str(&format!(
+            "<Delimiter>{}</Delimiter>",
+            escape_xml(&delimiter)
+        ));
+    }
+    body.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
+    if truncated && let Some(last) = &last {
+        let tag = if version2 {
+            "NextContinuationToken"
+        } else {
+            "NextMarker"
+        };
+        body.push_str(&format!("<{tag}>{}</{tag}>", escape_xml(last)));
+    }
+    for (key, stored) in &contents {
+        body.push_str("<Contents>");
+        body.push_str(&format!("<Key>{}</Key>", escape_xml(key)));
+        body.push_str(&format!(
+            "<LastModified>{}</LastModified>",
+            escape_xml(&stored.last_modified)
+        ));
+        body.push_str(&format!("<ETag>{}</ETag>", escape_xml(&stored.etag)));
+        body.push_str(&format!("<Size>{}</Size>", stored.body.len()));
+        body.push_str("<StorageClass>STANDARD</StorageClass>");
+        body.push_str("</Contents>");
+    }
+    for prefix in &prefixes {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            escape_xml(prefix)
+        ));
+    }
+    body.push_str("</ListBucketResult>");
+    xml(StatusCode::OK, &body)
+}
+
+fn query_text(query: &str, name: &str) -> Option<String> {
+    query_value(query, name).map(|value| {
+        percent_encoding::percent_decode_str(&value)
+            .decode_utf8_lossy()
+            .into_owned()
+    })
 }
 
 async fn spawn_cache() -> (String, CacheHandle) {
@@ -675,6 +815,52 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+/// Return the keys of every `<Contents>` block in one list response.
+fn contents_keys(body: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("<Contents>") {
+        let after = &rest[start..];
+        let Some(end) = after.find("</Contents>") else {
+            break;
+        };
+        let block = &after[..end];
+        if let Some(key) = xml_tag(block, "Key") {
+            keys.push(unescape_xml(&key));
+        }
+        rest = &after[end + "</Contents>".len()..];
+    }
+    keys
+}
+
+/// Return one XML element value.
+fn xml_tag(body: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = body.find(&open)? + open.len();
+    let rest = &body[start..];
+    let end = rest.find(&close)?;
+    Some(rest[..end].to_owned())
+}
+
+/// Return every `<CommonPrefixes>` prefix in one list response.
+fn common_prefixes(body: &str) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("<CommonPrefixes>") {
+        let after = &rest[start..];
+        let Some(end) = after.find("</CommonPrefixes>") else {
+            break;
+        };
+        let block = &after[..end];
+        if let Some(prefix) = xml_tag(block, "Prefix") {
+            prefixes.push(unescape_xml(&prefix));
+        }
+        rest = &after[end + "</CommonPrefixes>".len()..];
+    }
+    prefixes
 }
 
 fn xml(status: StatusCode, body: &str) -> Response {
@@ -2907,4 +3093,709 @@ async fn read_mode_forwards_sse_c_to_origin() {
         assert_eq!(body_text(get).await, "hello");
     }
     assert_eq!(origin.get_count(), 2);
+}
+
+#[tokio::test]
+async fn list_v2_merges_a_pending_write() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/listed", b"listed", "\"etag-listed\"");
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/pending-only", sidecar.url),
+        Some(b"pending body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    assert!(origin.body("media/pending-only").is_none());
+
+    let list = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?list-type=2", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = body_text(list).await;
+    assert_eq!(contents_keys(&body), vec!["listed", "pending-only"]);
+    assert!(body.contains("<IsTruncated>false</IsTruncated>"));
+    drop(permit);
+}
+
+#[tokio::test]
+async fn list_v1_merges_a_pending_write() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/listed", b"listed", "\"etag-listed\"");
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/pending-only", sidecar.url),
+        Some(b"pending body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    assert!(origin.body("media/pending-only").is_none());
+
+    let list = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = body_text(list).await;
+    assert_eq!(contents_keys(&body), vec!["listed", "pending-only"]);
+    assert!(body.contains("<Marker></Marker>"));
+    drop(permit);
+}
+
+#[tokio::test]
+async fn merged_list_hides_a_pending_delete() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/visible", b"visible", "\"etag-visible\"");
+    origin.put("media/hidden", b"hidden", "\"etag-hidden\"");
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    );
+    settings.cache.sync_debounce_ms = 5_000;
+    let sidecar = spawn_sidecar(settings).await;
+    let client = reqwest::Client::new();
+    let delete = signed_request(
+        &client,
+        Method::DELETE,
+        &format!("{}/media/hidden", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+
+    let list = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?list-type=2", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = body_text(list).await;
+    assert_eq!(contents_keys(&body), vec!["visible"]);
+    assert_eq!(origin.delete_count(), 0);
+}
+
+#[tokio::test]
+async fn merged_list_applies_prefix_delimiter_and_max_keys() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/alpha/one", b"one", "\"etag-one\"");
+    origin.put("media/beta/three", b"three", "\"etag-three\"");
+    origin.put("media/delta", b"delta", "\"etag-delta\"");
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    for key in ["media/alpha/pending", "media/gamma-pending"] {
+        let put = signed_request(
+            &client,
+            Method::PUT,
+            &format!("{}/{}", sidecar.url, key),
+            Some(b"pending".to_vec()),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+    }
+
+    let first = signed_request(
+        &client,
+        Method::GET,
+        &format!(
+            "{}/media?list-type=2&prefix=alpha%2F&max-keys=1",
+            sidecar.url
+        ),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = body_text(first).await;
+    assert_eq!(contents_keys(&first_body), vec!["alpha/one"]);
+    assert!(first_body.contains("<IsTruncated>true</IsTruncated>"));
+    let token = xml_tag(&first_body, "NextContinuationToken").unwrap();
+
+    let second = signed_request(
+        &client,
+        Method::GET,
+        &format!(
+            "{}/media?list-type=2&prefix=alpha%2F&max-keys=1&continuation-token={token}",
+            sidecar.url
+        ),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = body_text(second).await;
+    assert_eq!(contents_keys(&second_body), vec!["alpha/pending"]);
+    assert!(second_body.contains("<IsTruncated>false</IsTruncated>"));
+
+    let grouped = signed_request(
+        &client,
+        Method::GET,
+        &format!(
+            "{}/media?list-type=2&delimiter=%2F&max-keys=10",
+            sidecar.url
+        ),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(grouped.status(), StatusCode::OK);
+    let grouped_body = body_text(grouped).await;
+    assert_eq!(common_prefixes(&grouped_body), vec!["alpha/", "beta/"]);
+    assert_eq!(contents_keys(&grouped_body), vec!["delta", "gamma-pending"]);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn merged_v1_list_applies_marker_and_delimiter() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/alpha/one", b"one", "\"etag-one\"");
+    origin.put("media/beta/three", b"three", "\"etag-three\"");
+    origin.put("media/delta", b"delta", "\"etag-delta\"");
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/gamma-pending", sidecar.url),
+        Some(b"pending".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let first = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?delimiter=%2F&max-keys=2", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = body_text(first).await;
+    assert_eq!(common_prefixes(&first_body), vec!["alpha/", "beta/"]);
+    assert_eq!(contents_keys(&first_body), Vec::<String>::new());
+    assert!(first_body.contains("<IsTruncated>true</IsTruncated>"));
+    let marker = xml_tag(&first_body, "NextMarker").unwrap();
+
+    let second = signed_request(
+        &client,
+        Method::GET,
+        &format!(
+            "{}/media?delimiter=%2F&max-keys=2&marker={marker}",
+            sidecar.url
+        ),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body = body_text(second).await;
+    assert_eq!(contents_keys(&second_body), vec!["delta", "gamma-pending"]);
+    assert!(second_body.contains("<IsTruncated>false</IsTruncated>"));
+    drop(permit);
+}
+
+#[tokio::test]
+async fn merged_list_encodes_keys_for_encoding_type_url() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/encoded origin key", b"origin", "\"etag-origin\"");
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/encoded%20caf%C3%A9%20key", sidecar.url),
+        Some(b"pending".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let list = signed_request(
+        &client,
+        Method::GET,
+        &format!(
+            "{}/media?list-type=2&encoding-type=url&prefix=encoded%20",
+            sidecar.url
+        ),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = body_text(list).await;
+    assert!(body.contains("<EncodingType>url</EncodingType>"));
+    assert!(body.contains("<Prefix>encoded%20</Prefix>"));
+    assert!(body.contains("<Key>encoded%20caf%C3%A9%20key</Key>"));
+    assert!(body.contains("<Key>encoded%20origin%20key</Key>"));
+    assert!(!body.contains("encoded café key"));
+    drop(permit);
+}
+
+#[tokio::test]
+async fn merged_list_reads_one_origin_page_for_a_small_page() {
+    let (origin_url, origin) = spawn_origin().await;
+    for index in 0..300 {
+        origin.put(&format!("media/item-{index:03}"), b"body", "\"etag\"");
+    }
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/pending-zzz", sidecar.url),
+        Some(b"pending".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let calls_before = origin.list_count();
+    let list = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?list-type=2&max-keys=2", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = body_text(list).await;
+    assert_eq!(contents_keys(&body), vec!["item-000", "item-001"]);
+    let calls = origin.list_count() - calls_before;
+    assert_eq!(calls, 1, "origin list calls: {calls}");
+    drop(permit);
+}
+
+#[tokio::test]
+async fn merged_list_pages_a_pending_key_once() {
+    let (origin_url, origin) = spawn_origin().await;
+    for index in 0..9 {
+        origin.put(&format!("media/item-{index:02}"), b"body", "\"etag\"");
+    }
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/item-04-pending", sidecar.url),
+        Some(b"pending".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let mut keys = Vec::new();
+    let mut token: Option<String> = None;
+    let mut complete = false;
+    for _ in 0..20 {
+        let url = match &token {
+            Some(token) => format!(
+                "{}/media?list-type=2&max-keys=2&continuation-token={token}",
+                sidecar.url
+            ),
+            None => format!("{}/media?list-type=2&max-keys=2", sidecar.url),
+        };
+        let list = signed_request(&client, Method::GET, &url, None)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = body_text(list).await;
+        keys.extend(contents_keys(&body));
+        if body.contains("<IsTruncated>false</IsTruncated>") {
+            complete = true;
+            break;
+        }
+        token = xml_tag(&body, "NextContinuationToken");
+        assert!(token.is_some(), "missing continuation token");
+    }
+    assert!(complete, "the listing did not finish");
+    let mut expected: Vec<String> = (0..9).map(|index| format!("item-{index:02}")).collect();
+    expected.push("item-04-pending".to_owned());
+    expected.sort();
+    assert_eq!(keys, expected);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn merged_list_pages_common_prefixes_once() {
+    let (origin_url, origin) = spawn_origin().await;
+    for name in ["dir-a", "dir-b", "dir-c", "dir-d"] {
+        origin.put(&format!("media/{name}/one"), b"body", "\"etag\"");
+    }
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/dir-e/pending", sidecar.url),
+        Some(b"pending".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let mut prefixes = Vec::new();
+    let mut token: Option<String> = None;
+    let mut complete = false;
+    for _ in 0..20 {
+        let url = match &token {
+            Some(token) => format!(
+                "{}/media?list-type=2&delimiter=%2F&max-keys=2&continuation-token={token}",
+                sidecar.url
+            ),
+            None => format!("{}/media?list-type=2&delimiter=%2F&max-keys=2", sidecar.url),
+        };
+        let list = signed_request(&client, Method::GET, &url, None)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = body_text(list).await;
+        prefixes.extend(common_prefixes(&body));
+        assert_eq!(contents_keys(&body), Vec::<String>::new());
+        if body.contains("<IsTruncated>false</IsTruncated>") {
+            complete = true;
+            break;
+        }
+        token = xml_tag(&body, "NextContinuationToken");
+        assert!(token.is_some(), "missing continuation token");
+    }
+    assert!(complete, "the listing did not finish");
+    assert_eq!(
+        prefixes,
+        vec!["dir-a/", "dir-b/", "dir-c/", "dir-d/", "dir-e/"]
+    );
+    drop(permit);
+}
+
+#[tokio::test]
+async fn merged_list_forwards_an_unknown_v2_token() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/item-000", b"body", "\"etag\"");
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/pending", sidecar.url),
+        Some(b"pending".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let list = signed_request(
+        &client,
+        Method::GET,
+        &format!(
+            "{}/media?list-type=2&continuation-token=origin-token",
+            sidecar.url
+        ),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    assert_eq!(origin.last_token(), Some("origin-token".to_owned()));
+    drop(permit);
+}
+
+#[tokio::test]
+async fn merged_list_rejects_an_unknown_encoding_type() {
+    let (origin_url, origin) = spawn_origin().await;
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/pending", sidecar.url),
+        Some(b"pending".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+
+    let list = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?list-type=2&encoding-type=base64", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(list.status(), StatusCode::BAD_REQUEST);
+    let body = body_text(list).await;
+    assert!(body.contains("<Code>InvalidArgument</Code>"));
+    assert!(body.contains("encoding-type"));
+    assert_eq!(origin.list_count(), 0);
+    drop(permit);
+}
+
+#[tokio::test]
+async fn merged_list_resumes_after_a_hidden_origin_page() {
+    let (origin_url, origin) = spawn_origin().await;
+    for index in 0..20 {
+        origin.put(&format!("media/item-{index:02}"), b"body", "\"etag\"");
+    }
+    origin.put("media/zzz-live", b"live", "\"etag-live\"");
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    );
+    settings.cache.sync_debounce_ms = 60_000;
+    let sidecar = spawn_sidecar(settings).await;
+    let client = reqwest::Client::new();
+    for index in 0..20 {
+        let delete = signed_request(
+            &client,
+            Method::DELETE,
+            &format!("{}/media/item-{index:02}", sidecar.url),
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    }
+
+    let first = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media?list-type=2&max-keys=1", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = body_text(first).await;
+    assert!(
+        first_body.contains("<IsTruncated>true</IsTruncated>"),
+        "the hidden page did not stay truncated: {first_body}"
+    );
+    let mut keys = contents_keys(&first_body);
+    let mut token = xml_tag(&first_body, "NextContinuationToken");
+    assert!(token.is_some(), "the hidden page has no token");
+    let mut complete = false;
+    for _ in 0..10 {
+        let Some(current) = token.clone() else {
+            break;
+        };
+        let list = signed_request(
+            &client,
+            Method::GET,
+            &format!(
+                "{}/media?list-type=2&max-keys=1&continuation-token={current}",
+                sidecar.url
+            ),
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        let body = body_text(list).await;
+        keys.extend(contents_keys(&body));
+        if body.contains("<IsTruncated>false</IsTruncated>") {
+            complete = true;
+            break;
+        }
+        token = xml_tag(&body, "NextContinuationToken");
+        assert!(token.is_some(), "a page has no token");
+    }
+    assert!(complete, "the listing did not finish");
+    assert_eq!(keys, vec!["zzz-live"]);
 }

@@ -1,5 +1,7 @@
 //! HTTP server and S3 request forwarding.
 
+mod list;
+
 use std::future::IntoFuture;
 use std::io;
 use std::net::SocketAddr;
@@ -875,6 +877,15 @@ async fn forward(
     }
 
     if !object {
+        if method == Method::GET {
+            let write_state = cache.write_state(&bucket);
+            if (!write_state.0.is_empty() || !write_state.1.is_empty())
+                && let Some(response) =
+                    list::merged_response(state, write_state, &bucket, query, &credential).await?
+            {
+                return Ok(response);
+            }
+        }
         return proxy_request(state, method, &credential, prepared, path_and_query).await;
     }
 

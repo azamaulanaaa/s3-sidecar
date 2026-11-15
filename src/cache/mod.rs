@@ -379,6 +379,22 @@ impl Cache {
         lock(&self.tombstones).contains_key(&(bucket.to_owned(), key.to_owned()))
     }
 
+    /// Return one snapshot of the pending writes and tombstones for a bucket.
+    #[must_use]
+    pub fn write_state(&self, bucket: &str) -> (Vec<CacheMetadata>, Vec<String>) {
+        let pending = lock(&self.pending)
+            .iter()
+            .filter(|((name, _), _)| name == bucket)
+            .map(|(_, entry)| entry.meta.clone())
+            .collect();
+        let tombstones = lock(&self.tombstones)
+            .keys()
+            .filter(|(name, _)| name == bucket)
+            .map(|(_, key)| key.clone())
+            .collect();
+        (pending, tombstones)
+    }
+
     /// Read one cache entry from the metadata object.
     ///
     /// # Errors
