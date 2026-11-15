@@ -7,7 +7,7 @@ instruction.
 ## Purpose and version policy
 
 The repository has no `v0.1.0` tag. `v0.2.0` was the first public release tag.
-`v0.3.0` is the current release tag.
+`v0.3.0` is the next release tag.
 
 The version follows Semantic Versioning. The `package.version` field in
 `Cargo.toml` is the source of truth. Update `Cargo.lock` in the same change.

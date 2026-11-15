@@ -16,8 +16,8 @@ The format follows Keep a Changelog. This project uses Semantic Versioning.
 - `ListBuckets` answers from the client allow list in cache mode and cluster
   mode. It does not read the origin or the backing bucket.
 - Cluster mode answers `HeadBucket`, `ListObjects` V1, and `ListObjects` V2 from
-  committed metadata. `CreateBucket` and `DeleteBucket` return `501
-  NotImplemented` because the bucket set comes from configuration.
+  committed metadata. `CreateBucket` and `DeleteBucket` return
+  `501 NotImplemented` because the bucket set comes from configuration.
 - Cache mode passes bucket operations to origin. This covers `CreateBucket`,
   `DeleteBucket`, `HeadBucket`, `ListObjects` V1, `ListObjects` V2, and bucket
   sub-resources.
@@ -80,9 +80,9 @@ No security fixes in this release.
 - A slow client has no total response deadline. The idle timeout bounds only
   the gap between chunks.
 - Object tagging, versioning, ACLs, bucket policies, and `Select` are not
-  supported.
-- Cluster mode rejects object tagging, ACL, retention, legal hold, object
-  attribute, and `versionId` requests with `501 NotImplemented`.
+  supported. Cluster mode rejects object tagging, ACL, retention, legal hold,
+  object attribute, and `versionId` requests with `501 NotImplemented`. The
+  sidecar does not delete or overwrite the object.
 - The Consul watcher scans the full metadata prefix on each change.
 - Replication retries have no maximum attempt count.
 - Multipart checksum headers are dropped.

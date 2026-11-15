@@ -630,9 +630,9 @@ The cache key layout also changes. Read every step before you start.
 3. Set a unique `cache.prefix` for each sidecar. Sidecars that share a cache
    bucket must not share a prefix.
 4. Set `cache.max_bytes`. The field is required. `0` means unlimited.
-5. Expect a cold cache after the upgrade. The cache layout changed. Old objects
-   under `<prefix>/<node_id>/` become orphans. Add an S3 lifecycle rule on the
-   old prefixes, or purge them.
+5. Expect a cold cache after the upgrade. The new binary does not read the old
+   cache entries. Old blobs and old journal records remain in the cache bucket.
+   Add an S3 lifecycle rule on the old prefixes, or purge them.
 6. Drain pending writes before the upgrade, or upgrade all cache nodes
    together. A mixed-version set does not share cache entries.
 7. Check `GET /readyz`, the pending-write metric, and the journal after the
@@ -709,10 +709,9 @@ S3 client was available.
 ## Known limits
 
 - Object tagging, versioning, ACLs, bucket policies, and `Select` are not
-  supported.
-- Cluster mode rejects object tagging, ACL, retention, legal hold, object
-  attribute, and `versionId` requests with `501 NotImplemented`. The sidecar
-  does not delete or overwrite the object.
+  supported. Cluster mode rejects object tagging, ACL, retention, legal hold,
+  object attribute, and `versionId` requests with `501 NotImplemented`. The
+  sidecar does not delete or overwrite the object.
 - A cache entry is two S3 objects: a blob and a metadata object. There is no
   atomic switch between them. A different sidecar that reads the shared cache
   bucket during a write can observe old metadata with new bytes. The accepting
