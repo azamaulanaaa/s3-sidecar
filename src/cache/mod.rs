@@ -7,7 +7,7 @@ pub mod meta;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -93,6 +93,27 @@ struct PendingEntry {
     journal_key: String,
 }
 
+/// State for one client-driven multipart upload that completes in the cache.
+#[derive(Debug, Clone)]
+struct ClientUpload {
+    /// The multipart upload id at the cache endpoint.
+    upload_id: String,
+    /// The cache blob key for the completed object.
+    cache_key: String,
+    /// Origin bucket.
+    bucket: String,
+    /// Origin key.
+    key: String,
+    /// Content type from the client create request.
+    content_type: Option<String>,
+    /// Content encoding from the client create request.
+    content_encoding: Option<String>,
+    /// Object headers that the cache may store and replay.
+    headers: BTreeMap<String, String>,
+    /// Size of each uploaded part, keyed by part number.
+    part_sizes: Arc<Mutex<HashMap<u32, u64>>>,
+}
+
 struct SyncJobs {
     latest: HashMap<CacheKey, JournalEntry>,
     running: HashSet<CacheKey>,
@@ -119,6 +140,7 @@ pub struct Cache {
     origin_credential: Arc<ClientCredential>,
     index: Option<Mutex<CacheIndex>>,
     pending: Mutex<HashMap<CacheKey, PendingEntry>>,
+    client_uploads: Mutex<HashMap<String, ClientUpload>>,
     tombstones: Mutex<HashMap<CacheKey, i64>>,
     jobs: Mutex<SyncJobs>,
     sync_slots: Arc<Semaphore>,
@@ -191,6 +213,7 @@ impl Cache {
             origin_credential,
             index,
             pending: Mutex::new(HashMap::new()),
+            client_uploads: Mutex::new(HashMap::new()),
             tombstones: Mutex::new(HashMap::new()),
             jobs: Mutex::new(SyncJobs {
                 latest: HashMap::new(),
@@ -206,6 +229,11 @@ impl Cache {
     #[must_use]
     pub fn cache_bucket(&self) -> &str {
         &self.config.cache.bucket
+    }
+
+    /// Return the cache blob key for one origin object.
+    fn cache_key(&self, bucket: &str, key: &str) -> String {
+        blob_key(&self.config.cache.prefix, bucket, key)
     }
 
     /// Return the configured cache mode.
@@ -359,7 +387,7 @@ impl Cache {
         bucket: &str,
         key: &str,
     ) -> Result<Option<CacheMetadata>, CacheError> {
-        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
+        let cache_key = self.cache_key(bucket, key);
         let Some(response) = self
             .get_object(self.cache_bucket(), &meta_key(&cache_key), None)
             .await?
@@ -382,7 +410,7 @@ impl Cache {
         key: &str,
         range: Option<&str>,
     ) -> Result<Option<reqwest::Response>, CacheError> {
-        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
+        let cache_key = self.cache_key(bucket, key);
         self.get_object(self.cache_bucket(), &cache_key, range)
             .await
     }
@@ -398,14 +426,14 @@ impl Cache {
         key: &str,
         meta: &CacheMetadata,
     ) -> Result<(), CacheError> {
-        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
+        let cache_key = self.cache_key(bucket, key);
         self.put_meta(self.cache_bucket(), &cache_key, meta).await
     }
 
     /// Update the LRU access time for an entry.
     pub fn touch(&self, bucket: &str, key: &str) {
         if let Some(index) = &self.index {
-            let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
+            let cache_key = self.cache_key(bucket, key);
             let index = lock(index);
             if let Err(error) = index.touch(&cache_key, unix_now()) {
                 warn!(%error, "cache index touch failed");
@@ -449,7 +477,7 @@ impl Cache {
 
     /// Invalidate one cache entry. Errors are logged and ignored.
     pub async fn invalidate(&self, bucket: &str, key: &str) {
-        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
+        let cache_key = self.cache_key(bucket, key);
         if let Err(error) = self
             .delete_object(self.cache_bucket(), &meta_key(&cache_key))
             .await
@@ -484,8 +512,7 @@ impl Cache {
         headers: BTreeMap<String, String>,
         body_started: Arc<AtomicBool>,
     ) -> Result<CacheMetadata, CacheError> {
-        let id = next_id();
-        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
+        let cache_key = self.cache_key(bucket, key);
         let mut meta = CacheMetadata::synced(
             bucket,
             key,
@@ -510,35 +537,13 @@ impl Cache {
         meta.size = hashes.size;
         meta.checksum = hashes.sha256;
         meta.etag = format!("\"{}\"", hashes.md5);
-        let journal = JournalEntry::put(id.clone(), cache_key.clone(), &meta);
-        let journal_key = journal_key(&self.config.cache.prefix, &journal.id);
         if let Err(error) = self
-            .put_journal(self.cache_bucket(), &journal_key, &journal)
+            .record_pending_put(bucket, key, &cache_key, &meta)
             .await
         {
             let _ = self.delete_object(self.cache_bucket(), &cache_key).await;
             return Err(error);
         }
-        if let Err(error) = self.put_meta(self.cache_bucket(), &cache_key, &meta).await {
-            let _ = self.delete_object(self.cache_bucket(), &journal_key).await;
-            let _ = self.delete_object(self.cache_bucket(), &cache_key).await;
-            return Err(error);
-        }
-        let previous = lock(&self.pending).remove(&(bucket.to_owned(), key.to_owned()));
-        if let Some(previous) = previous {
-            let _ = self
-                .delete_object(self.cache_bucket(), &previous.journal_key)
-                .await;
-        }
-        lock(&self.pending).insert(
-            (bucket.to_owned(), key.to_owned()),
-            PendingEntry {
-                meta: meta.clone(),
-                journal_key,
-            },
-        );
-        lock(&self.tombstones).remove(&(bucket.to_owned(), key.to_owned()));
-        self.enqueue((bucket.to_owned(), key.to_owned()), journal);
         Ok(meta)
     }
 
@@ -548,7 +553,7 @@ impl Cache {
     ///
     /// Returns an error when the journal cannot be removed.
     pub async fn delete_pending(&self, bucket: &str, key: &str) -> Result<(), CacheError> {
-        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
+        let cache_key = self.cache_key(bucket, key);
         let pending = lock(&self.pending).remove(&(bucket.to_owned(), key.to_owned()));
         if let Some(entry) = pending {
             self.delete_object(self.cache_bucket(), &entry.journal_key)
@@ -570,7 +575,7 @@ impl Cache {
     /// Returns an error when the journal cannot be written.
     pub async fn stage_delete(self: &Arc<Self>, bucket: &str, key: &str) -> Result<(), CacheError> {
         let id = next_id();
-        let cache_key = blob_key(&self.config.cache.prefix, bucket, key);
+        let cache_key = self.cache_key(bucket, key);
         let _ = self
             .delete_object(self.cache_bucket(), &meta_key(&cache_key))
             .await;
@@ -602,7 +607,7 @@ impl Cache {
         let meta_writer = meta.clone();
         let origin_bucket = meta.origin_bucket.clone();
         let origin_key = meta.origin_key.clone();
-        let cache_key_value = blob_key(&self.config.cache.prefix, &origin_bucket, &origin_key);
+        let cache_key_value = self.cache_key(&origin_bucket, &origin_key);
         let tee_span = tracing::info_span!(
             "cache.tee",
             "s3.bucket.name" = meta.origin_bucket.as_str(),
@@ -865,7 +870,7 @@ impl Cache {
                         .flatten()
                         .is_none()
                     {
-                        let path = blob_key(&self.config.cache.prefix, &cache_key.0, &cache_key.1);
+                        let path = self.cache_key(&cache_key.0, &cache_key.1);
                         let _ = self.put_meta_from_key(bucket, &path, &meta).await;
                     }
                 }
@@ -970,7 +975,7 @@ impl Cache {
         let path = journal_key(&self.config.cache.prefix, &entry.id);
         if entry.kind == JournalKind::Put {
             let bucket = &entry.bucket;
-            let cache_key = blob_key(&self.config.cache.prefix, bucket, &entry.key);
+            let cache_key = self.cache_key(bucket, &entry.key);
             let mut meta = self
                 .read_meta(bucket, &entry.key)
                 .await
@@ -1000,7 +1005,7 @@ impl Cache {
         failed.state = EntryState::Failed;
         let _ = self.put_journal(self.cache_bucket(), &path, &failed).await;
         if entry.kind == JournalKind::Put {
-            let cache_key = blob_key(&self.config.cache.prefix, &entry.bucket, &entry.key);
+            let cache_key = self.cache_key(&entry.bucket, &entry.key);
             if let Ok(Some(mut meta)) = self.read_meta(&entry.bucket, &entry.key).await {
                 meta.mark_failed();
                 let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
@@ -1138,7 +1143,7 @@ impl Cache {
         receiver: mpsc::Receiver<Result<Bytes, io::Error>>,
         length: Option<u64>,
     ) -> Result<StoredBlob, CacheError> {
-        let cache_key = blob_key(&self.config.cache.prefix, origin_bucket, origin_key);
+        let cache_key = self.cache_key(origin_bucket, origin_key);
         let body = receiver_stream(receiver);
         let hashes = self
             .put_blob_stream(self.cache_bucket(), &cache_key, body, length, None)
@@ -1198,12 +1203,439 @@ impl Cache {
 
     /// Delete a best-effort cache blob for a failed write-through.
     pub async fn discard_blob(&self, origin_bucket: &str, origin_key: &str) {
-        let cache_key = blob_key(&self.config.cache.prefix, origin_bucket, origin_key);
+        let cache_key = self.cache_key(origin_bucket, origin_key);
         let _ = self
             .delete_object(self.cache_bucket(), &meta_key(&cache_key))
             .await;
         let _ = self.delete_object(self.cache_bucket(), &cache_key).await;
         self.index_remove(&cache_key);
+    }
+
+    /// Return true when a client multipart upload completes in the cache.
+    #[must_use]
+    pub fn has_client_upload(&self, upload_id: &str) -> bool {
+        lock(&self.client_uploads).contains_key(upload_id)
+    }
+
+    /// Start a client multipart upload at the cache endpoint.
+    ///
+    /// Returns the sidecar upload id for the client. The sidecar maps this id
+    /// to the cache upload id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache cannot start the upload or the response
+    /// does not contain an upload id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_client_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        headers: BTreeMap<String, String>,
+        request_headers: &HeaderMap,
+    ) -> Result<String, CacheError> {
+        let cache_key = self.cache_key(bucket, key);
+        let request = ForwardRequest {
+            method: Method::POST,
+            path_and_query: format!("{}?uploads", object_path(self.cache_bucket(), &cache_key)),
+            headers: request_headers.clone(),
+            body: None,
+            content_length: Some(0),
+        };
+        let response = self
+            .client
+            .execute(&self.credential, request)
+            .await
+            .map_err(storage_error)?;
+        if !response.status().is_success() {
+            return Err(CacheError::Status(response.status().as_u16()));
+        }
+        let body = response.bytes().await.map_err(|_| CacheError::Body)?;
+        let text = String::from_utf8_lossy(&body);
+        let cache_upload_id = extract_tag(&text, "UploadId").ok_or(CacheError::Metadata)?;
+        let id = next_id();
+        lock(&self.client_uploads).insert(
+            id.clone(),
+            ClientUpload {
+                upload_id: cache_upload_id,
+                cache_key,
+                bucket: bucket.to_owned(),
+                key: key.to_owned(),
+                content_type,
+                content_encoding,
+                headers,
+                part_sizes: Arc::new(Mutex::new(HashMap::new())),
+            },
+        );
+        Ok(id)
+    }
+
+    /// Send one client part to the cache endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache does not know the upload or the cache
+    /// request fails.
+    pub async fn upload_client_part(
+        &self,
+        upload_id: &str,
+        part_number: &str,
+        headers: &HeaderMap,
+        body: BodyStream,
+        length: Option<u64>,
+    ) -> Result<reqwest::Response, CacheError> {
+        let upload = self.client_upload(upload_id)?;
+        let part_number = part_number
+            .parse::<u32>()
+            .map_err(|_| CacheError::Metadata)?;
+        let (body, counted, overflow) = if let Some(length) = length {
+            if let Err(error) = self.check_part_total(&upload, part_number, length) {
+                return Err(self.reject_client_upload(upload_id, &upload, error).await);
+            }
+            (body, None, None)
+        } else {
+            let remaining = self.remaining_part_bytes(&upload, part_number);
+            let counted = Arc::new(AtomicU64::new(0));
+            let overflow = Arc::new(AtomicBool::new(false));
+            let body =
+                count_part_bytes(body, Arc::clone(&counted), Arc::clone(&overflow), remaining);
+            (body, Some(counted), Some(overflow))
+        };
+        let request = ForwardRequest {
+            method: Method::PUT,
+            path_and_query: format!(
+                "{}?partNumber={part_number}&uploadId={}",
+                object_path(self.cache_bucket(), &upload.cache_key),
+                encode_query_value(&upload.upload_id)
+            ),
+            headers: headers.clone(),
+            body: Some(body),
+            content_length: length,
+        };
+        let result = self.client.execute(&self.credential, request).await;
+        if let Some(overflow) = &overflow
+            && overflow.load(Ordering::Acquire)
+        {
+            return Err(self
+                .reject_client_upload(upload_id, &upload, CacheError::TooLarge)
+                .await);
+        }
+        let response = result.map_err(storage_error)?;
+        if !response.status().is_success() {
+            return Err(CacheError::Status(response.status().as_u16()));
+        }
+        let size = match (counted, length) {
+            (Some(counted), _) => counted.load(Ordering::Acquire),
+            (_, Some(length)) => length,
+            _ => 0,
+        };
+        lock(&upload.part_sizes).insert(part_number, size);
+        Ok(response)
+    }
+
+    /// Complete a client multipart upload at the cache endpoint.
+    ///
+    /// The cache entry becomes pending. The origin sync starts after this call
+    /// writes the journal and metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache does not know the upload, the cache
+    /// complete fails, or the cache cannot store the metadata.
+    pub async fn complete_client_upload(
+        self: &Arc<Self>,
+        upload_id: &str,
+        headers: &HeaderMap,
+        body: Bytes,
+    ) -> Result<ClientComplete, CacheError> {
+        let upload = self.client_upload(upload_id)?;
+        if client_upload_total(&upload) > self.max_object_bytes() {
+            return Err(self
+                .reject_client_upload(upload_id, &upload, CacheError::TooLarge)
+                .await);
+        }
+        let length = u64::try_from(body.len()).map_err(|_| CacheError::Body)?;
+        let stream: BodyStream = Box::pin(futures_util::stream::once(async move { Ok(body) }));
+        let request = ForwardRequest {
+            method: Method::POST,
+            path_and_query: format!(
+                "{}?uploadId={}",
+                object_path(self.cache_bucket(), &upload.cache_key),
+                encode_query_value(&upload.upload_id)
+            ),
+            headers: headers.clone(),
+            body: Some(stream),
+            content_length: Some(length),
+        };
+        let response = self
+            .client
+            .execute(&self.credential, request)
+            .await
+            .map_err(storage_error)?;
+        if !response.status().is_success() {
+            return Err(CacheError::Status(response.status().as_u16()));
+        }
+        let response_headers = response.headers().clone();
+        let response_body = response.bytes().await.map_err(|_| CacheError::Body)?;
+        let text = String::from_utf8_lossy(&response_body);
+        let etag = response_headers
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| extract_tag(&text, "ETag"))
+            .unwrap_or_default();
+        let size = self
+            .head_content_length(self.cache_bucket(), &upload.cache_key)
+            .await?;
+        lock(&self.client_uploads).remove(upload_id);
+        let mut meta = CacheMetadata::synced(
+            &upload.bucket,
+            &upload.key,
+            etag,
+            None,
+            size,
+            upload.content_type,
+            upload.content_encoding,
+            unix_now(),
+        );
+        meta.headers = upload.headers;
+        meta.state = EntryState::Pending;
+        self.record_pending_put(&upload.bucket, &upload.key, &upload.cache_key, &meta)
+            .await?;
+        Ok(ClientComplete {
+            headers: response_headers,
+            body: response_body,
+        })
+    }
+
+    /// Abort a client multipart upload at the cache endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache does not know the upload or the cache
+    /// abort fails.
+    pub async fn abort_client_upload(
+        &self,
+        upload_id: &str,
+        headers: &HeaderMap,
+    ) -> Result<reqwest::Response, CacheError> {
+        let upload = self.client_upload(upload_id)?;
+        let response = self.delete_cache_upload(&upload, headers).await?;
+        lock(&self.client_uploads).remove(upload_id);
+        Ok(response)
+    }
+
+    /// List the parts of a client multipart upload at the cache endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache does not know the upload or the cache
+    /// request fails.
+    pub async fn list_client_parts(
+        &self,
+        upload_id: &str,
+        query: &str,
+        headers: &HeaderMap,
+    ) -> Result<reqwest::Response, CacheError> {
+        let upload = self.client_upload(upload_id)?;
+        let query = replace_upload_id(query, &upload.upload_id);
+        let request = ForwardRequest {
+            method: Method::GET,
+            path_and_query: format!(
+                "{}?{query}",
+                object_path(self.cache_bucket(), &upload.cache_key)
+            ),
+            headers: headers.clone(),
+            body: None,
+            content_length: None,
+        };
+        let response = self
+            .client
+            .execute(&self.credential, request)
+            .await
+            .map_err(storage_error)?;
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            Err(CacheError::Status(response.status().as_u16()))
+        }
+    }
+
+    /// Fill the cache from an origin response.
+    ///
+    /// This call does not write a journal record. Origin already has the
+    /// object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the body is too large or the cache write fails.
+    pub async fn fill_from_response(
+        self: &Arc<Self>,
+        bucket: &str,
+        key: &str,
+        response: reqwest::Response,
+        mut meta: CacheMetadata,
+    ) -> Result<(), CacheError> {
+        if meta.size > self.max_object_bytes() {
+            return Err(CacheError::TooLarge);
+        }
+        let cache_key = self.cache_key(bucket, key);
+        let body: BodyStream = Box::pin(
+            response
+                .bytes_stream()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string())),
+        );
+        let hashes = self
+            .put_blob_stream(self.cache_bucket(), &cache_key, body, Some(meta.size), None)
+            .await?;
+        meta.size = hashes.size;
+        meta.checksum = hashes.sha256;
+        if meta.etag.is_empty() {
+            meta.etag = format!("\"{}\"", hashes.md5);
+        }
+        meta.state = EntryState::Synced;
+        meta.validated_at = unix_now();
+        self.put_meta(self.cache_bucket(), &cache_key, &meta)
+            .await?;
+        let pending = lock(&self.pending).remove(&(bucket.to_owned(), key.to_owned()));
+        if let Some(entry) = pending {
+            let _ = self
+                .delete_object(self.cache_bucket(), &entry.journal_key)
+                .await;
+        }
+        lock(&self.tombstones).remove(&(bucket.to_owned(), key.to_owned()));
+        self.index_upsert(&cache_key, &meta).await
+    }
+
+    fn client_upload(&self, upload_id: &str) -> Result<ClientUpload, CacheError> {
+        lock(&self.client_uploads)
+            .get(upload_id)
+            .cloned()
+            .ok_or(CacheError::Status(StatusCode::NOT_FOUND.as_u16()))
+    }
+
+    /// Check the total size after one part replaces an older part.
+    fn check_part_total(
+        &self,
+        upload: &ClientUpload,
+        part_number: u32,
+        length: u64,
+    ) -> Result<(), CacheError> {
+        let sizes = lock(&upload.part_sizes);
+        let base = part_total(&sizes).saturating_sub(sizes.get(&part_number).copied().unwrap_or(0));
+        if base.saturating_add(length) > self.max_object_bytes() {
+            return Err(CacheError::TooLarge);
+        }
+        Ok(())
+    }
+
+    /// Return the bytes that a new part may add.
+    fn remaining_part_bytes(&self, upload: &ClientUpload, part_number: u32) -> u64 {
+        let sizes = lock(&upload.part_sizes);
+        let base = part_total(&sizes).saturating_sub(sizes.get(&part_number).copied().unwrap_or(0));
+        self.max_object_bytes().saturating_sub(base)
+    }
+
+    /// Abort one cache upload and remove its sidecar state.
+    async fn reject_client_upload(
+        &self,
+        upload_id: &str,
+        upload: &ClientUpload,
+        error: CacheError,
+    ) -> CacheError {
+        if let Err(abort_error) = self.delete_cache_upload(upload, &HeaderMap::new()).await {
+            warn!(%abort_error, "cache multipart abort failed");
+        }
+        lock(&self.client_uploads).remove(upload_id);
+        error
+    }
+
+    /// Send one abort request for a cache upload.
+    async fn delete_cache_upload(
+        &self,
+        upload: &ClientUpload,
+        headers: &HeaderMap,
+    ) -> Result<reqwest::Response, CacheError> {
+        let request = ForwardRequest {
+            method: Method::DELETE,
+            path_and_query: format!(
+                "{}?uploadId={}",
+                object_path(self.cache_bucket(), &upload.cache_key),
+                encode_query_value(&upload.upload_id)
+            ),
+            headers: headers.clone(),
+            body: None,
+            content_length: None,
+        };
+        let response = self
+            .client
+            .execute(&self.credential, request)
+            .await
+            .map_err(storage_error)?;
+        if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
+            return Err(CacheError::Status(response.status().as_u16()));
+        }
+        Ok(response)
+    }
+
+    /// Write the journal and metadata for a pending cache entry.
+    async fn record_pending_put(
+        self: &Arc<Self>,
+        bucket: &str,
+        key: &str,
+        cache_key: &str,
+        meta: &CacheMetadata,
+    ) -> Result<(), CacheError> {
+        let journal = JournalEntry::put(next_id(), cache_key.to_owned(), meta);
+        let journal_key = journal_key(&self.config.cache.prefix, &journal.id);
+        self.put_journal(self.cache_bucket(), &journal_key, &journal)
+            .await?;
+        if let Err(error) = self.put_meta(self.cache_bucket(), cache_key, meta).await {
+            let _ = self.delete_object(self.cache_bucket(), &journal_key).await;
+            return Err(error);
+        }
+        let previous = lock(&self.pending).remove(&(bucket.to_owned(), key.to_owned()));
+        if let Some(previous) = previous {
+            let _ = self
+                .delete_object(self.cache_bucket(), &previous.journal_key)
+                .await;
+        }
+        lock(&self.pending).insert(
+            (bucket.to_owned(), key.to_owned()),
+            PendingEntry {
+                meta: meta.clone(),
+                journal_key,
+            },
+        );
+        lock(&self.tombstones).remove(&(bucket.to_owned(), key.to_owned()));
+        self.enqueue((bucket.to_owned(), key.to_owned()), journal);
+        Ok(())
+    }
+
+    async fn head_content_length(&self, bucket: &str, key: &str) -> Result<u64, CacheError> {
+        let request = ForwardRequest {
+            method: Method::HEAD,
+            path_and_query: object_path(bucket, key),
+            headers: HeaderMap::new(),
+            body: None,
+            content_length: None,
+        };
+        let response = self
+            .client
+            .execute(&self.credential, request)
+            .await
+            .map_err(storage_error)?;
+        if !response.status().is_success() {
+            return Err(CacheError::Status(response.status().as_u16()));
+        }
+        response
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(CacheError::Metadata)
     }
 
     async fn put_journal(
@@ -1636,6 +2068,14 @@ pub struct StoredBlob {
     md5: String,
 }
 
+/// A completed client multipart upload response from the cache.
+pub struct ClientComplete {
+    /// Response headers from the cache.
+    pub headers: HeaderMap,
+    /// Response body from the cache.
+    pub body: Bytes,
+}
+
 struct HashResult {
     size: u64,
     sha256: String,
@@ -1775,6 +2215,43 @@ fn receiver_stream(mut receiver: mpsc::Receiver<Result<Bytes, io::Error>>) -> Bo
     Box::pin(stream)
 }
 
+/// Return the total size of the stored parts.
+fn part_total(sizes: &HashMap<u32, u64>) -> u64 {
+    sizes.values().copied().fold(0_u64, u64::saturating_add)
+}
+
+/// Return the total size of one client upload.
+fn client_upload_total(upload: &ClientUpload) -> u64 {
+    part_total(&lock(&upload.part_sizes))
+}
+
+/// Count the bytes of one part and stop when the limit is exceeded.
+fn count_part_bytes(
+    mut body: BodyStream,
+    counted: Arc<AtomicU64>,
+    overflow: Arc<AtomicBool>,
+    limit: u64,
+) -> BodyStream {
+    let stream = async_stream::try_stream! {
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk?;
+            let length = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+            let total = counted
+                .fetch_add(length, Ordering::AcqRel)
+                .saturating_add(length);
+            if total > limit {
+                overflow.store(true, Ordering::Release);
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the part is too large for the cache",
+                ))?;
+            }
+            yield chunk;
+        }
+    };
+    Box::pin(stream)
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn storage_error(error: StorageError) -> CacheError {
     match error {
@@ -1804,6 +2281,48 @@ fn parse_keys(body: &str) -> Vec<String> {
         rest = &rest[end + 6..];
     }
     keys
+}
+
+/// Return one XML element value.
+fn extract_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)?.saturating_add(open.len());
+    let rest = xml.get(start..)?;
+    let end = rest.find(&close)?;
+    Some(unescape_xml(rest.get(..end)?))
+}
+
+/// Replace the upload id in one query string.
+fn replace_upload_id(query: &str, upload_id: &str) -> String {
+    let value = encode_query_value(upload_id);
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+            if key == "uploadId" {
+                format!("uploadId={value}")
+            } else {
+                pair.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Percent-encode one query value.
+fn encode_query_value(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            output.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(output, "%{byte:02X}");
+        }
+    }
+    output
 }
 
 fn unescape_xml(value: &str) -> String {

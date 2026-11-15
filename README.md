@@ -1069,8 +1069,16 @@ and is not part of the pull request gate.
 - `bootstrap = true` belongs on one node. A restart of that node keeps the
   existing cluster. A fresh second node with `bootstrap = false` waits for the
   leader and does not form a cluster alone.
-- In cache mode, multipart and CopyObject pass through to origin. The sidecar
-  does not cache multipart parts.
+- In cache mode, CopyObject passes through to origin. A client-driven multipart
+  upload uses the cache:
+  - In `read` mode, the upload completes at origin. The sidecar then stores the
+    object in the cache.
+  - With `write_policy = "write_back"`, the upload completes in the cache. The
+    sidecar syncs the object to origin in the background.
+  - With `write_policy = "write_through"`, the upload completes at origin. The
+    sidecar then stores the object in the cache.
+  - `ListMultipartUploads` reads origin. It does not list an in-flight write-back
+    upload.
 - The TLS listener serves one certificate. Client certificate authentication and
   automatic certificate reload are not implemented.
 - The sidecar retries only idempotent requests. It never replays a request body.

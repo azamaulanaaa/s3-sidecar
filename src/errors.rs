@@ -159,6 +159,16 @@ impl S3Error {
         )
     }
 
+    /// The object is too large for the cache.
+    #[must_use]
+    pub fn cache_object_too_large() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "EntityTooLarge",
+            "The object is larger than the cache object size limit.",
+        )
+    }
+
     /// The upstream did not respond in time.
     #[must_use]
     pub fn request_timeout() -> Self {

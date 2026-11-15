@@ -98,6 +98,12 @@ impl FakeS3 {
         self.counts.puts.load(Ordering::Relaxed)
     }
 
+    /// Return the number of `GET` and `HEAD` requests.
+    #[must_use]
+    pub fn gets(&self) -> u64 {
+        self.counts.gets.load(Ordering::Relaxed)
+    }
+
     /// Return the number of multipart uploads that started.
     #[must_use]
     pub fn uploads(&self) -> u64 {

@@ -830,8 +830,9 @@ async fn forward(
     )?;
     let path_and_query = upstream_path_and_query(uri, is_presigned(uri));
     let query = uri.query().unwrap_or_default();
-    let multipart =
-        query.contains("uploads") || query.contains("uploadId") || query.contains("partNumber");
+    let multipart = query_has(query, "uploads")
+        || query_has(query, "uploadId")
+        || query_has(query, "partNumber");
     let copy = headers.contains_key("x-amz-copy-source");
     let object = !key.is_empty();
 
@@ -860,20 +861,31 @@ async fn forward(
         }
     }
 
-    if !object || multipart {
+    if !object {
+        return proxy_request(state, method, &credential, prepared, path_and_query).await;
+    }
+
+    if copy {
         let response = proxy_request(state, method, &credential, prepared, path_and_query).await?;
-        if method == Method::POST && query.contains("uploadId") && response.status().is_success() {
+        if response.status().is_success() && !multipart {
             cache.invalidate(&bucket, &key).await;
         }
         return Ok(response);
     }
 
-    if copy {
-        let response = proxy_request(state, method, &credential, prepared, path_and_query).await?;
-        if response.status().is_success() {
-            cache.invalidate(&bucket, &key).await;
-        }
-        return Ok(response);
+    if multipart {
+        return multipart_request(
+            state,
+            cache,
+            method,
+            &credential,
+            prepared,
+            &bucket,
+            &key,
+            path_and_query,
+            query,
+        )
+        .await;
     }
 
     match method {
@@ -937,6 +949,231 @@ async fn forward(
         }
         _ => proxy_request(state, method, &credential, prepared, path_and_query).await,
     }
+}
+
+/// Route one client-driven multipart request.
+///
+/// A write-back upload completes in the cache and syncs to origin. A read or
+/// write-through upload completes at origin and fills the cache. A create
+/// failure can fall back to origin when `on_cache_error` permits it.
+// The router needs the request context and the prepared request.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn multipart_request(
+    state: &AppState,
+    cache: &Arc<Cache>,
+    method: &Method,
+    credential: &Arc<ClientCredential>,
+    prepared: PreparedRequest,
+    bucket: &str,
+    key: &str,
+    path_and_query: String,
+    query: &str,
+) -> Result<Response, S3Error> {
+    let policy = cache.write_policy_for(bucket);
+    let write_back = cache.writes_cache() && policy == WritePolicy::WriteBack;
+    let upload_id = query_param(query, "uploadId");
+
+    if method == Method::POST && query_has(query, "uploads") {
+        if write_back {
+            let content_type = header_string(&prepared.headers, header::CONTENT_TYPE);
+            let content_encoding = header_string(&prepared.headers, header::CONTENT_ENCODING);
+            let object_headers = collect_headers(&prepared.headers);
+            match cache
+                .create_client_upload(
+                    bucket,
+                    key,
+                    content_type,
+                    content_encoding,
+                    object_headers,
+                    &prepared.headers,
+                )
+                .await
+            {
+                Ok(id) => return Ok(initiate_multipart_response(bucket, key, &id)),
+                Err(error) => {
+                    if cache.on_cache_error() == crate::config::OnCacheError::Origin {
+                        state.metrics.fallback();
+                        warn!(%error, "cache multipart create failed; using origin");
+                    } else {
+                        return Err(cache_error(&error));
+                    }
+                }
+            }
+        }
+        return proxy_request(state, method, credential, prepared, path_and_query).await;
+    }
+
+    if method == Method::PUT && query_has(query, "partNumber") {
+        let part_number = query_param(query, "partNumber").unwrap_or_default();
+        if let Some(id) = upload_id.as_deref()
+            && write_back
+            && cache.has_client_upload(id)
+        {
+            let body = prepared.body.unwrap_or_else(empty_body);
+            let response = cache
+                .upload_client_part(
+                    id,
+                    &part_number,
+                    &prepared.headers,
+                    body,
+                    prepared.content_length,
+                )
+                .await
+                .map_err(|error| multipart_cache_error(&error))?;
+            return forward_response(method, response, state.idle_timeout()).await;
+        }
+        return proxy_request(state, method, credential, prepared, path_and_query).await;
+    }
+
+    if method == Method::POST && query_has(query, "uploadId") {
+        if let Some(id) = upload_id.as_deref()
+            && write_back
+            && cache.has_client_upload(id)
+        {
+            let request_headers = prepared.headers;
+            let body = collect_request_body(prepared.body).await?;
+            let complete = cache
+                .complete_client_upload(id, &request_headers, body)
+                .await
+                .map_err(|error| multipart_cache_error(&error))?;
+            return Ok(client_complete_response(complete));
+        }
+        let response = proxy_request(state, method, credential, prepared, path_and_query).await?;
+        if response.status().is_success() {
+            cache.invalidate(bucket, key).await;
+            if cache.reads_cache() || policy == WritePolicy::WriteThrough {
+                fill_cache_from_origin(state, cache, credential, bucket, key).await;
+            }
+        }
+        return Ok(response);
+    }
+
+    if method == Method::DELETE && query_has(query, "uploadId") {
+        if let Some(id) = upload_id.as_deref()
+            && write_back
+            && cache.has_client_upload(id)
+        {
+            let response = cache
+                .abort_client_upload(id, &prepared.headers)
+                .await
+                .map_err(|error| cache_error(&error))?;
+            return forward_response(method, response, state.idle_timeout()).await;
+        }
+        return proxy_request(state, method, credential, prepared, path_and_query).await;
+    }
+
+    if method == Method::GET && query_has(query, "uploadId") {
+        if let Some(id) = upload_id.as_deref()
+            && write_back
+            && cache.has_client_upload(id)
+        {
+            let response = cache
+                .list_client_parts(id, query, &prepared.headers)
+                .await
+                .map_err(|error| cache_error(&error))?;
+            return forward_response(method, response, state.idle_timeout()).await;
+        }
+        return proxy_request(state, method, credential, prepared, path_and_query).await;
+    }
+
+    // ListMultipartUploads uses origin. The sidecar does not list an in-flight
+    // write-back upload.
+    proxy_request(state, method, credential, prepared, path_and_query).await
+}
+
+/// Build the create response for a cache upload.
+fn initiate_multipart_response(bucket: &str, key: &str, upload_id: &str) -> Response {
+    let body = format!(
+        "<InitiateMultipartUploadResult><Bucket>{}</Bucket><Key>{}</Key>\
+         <UploadId>{}</UploadId></InitiateMultipartUploadResult>",
+        escape_xml(bucket),
+        escape_xml(key),
+        escape_xml(upload_id)
+    );
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/xml"),
+    );
+    response
+}
+
+/// Build the complete response from a cache upload.
+fn client_complete_response(complete: crate::cache::ClientComplete) -> Response {
+    let length = complete.body.len();
+    let mut response = Response::new(Body::from(complete.body));
+    *response.status_mut() = StatusCode::OK;
+    copy_response_headers(&complete.headers, response.headers_mut());
+    response.headers_mut().remove(header::CONTENT_LENGTH);
+    if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
+    }
+    response
+}
+
+/// Read a small request body, such as one complete request.
+async fn collect_request_body(body: Option<BodyStream>) -> Result<Bytes, S3Error> {
+    let Some(mut body) = body else {
+        return Ok(Bytes::new());
+    };
+    let mut buffer = BytesMut::new();
+    while let Some(chunk) = body.next().await {
+        let chunk =
+            chunk.map_err(|_| S3Error::invalid_request("The request body is not valid."))?;
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer.freeze())
+}
+
+/// Read one object from origin and store it in the cache.
+///
+/// The request has no client condition and no range. A failure only logs a
+/// warning because origin already accepted the write.
+async fn fill_cache_from_origin(
+    state: &AppState,
+    cache: &Arc<Cache>,
+    credential: &Arc<ClientCredential>,
+    bucket: &str,
+    key: &str,
+) {
+    let request = ForwardRequest {
+        method: Method::GET,
+        path_and_query: crate::cache::keys::object_path(bucket, key),
+        headers: HeaderMap::new(),
+        body: None,
+        content_length: None,
+    };
+    let response = match state.client.execute(credential, request).await {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(kind = error.kind(), "cache fill read failed");
+            return;
+        }
+    };
+    if !response.status().is_success() {
+        warn!(
+            status = response.status().as_u16(),
+            "cache fill read failed"
+        );
+        return;
+    }
+    let meta = Cache::metadata_from_response(bucket, key, &response);
+    if meta.size == 0 || meta.size > cache.max_object_bytes() {
+        return;
+    }
+    if let Err(error) = cache.fill_from_response(bucket, key, response, meta).await {
+        warn!(%error, "cache fill write failed");
+    }
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 async fn forward_cluster(
@@ -1975,6 +2212,15 @@ fn cache_error_fallback(cache: &Cache, error: &crate::cache::CacheError) -> bool
 fn cache_error(error: &crate::cache::CacheError) -> S3Error {
     warn!(%error, "cache request failed");
     S3Error::service_unavailable()
+}
+
+/// Map one cache multipart error to an S3 error.
+fn multipart_cache_error(error: &crate::cache::CacheError) -> S3Error {
+    if matches!(error, crate::cache::CacheError::TooLarge) {
+        S3Error::cache_object_too_large()
+    } else {
+        cache_error(error)
+    }
 }
 
 fn unix_now() -> i64 {
