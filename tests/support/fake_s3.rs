@@ -24,6 +24,7 @@ struct Stored {
 
 #[derive(Debug, Clone)]
 struct Upload {
+    bucket: String,
     key: String,
     parts: BTreeMap<u32, Bytes>,
 }
@@ -238,7 +239,8 @@ async fn handler(
             uploads.insert(
                 upload_id.clone(),
                 Upload {
-                    key: object_key,
+                    bucket: bucket.clone(),
+                    key: key.clone(),
                     parts: BTreeMap::new(),
                 },
             );
@@ -329,7 +331,7 @@ async fn handler(
         let etag = format!("\"{}-{}\"", md5_hex(&body), upload.parts.len());
         if let Ok(mut objects) = state.objects.lock() {
             objects.insert(
-                upload.key,
+                format!("{}/{}", upload.bucket, upload.key),
                 Stored {
                     body,
                     etag: etag.clone(),
@@ -340,9 +342,66 @@ async fn handler(
         return xml(
             StatusCode::OK,
             &format!(
-                "<CompleteMultipartUploadResult><ETag>{}</ETag>\
+                "<CompleteMultipartUploadResult><Location>/{}/{}</Location>\
+                 <Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>\
                  </CompleteMultipartUploadResult>",
+                escape_xml(&upload.bucket),
+                escape_xml(&upload.key),
+                escape_xml(&upload.bucket),
+                escape_xml(&upload.key),
                 escape_xml(&etag)
+            ),
+        );
+    }
+
+    if method == Method::GET && has(&query, "uploadId") {
+        let upload_id = get(&query, "uploadId").unwrap_or_default().to_owned();
+        let Some(upload) = state
+            .uploads
+            .lock()
+            .ok()
+            .and_then(|uploads| uploads.get(&upload_id).cloned())
+        else {
+            return xml(
+                StatusCode::NOT_FOUND,
+                "<Error><Code>NoSuchUpload</Code></Error>",
+            );
+        };
+        let max_parts = get(&query, "max-parts")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_000);
+        let marker = get(&query, "part-number-marker")
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let mut parts = String::new();
+        let mut next_marker = marker;
+        let mut truncated = false;
+        let mut shown = 0_usize;
+        for (number, part) in upload.parts.range(marker.saturating_add(1)..) {
+            if shown == max_parts {
+                truncated = true;
+                break;
+            }
+            let _ = write!(
+                parts,
+                "<Part><PartNumber>{number}</PartNumber><ETag>\"part-{number}\"</ETag>\
+                 <Size>{}</Size></Part>",
+                part.len()
+            );
+            next_marker = *number;
+            shown = shown.saturating_add(1);
+        }
+        return xml(
+            StatusCode::OK,
+            &format!(
+                "<ListPartsResult><Bucket>{}</Bucket><Key>{}</Key>\
+                 <UploadId>{}</UploadId><PartNumberMarker>{marker}</PartNumberMarker>\
+                 <NextPartNumberMarker>{next_marker}</NextPartNumberMarker>\
+                 <MaxParts>{max_parts}</MaxParts><IsTruncated>{truncated}</IsTruncated>\
+                 {parts}</ListPartsResult>",
+                escape_xml(&upload.bucket),
+                escape_xml(&upload.key),
+                escape_xml(&upload_id)
             ),
         );
     }

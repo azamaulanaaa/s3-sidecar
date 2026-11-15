@@ -1399,7 +1399,7 @@ impl Cache {
         let mut meta = CacheMetadata::synced(
             &upload.bucket,
             &upload.key,
-            etag,
+            etag.clone(),
             None,
             size,
             upload.content_type,
@@ -1412,7 +1412,9 @@ impl Cache {
             .await?;
         Ok(ClientComplete {
             headers: response_headers,
-            body: response_body,
+            bucket: upload.bucket,
+            key: upload.key,
+            etag,
         })
     }
 
@@ -1435,6 +1437,10 @@ impl Cache {
 
     /// List the parts of a client multipart upload at the cache endpoint.
     ///
+    /// The caller must rewrite the bucket, key, and upload id in the response
+    /// body. The cache response describes the cache object, not the origin
+    /// object.
+    ///
     /// # Errors
     ///
     /// Returns an error when the cache does not know the upload or the cache
@@ -1444,7 +1450,7 @@ impl Cache {
         upload_id: &str,
         query: &str,
         headers: &HeaderMap,
-    ) -> Result<reqwest::Response, CacheError> {
+    ) -> Result<ClientListParts, CacheError> {
         let upload = self.client_upload(upload_id)?;
         let query = replace_upload_id(query, &upload.upload_id);
         let request = ForwardRequest {
@@ -1462,11 +1468,15 @@ impl Cache {
             .execute(&self.credential, request)
             .await
             .map_err(storage_error)?;
-        if response.status().is_success() {
-            Ok(response)
-        } else {
-            Err(CacheError::Status(response.status().as_u16()))
+        if !response.status().is_success() {
+            return Err(CacheError::Status(response.status().as_u16()));
         }
+        let response_headers = response.headers().clone();
+        let body = response.bytes().await.map_err(|_| CacheError::Body)?;
+        Ok(ClientListParts {
+            headers: response_headers,
+            body,
+        })
     }
 
     /// Fill the cache from an origin response.
@@ -2078,7 +2088,19 @@ pub struct StoredBlob {
 pub struct ClientComplete {
     /// Response headers from the cache.
     pub headers: HeaderMap,
-    /// Response body from the cache.
+    /// Origin bucket for the completed object.
+    pub bucket: String,
+    /// Origin key for the completed object.
+    pub key: String,
+    /// `ETag` that the cache stored for the object.
+    pub etag: String,
+}
+
+/// A list parts response from the cache.
+pub struct ClientListParts {
+    /// Response headers from the cache.
+    pub headers: HeaderMap,
+    /// Response body from the cache. The body describes the cache object.
     pub body: Bytes,
 }
 
