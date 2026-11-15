@@ -1968,6 +1968,143 @@ async fn cluster_create_and_delete_bucket_are_not_implemented() {
 }
 
 #[tokio::test]
+async fn delete_object_with_tagging_query_returns_not_implemented() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/media/tag-delete", sidecar.url);
+    assert_eq!(
+        put(&client, &url, b"keep-me", &[]).await.status(),
+        StatusCode::OK
+    );
+
+    let response = signed_request(
+        &client,
+        Method::DELETE,
+        &format!("{url}?tagging"),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(body_text(response).await.contains("NotImplemented"));
+
+    let response = signed_request(&client, Method::GET, &url, None, &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "keep-me");
+}
+
+#[tokio::test]
+async fn put_object_with_tagging_query_returns_not_implemented() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/media/tag-put", sidecar.url);
+    assert_eq!(
+        put(&client, &url, b"original", &[]).await.status(),
+        StatusCode::OK
+    );
+
+    let response = put(&client, &format!("{url}?tagging"), b"<Tagging/>", &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(body_text(response).await.contains("NotImplemented"));
+
+    let response = signed_request(&client, Method::GET, &url, None, &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "original");
+}
+
+#[tokio::test]
+async fn get_object_acl_query_returns_not_implemented() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/media/acl-object", sidecar.url);
+    assert_eq!(
+        put(&client, &url, b"object-body", &[]).await.status(),
+        StatusCode::OK
+    );
+
+    let response = signed_request(&client, Method::GET, &format!("{url}?acl"), None, &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    let text = body_text(response).await;
+    assert!(text.contains("NotImplemented"));
+    assert!(!text.contains("object-body"));
+}
+
+#[tokio::test]
+async fn get_object_version_query_returns_not_implemented() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/media/versioned", sidecar.url);
+    assert_eq!(
+        put(&client, &url, b"current", &[]).await.status(),
+        StatusCode::OK
+    );
+
+    let response = signed_request(
+        &client,
+        Method::GET,
+        &format!("{url}?versionId=1"),
+        None,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(body_text(response).await.contains("NotImplemented"));
+}
+
+#[tokio::test]
 async fn gc_removes_orphan_and_tombstoned_blobs() {
     let (backing, handle) = spawn_backing().await;
     handle.insert("orphan", b"orphan", "2000-01-01T00:00:00Z");
