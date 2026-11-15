@@ -1511,6 +1511,80 @@ async fn write_through_tees_to_cache_without_origin_get() {
 }
 
 #[tokio::test]
+async fn write_through_oversized_put_invalidates_the_cache() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut settings = config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteThrough,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    );
+    settings.cache.max_object_bytes = 16;
+    let sidecar = spawn_sidecar(settings).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/media/oversized", sidecar.url);
+
+    let put = signed_request(&client, Method::PUT, &url, Some(b"small body".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let blob = blob_key("cache", "media", "oversized");
+    wait_for(Duration::from_secs(2), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { cache.has(&blob) && cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
+    let get = signed_request(&client, Method::GET, &url, None)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(body_text(get).await, "small body");
+    let gets_before = origin.get_count();
+
+    // A failed oversized origin PUT must keep the cached body.
+    *origin.put_status.lock().unwrap() = Some(StatusCode::SERVICE_UNAVAILABLE);
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &url,
+        Some(b"a much larger replacement body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert!(!put.status().is_success());
+    let get = signed_request(&client, Method::GET, &url, None)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(body_text(get).await, "small body");
+    assert_eq!(origin.get_count(), gets_before);
+
+    // A successful oversized origin PUT must remove the cached body.
+    *origin.put_status.lock().unwrap() = None;
+    let replacement = b"a much larger replacement body".to_vec();
+    let put = signed_request(&client, Method::PUT, &url, Some(replacement.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_eq!(origin.body("media/oversized").unwrap(), replacement);
+    let get = signed_request(&client, Method::GET, &url, None)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(body_text(get).await, "a much larger replacement body");
+}
+
+#[tokio::test]
 async fn write_through_cache_failure_still_writes_origin() {
     let (origin_url, origin) = spawn_origin().await;
     let (cache_url, cache) = spawn_cache().await;

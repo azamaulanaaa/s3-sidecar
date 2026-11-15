@@ -2091,14 +2091,18 @@ async fn write_through_put(
 ) -> Result<Response, S3Error> {
     let length = prepared.content_length;
     if length.is_some_and(|length| length > cache.max_object_bytes()) {
-        return proxy_request(
+        let response = proxy_request(
             state,
             &Method::PUT,
             credential,
             prepared,
             path_and_query.to_owned(),
         )
-        .await;
+        .await?;
+        if response.status().is_success() {
+            cache.invalidate(bucket, key).await;
+        }
+        return Ok(response);
     }
 
     let content_type = header_string(&prepared.headers, header::CONTENT_TYPE);
