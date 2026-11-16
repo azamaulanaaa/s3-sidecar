@@ -343,7 +343,10 @@ async fn origin_handler(
             let hold = state.put_holds.lock().unwrap().get(&object_key).cloned();
             if let Some(hold) = hold {
                 hold.started.add_permits(1);
-                let _release = hold.release.acquire().await.unwrap();
+                let release = hold.release.acquire().await.unwrap();
+                // Consume the permit. If we drop it, the semaphore returns it
+                // and a later put passes without a new release.
+                std::mem::forget(release);
             }
             let _permit = state.gate.acquire().await.unwrap();
             state.counts.put.fetch_add(1, Ordering::Relaxed);
