@@ -1586,6 +1586,214 @@ async fn two_writes_to_one_key_coalesce() {
 }
 
 #[tokio::test]
+async fn write_mode_sync_removes_blob_and_metadata() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Write,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/write-buffer", sidecar.url),
+        Some(b"buffer body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let blob = blob_key("cache", "media", "write-buffer");
+    assert!(cache.has(&blob));
+    assert!(cache.has(&format!("{blob}.meta")));
+    wait_for(Duration::from_secs(5), || {
+        let origin = origin.clone();
+        async move { origin.body("media/write-buffer").is_some() }
+    })
+    .await;
+    wait_for(Duration::from_secs(5), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { !cache.has(&blob) && !cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
+    assert_eq!(origin.body("media/write-buffer").unwrap(), b"buffer body");
+    assert!(
+        cache
+            .keys()
+            .iter()
+            .all(|key| !key.starts_with("cache/journal/"))
+    );
+}
+
+#[tokio::test]
+async fn newer_pending_write_keeps_the_cache_blob() {
+    let (origin_url, origin) = spawn_origin().await;
+    let hold = origin.hold_put("media/newer-pending");
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(
+        origin_url,
+        cache_url,
+        CacheMode::Write,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    );
+    config.cache.sync_debounce_ms = 10;
+    let sidecar = spawn_sidecar(config).await;
+    let client = reqwest::Client::new();
+    let first = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/newer-pending", sidecar.url),
+        Some(b"first body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    hold.wait_started().await;
+    let second = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/newer-pending", sidecar.url),
+        Some(b"second body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    hold.release();
+    wait_for(Duration::from_secs(5), || {
+        let origin = origin.clone();
+        async move { origin.body("media/newer-pending").as_deref() == Some(b"first body") }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let blob = blob_key("cache", "media", "newer-pending");
+    assert!(cache.has(&blob));
+    assert!(cache.has(&format!("{blob}.meta")));
+    assert_eq!(origin.put_count(), 1);
+    hold.release();
+    wait_for(Duration::from_secs(5), || {
+        let origin = origin.clone();
+        async move { origin.body("media/newer-pending").as_deref() == Some(b"second body") }
+    })
+    .await;
+    wait_for(Duration::from_secs(5), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { !cache.has(&blob) && !cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn write_mode_write_through_removes_blob_and_metadata() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::Write,
+        0,
+        3_600,
+        WritePolicy::WriteThrough,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/write-through", sidecar.url),
+        Some(b"through body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    assert_eq!(origin.body("media/write-through").unwrap(), b"through body");
+    let blob = blob_key("cache", "media", "write-through");
+    wait_for(Duration::from_secs(5), || {
+        let cache = cache.clone();
+        let blob = blob.clone();
+        async move { !cache.has(&blob) && !cache.has(&format!("{blob}.meta")) }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn read_write_mode_keeps_the_synced_cache_entry() {
+    let (origin_url, origin) = spawn_origin().await;
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/read-write", sidecar.url),
+        Some(b"cached body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    wait_for(Duration::from_secs(5), || {
+        let origin = origin.clone();
+        let cache = cache.clone();
+        async move {
+            origin.body("media/read-write").is_some()
+                && cache
+                    .keys()
+                    .iter()
+                    .all(|key| !key.starts_with("cache/journal/"))
+        }
+    })
+    .await;
+    let blob = blob_key("cache", "media", "read-write");
+    assert!(cache.has(&blob));
+    assert!(cache.has(&format!("{blob}.meta")));
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/read-write", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(body_text(get).await, "cached body");
+    assert_eq!(origin.get_count(), 0);
+}
+
+#[tokio::test]
 async fn cache_outage_falls_back_to_origin() {
     let (origin_url, origin) = spawn_origin().await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

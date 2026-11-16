@@ -1008,14 +1008,24 @@ impl Cache {
         }
     }
 
+    /// Finish one sync. In `write` mode the cache removes its write buffer.
     async fn finish_sync(self: &Arc<Self>, entry: &JournalEntry, etag: Option<String>) {
         let path = journal_key(&self.config.cache.prefix, &entry.id);
         if entry.kind == JournalKind::Put {
             let bucket = &entry.bucket;
-            let cache_key = self.cache_key(bucket, &entry.key);
+            let key = (bucket.clone(), entry.key.clone());
+            let current = {
+                let mut pending = lock(&self.pending);
+                remove_pending_if_current(&mut pending, &key, &path)
+            };
             // A delete tombstone wins over a write that finished after the
             // delete. Do not put the metadata back into the cache.
-            if !self.is_tombstoned(bucket, &entry.key) {
+            if self.mode() == CacheMode::Write {
+                // A newer write owns the blob when this journal is not current.
+                if current && !self.is_tombstoned(bucket, &entry.key) {
+                    self.invalidate(bucket, &entry.key).await;
+                }
+            } else if !self.is_tombstoned(bucket, &entry.key) {
                 let mut meta = self
                     .read_meta(bucket, &entry.key)
                     .await
@@ -1023,11 +1033,10 @@ impl Cache {
                     .flatten()
                     .unwrap_or_else(|| metadata_from_journal(entry));
                 meta.mark_synced(etag.unwrap_or_else(|| entry.etag.clone()), unix_now());
+                let cache_key = self.cache_key(bucket, &entry.key);
                 let _ = self.put_meta(self.cache_bucket(), &cache_key, &meta).await;
                 let _ = self.index_upsert(&cache_key, &meta).await;
             }
-            let mut pending = lock(&self.pending);
-            remove_pending_if_current(&mut pending, &(bucket.clone(), entry.key.clone()), &path);
         } else {
             lock(&self.tombstones).remove(&(entry.bucket.clone(), entry.key.clone()));
         }
@@ -1199,6 +1208,8 @@ impl Cache {
 
     /// Mark a write-through blob as synced after origin accepted it.
     ///
+    /// In `write` mode the cache removes the blob after origin accepts it.
+    ///
     /// # Errors
     ///
     /// Returns an error when the metadata or index write fails.
@@ -1213,6 +1224,22 @@ impl Cache {
         content_encoding: Option<String>,
         headers: BTreeMap<String, String>,
     ) -> Result<(), CacheError> {
+        let key = (origin_bucket.to_owned(), origin_key.to_owned());
+        let previous = {
+            let mut pending = lock(&self.pending);
+            pending.remove(&key)
+        };
+        if let Some(previous) = previous {
+            let _ = self
+                .delete_object(self.cache_bucket(), &previous.journal_key)
+                .await;
+        }
+        lock(&self.tombstones).remove(&key);
+        if self.mode() == CacheMode::Write {
+            // The cache is a write buffer. Origin has the object now.
+            self.invalidate(origin_bucket, origin_key).await;
+            return Ok(());
+        }
         let etag = etag.unwrap_or_else(|| format!("\"{}\"", blob.md5));
         let mut meta = CacheMetadata::synced(
             origin_bucket,
@@ -1228,17 +1255,6 @@ impl Cache {
         meta.checksum.clone_from(&blob.checksum);
         self.put_meta(self.cache_bucket(), &blob.cache_key, &meta)
             .await?;
-        let key = (origin_bucket.to_owned(), origin_key.to_owned());
-        let previous = {
-            let mut pending = lock(&self.pending);
-            pending.remove(&key)
-        };
-        if let Some(previous) = previous {
-            let _ = self
-                .delete_object(self.cache_bucket(), &previous.journal_key)
-                .await;
-        }
-        lock(&self.tombstones).remove(&key);
         self.index_upsert(&blob.cache_key, &meta).await
     }
 

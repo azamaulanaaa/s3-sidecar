@@ -137,6 +137,11 @@ observe old metadata with new bytes. The accepting sidecar hides the window
 after it installs the pending entry. A read before that install can still
 observe the mix. Another sidecar sees the write after the sync completes.
 
+In `write` mode the cache is a write buffer. After origin accepts a write, the
+sidecar removes the cache blob, the metadata object, and the LRU index entry. A
+newer pending write keeps its blob. The `read` and `read_write` modes keep a
+synced entry.
+
 A cached `GET` or `HEAD` evaluates conditional headers against the cached entry.
 The cache does not evaluate `If-Range`. A conditional range request can return
 `206 PartialContent` when the validator does not match.

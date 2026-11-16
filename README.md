@@ -377,6 +377,12 @@ do not process each other's journals.
 `read` mode is a pure read cache. `write` mode is a write buffer.
 `read_write` does both.
 
+In `write` mode the cache is a write buffer. After a write reaches origin, the
+sidecar removes the cache blob, the metadata object, and the LRU index entry. It
+also deletes the journal record. If a newer write to the same bucket and key is
+pending, the sidecar keeps the cache blob for that newer write. The `read` and
+`read_write` modes keep a synced entry in the cache.
+
 ### Server-side encryption with customer keys
 
 Cache mode `write` and `read_write` reject a request that carries SSE-C headers
@@ -452,7 +458,9 @@ The write protocol is:
 3. Return `200` to the client.
 4. A worker signs with the origin service credential and sends the object to
    origin.
-5. The worker marks the entry synced and deletes the journal record.
+5. The worker deletes the journal record. In `write` mode it also removes the
+   cache blob and its metadata. In `read` and `read_write` modes it keeps a
+   synced entry.
 
 Startup scans the journal and resumes. A crash between the blob write and the
 journal write leaves an orphan blob. The garbage collector removes it after
@@ -476,6 +484,10 @@ The cache entry becomes synced only after origin returns success. If origin
 fails, the sidecar deletes the cache object. If the cache write fails, origin
 still receives the object and the client still receives success. The sidecar
 deletes a partial cache object.
+
+In `write` mode the cache is a write buffer. After origin returns success, the
+sidecar removes the cache blob, its metadata object, and its LRU index entry.
+The `read` and `read_write` modes keep the synced entry.
 
 ### Delete
 
