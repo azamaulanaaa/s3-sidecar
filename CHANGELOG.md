@@ -4,22 +4,11 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog. This project uses Semantic Versioning.
 
-## [Unreleased]
+## [0.3.0-rc.2] - 2026-11-15
 
-### Added
-
-- Cache mode `ListObjects` V1 and V2 merge pending write-back keys into the
-  origin listing and hide keys with a staged delete or a tombstone. The merge
-  reads origin one page at a time and resumes with a stateless sidecar token.
-  `Prefix`, `Delimiter`, `Marker`, `MaxKeys`, `ContinuationToken`, and
-  `StartAfter` apply to the merged view.
-- Cache mode merged listings support `encoding-type=url`. Any other
-  `encoding-type` value returns `400 InvalidArgument`.
-
-### Fixed
-
-- A pending or fresh cached `GET` or `HEAD` returns `503 ServiceUnavailable`
-  when the cache entry has no readable body.
+This candidate adds the cache `ListObjects` merge and the cached-read `503`
+behavior to the 0.3.0 candidate. The final 0.3.0 release follows after the
+candidate passes.
 
 ## [0.3.0-rc.1] - 2026-11-15
 
@@ -41,8 +30,15 @@ after the candidate passes.
   committed metadata. `CreateBucket` and `DeleteBucket` return
   `501 NotImplemented` because the bucket set comes from configuration.
 - Cache mode passes bucket operations to origin. This covers `CreateBucket`,
-  `DeleteBucket`, `HeadBucket`, `ListObjects` V1, `ListObjects` V2, and bucket
-  sub-resources.
+  `DeleteBucket`, `HeadBucket`, and bucket sub-resources. `ListObjects` V1 and
+  V2 merge local write-back state with the origin listing.
+- Cache mode `ListObjects` V1 and V2 merge pending write-back keys into the
+  origin listing and hide keys with a staged delete or a tombstone. The merge
+  reads origin one page at a time and resumes with a stateless sidecar token.
+  `Prefix`, `Delimiter`, `Marker`, `MaxKeys`, `ContinuationToken`, and
+  `StartAfter` apply to the merged view.
+- Cache mode merged listings support `encoding-type=url`. Any other
+  `encoding-type` value returns `400 InvalidArgument`.
 
 ### Changed
 
@@ -83,6 +79,8 @@ after the candidate passes.
   and `versionId`. The sidecar does not delete or overwrite the object.
 - The container image workflow now starts from the release workflow through the
   cargo-dist custom job. It also retries a denied first push three times.
+- A pending or fresh cached `GET` or `HEAD` returns `503 ServiceUnavailable`
+  when the cache entry has no readable body.
 
 ### Security
 
@@ -110,8 +108,11 @@ No security fixes in this release.
 - Multipart checksum headers are dropped.
 - A TLS listener serves one certificate. Client certificate authentication and
   automatic certificate reload are not implemented.
-- Cache-mode `ListObjects` reads origin. A key with a pending write-back is not
-  listed until the sync completes.
+- A merged V2 listing uses a sidecar-owned continuation token. The token
+  resumes the merge across a restart. A V2 token that is not a sidecar token
+  goes to origin for that page and can omit local pending writes on that page.
+- The merged list view shows the local pending writes and tombstones only.
+  Another sidecar sees the write after the sync completes.
 - An in-flight write-back multipart upload lives in memory. A restart loses it.
   An abandoned upload has no expiry until a restart.
 - `ListMultipartUploads` reads origin. It does not list a cache upload.
