@@ -257,9 +257,22 @@ pub struct ConfigFlags {
     /// Read the cluster blob transport token from stdin.
     #[arg(long = "cluster-secret-stdin")]
     pub cluster_secret_stdin: bool,
-    /// Store a peer blob locally while serving it.
-    #[arg(long = "cluster-read-repair")]
-    pub cluster_read_repair: bool,
+    /// Store a peer blob locally while serving it. The value is optional and
+    /// defaults to true when the flag has no value.
+    #[arg(
+        long = "cluster-read-repair",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        conflicts_with = "no_cluster_read_repair"
+    )]
+    pub cluster_read_repair: Option<bool>,
+    /// Do not store a peer blob locally while serving it.
+    #[arg(
+        long = "no-cluster-read-repair",
+        conflicts_with = "cluster_read_repair"
+    )]
+    pub no_cluster_read_repair: bool,
     /// Number of concurrent replication workers.
     #[arg(long = "cluster-replicate-workers", value_name = "COUNT")]
     pub cluster_replicate_workers: Option<usize>,
@@ -275,15 +288,45 @@ pub struct ConfigFlags {
     /// Export metrics over OTLP.
     #[arg(long = "otel-enabled")]
     pub otel_enabled: bool,
-    /// Export metrics over OTLP when OpenTelemetry is enabled.
-    #[arg(long = "otel-metrics")]
-    pub otel_metrics: bool,
-    /// Export traces over OTLP.
-    #[arg(long = "otel-traces")]
-    pub otel_traces: bool,
-    /// Export logs over OTLP.
-    #[arg(long = "otel-logs")]
-    pub otel_logs: bool,
+    /// Export metrics over OTLP when OpenTelemetry is enabled. The value is
+    /// optional and defaults to true when the flag has no value.
+    #[arg(
+        long = "otel-metrics",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        conflicts_with = "no_otel_metrics"
+    )]
+    pub otel_metrics: Option<bool>,
+    /// Do not export metrics over OTLP.
+    #[arg(long = "no-otel-metrics", conflicts_with = "otel_metrics")]
+    pub no_otel_metrics: bool,
+    /// Export traces over OTLP. The value is optional and defaults to true
+    /// when the flag has no value.
+    #[arg(
+        long = "otel-traces",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        conflicts_with = "no_otel_traces"
+    )]
+    pub otel_traces: Option<bool>,
+    /// Do not export traces over OTLP.
+    #[arg(long = "no-otel-traces", conflicts_with = "otel_traces")]
+    pub no_otel_traces: bool,
+    /// Export logs over OTLP. The value is optional and defaults to true when
+    /// the flag has no value.
+    #[arg(
+        long = "otel-logs",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        conflicts_with = "no_otel_logs"
+    )]
+    pub otel_logs: Option<bool>,
+    /// Do not export logs over OTLP.
+    #[arg(long = "no-otel-logs", conflicts_with = "otel_logs")]
+    pub no_otel_logs: bool,
     /// Fraction of root traces to sample, from 0.0 to 1.0.
     #[arg(long = "otel-trace-sample-ratio", value_name = "RATIO")]
     pub otel_trace_sample_ratio: Option<f64>,
@@ -299,9 +342,22 @@ pub struct ConfigFlags {
     /// Delay between log exports.
     #[arg(long = "otel-log-schedule-delay", value_name = "DURATION")]
     pub otel_log_schedule_delay: Option<String>,
-    /// Add the `s3.object.key` attribute to spans.
-    #[arg(long = "otel-record-object-keys")]
-    pub otel_record_object_keys: bool,
+    /// Add the `s3.object.key` attribute to spans. The value is optional and
+    /// defaults to true when the flag has no value.
+    #[arg(
+        long = "otel-record-object-keys",
+        value_name = "BOOL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        conflicts_with = "no_otel_record_object_keys"
+    )]
+    pub otel_record_object_keys: Option<bool>,
+    /// Do not add the `s3.object.key` attribute to spans.
+    #[arg(
+        long = "no-otel-record-object-keys",
+        conflicts_with = "otel_record_object_keys"
+    )]
+    pub no_otel_record_object_keys: bool,
     /// Service name for exported telemetry.
     #[arg(long = "otel-service-name", value_name = "NAME")]
     pub otel_service_name: Option<String>,
@@ -747,8 +803,11 @@ impl ConfigFlags {
                 Value::String(secret.expose_secret().to_owned()),
             );
         }
-        if self.cluster_read_repair {
-            set(&mut object, &["cluster", "read_repair"], Value::Bool(true));
+        if let Some(value) = self.cluster_read_repair {
+            set(&mut object, &["cluster", "read_repair"], Value::Bool(value));
+        }
+        if self.no_cluster_read_repair {
+            set(&mut object, &["cluster", "read_repair"], Value::Bool(false));
         }
         if let Some(value) = self.cluster_replicate_workers {
             set(&mut object, &["cluster", "replicate_workers"], json!(value));
@@ -775,14 +834,23 @@ impl ConfigFlags {
         if self.otel_enabled {
             set(&mut object, &["otel", "enabled"], Value::Bool(true));
         }
-        if self.otel_metrics {
-            set(&mut object, &["otel", "metrics"], Value::Bool(true));
+        if let Some(value) = self.otel_metrics {
+            set(&mut object, &["otel", "metrics"], Value::Bool(value));
         }
-        if self.otel_traces {
-            set(&mut object, &["otel", "traces"], Value::Bool(true));
+        if self.no_otel_metrics {
+            set(&mut object, &["otel", "metrics"], Value::Bool(false));
         }
-        if self.otel_logs {
-            set(&mut object, &["otel", "logs"], Value::Bool(true));
+        if let Some(value) = self.otel_traces {
+            set(&mut object, &["otel", "traces"], Value::Bool(value));
+        }
+        if self.no_otel_traces {
+            set(&mut object, &["otel", "traces"], Value::Bool(false));
+        }
+        if let Some(value) = self.otel_logs {
+            set(&mut object, &["otel", "logs"], Value::Bool(value));
+        }
+        if self.no_otel_logs {
+            set(&mut object, &["otel", "logs"], Value::Bool(false));
         }
         if let Some(value) = self.otel_trace_sample_ratio {
             set(&mut object, &["otel", "trace_sample_ratio"], json!(value));
@@ -815,11 +883,18 @@ impl ConfigFlags {
                 Value::String(value.clone()),
             );
         }
-        if self.otel_record_object_keys {
+        if let Some(value) = self.otel_record_object_keys {
             set(
                 &mut object,
                 &["otel", "record_object_keys"],
-                Value::Bool(true),
+                Value::Bool(value),
+            );
+        }
+        if self.no_otel_record_object_keys {
+            set(
+                &mut object,
+                &["otel", "record_object_keys"],
+                Value::Bool(false),
             );
         }
         if let Some(value) = &self.otel_service_name {
@@ -1030,6 +1105,22 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{Cli, Command, ConfigFlags, StdinTarget};
+    use crate::config::loader::{LoadOptions, load};
+
+    fn flag_layer(args: &[&str]) -> serde_json::Value {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::Check(check) = cli.command else {
+            panic!("the test must use the check command");
+        };
+        check.config.to_layer(None).unwrap()
+    }
+
+    fn layer_bool(layer: &serde_json::Value, section: &str, key: &str) -> Option<bool> {
+        layer
+            .get(section)
+            .and_then(|value| value.get(key))
+            .and_then(serde_json::Value::as_bool)
+    }
 
     fn multipart_enabled(args: &[&str]) -> Option<bool> {
         let cli = Cli::try_parse_from(args).unwrap();
@@ -1070,6 +1161,98 @@ mod tests {
             Some(false)
         );
         assert_eq!(multipart_enabled(&["s3-sidecar", "check"]), None);
+    }
+
+    #[test]
+    fn boolean_flags_accept_bare_true_and_inverse_false_forms() {
+        for (flag, section, key) in [
+            ("cluster-read-repair", "cluster", "read_repair"),
+            ("otel-metrics", "otel", "metrics"),
+            ("otel-traces", "otel", "traces"),
+            ("otel-logs", "otel", "logs"),
+            ("otel-record-object-keys", "otel", "record_object_keys"),
+        ] {
+            let bare_flag = format!("--{flag}");
+            let bare = flag_layer(&["s3-sidecar", "check", &bare_flag]);
+            assert_eq!(layer_bool(&bare, section, key), Some(true), "{bare_flag}");
+
+            let inverse_flag = format!("--no-{flag}");
+            let inverse = flag_layer(&["s3-sidecar", "check", &inverse_flag]);
+            assert_eq!(
+                layer_bool(&inverse, section, key),
+                Some(false),
+                "{inverse_flag}"
+            );
+
+            let explicit_flag = format!("--{flag}=false");
+            let explicit = flag_layer(&["s3-sidecar", "check", &explicit_flag]);
+            assert_eq!(
+                layer_bool(&explicit, section, key),
+                Some(false),
+                "{explicit_flag}"
+            );
+
+            let absent = flag_layer(&["s3-sidecar", "check"]);
+            assert_eq!(layer_bool(&absent, section, key), None, "no flag");
+        }
+    }
+
+    #[test]
+    fn inverse_flags_override_true_settings_from_the_config_file() {
+        let dir = tempdir().unwrap();
+        let config_path = dir.path().join("sidecar.toml");
+        fs::write(
+            &config_path,
+            r#"
+[cache]
+endpoint = "http://127.0.0.1:9002"
+bucket = "cache"
+max_bytes = 0
+
+[cluster]
+read_repair = true
+
+[otel]
+enabled = true
+metrics = true
+traces = true
+logs = true
+record_object_keys = true
+"#,
+        )
+        .unwrap();
+
+        let config_arg = config_path.to_str().unwrap();
+        let cli = Cli::try_parse_from([
+            "s3-sidecar",
+            "check",
+            "--config",
+            config_arg,
+            "--no-cluster-read-repair",
+            "--no-otel-metrics",
+            "--no-otel-traces",
+            "--no-otel-logs",
+            "--no-otel-record-object-keys",
+        ])
+        .unwrap();
+        let Command::Check(check) = cli.command else {
+            panic!("the test must use the check command");
+        };
+        let flags = check.config.to_layer(None).unwrap();
+        let loaded = load(&LoadOptions {
+            config_flag: Some(config_path),
+            env: Vec::new(),
+            flags,
+            cwd: dir.path().to_path_buf(),
+            default_paths: Vec::new(),
+        })
+        .unwrap();
+
+        assert!(!loaded.config.cluster.read_repair);
+        assert!(!loaded.config.otel.metrics);
+        assert!(!loaded.config.otel.traces);
+        assert!(!loaded.config.otel.logs);
+        assert!(!loaded.config.otel.record_object_keys);
     }
 
     #[test]
