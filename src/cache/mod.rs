@@ -122,6 +122,28 @@ struct SyncJobs {
     running: HashSet<CacheKey>,
 }
 
+impl SyncJobs {
+    /// Queue the newest entry and claim the worker for one key.
+    ///
+    /// Return true when the caller must start a worker.
+    fn enqueue_locked(&mut self, key: CacheKey, entry: JournalEntry) -> bool {
+        self.latest.insert(key.clone(), entry);
+        self.running.insert(key)
+    }
+
+    /// Remove the newest entry for one key.
+    ///
+    /// When no entry is queued, clear the running flag in the same operation.
+    /// The next enqueue then claims the flag and starts a new worker.
+    fn drain_or_clear(&mut self, key: &CacheKey) -> Option<JournalEntry> {
+        let entry = self.latest.remove(key);
+        if entry.is_none() {
+            self.running.remove(key);
+        }
+        entry
+    }
+}
+
 /// A cache lookup result.
 pub enum Lookup {
     /// The cache has a usable entry.
@@ -921,8 +943,7 @@ impl Cache {
 
     fn enqueue(self: &Arc<Self>, key: CacheKey, entry: JournalEntry) {
         let mut jobs = lock(&self.jobs);
-        jobs.latest.insert(key.clone(), entry);
-        if !jobs.running.insert(key.clone()) {
+        if !jobs.enqueue_locked(key.clone(), entry) {
             return;
         }
         drop(jobs);
@@ -937,10 +958,9 @@ impl Cache {
         loop {
             let entry = {
                 let mut jobs = lock(&self.jobs);
-                jobs.latest.remove(&key)
+                jobs.drain_or_clear(&key)
             };
             let Some(entry) = entry else {
-                lock(&self.jobs).running.remove(&key);
                 return;
             };
             let mut entry = entry;
@@ -2531,5 +2551,33 @@ mod tests {
         assert!(pending.contains_key(&key));
         assert!(remove_pending_if_current(&mut pending, &key, "new"));
         assert!(!pending.contains_key(&key));
+    }
+
+    #[test]
+    fn empty_drain_releases_the_worker_slot() {
+        let key = ("media".to_owned(), "drain-race".to_owned());
+        let mut jobs = SyncJobs {
+            latest: HashMap::new(),
+            running: HashSet::new(),
+        };
+
+        // One worker owns the key and finds no queued entry.
+        assert!(jobs.running.insert(key.clone()));
+        assert!(jobs.drain_or_clear(&key).is_none());
+        assert!(!jobs.running.contains(&key));
+
+        // A writer queues a new entry after the drain. The worker slot is free,
+        // so the writer must start a worker. If no worker starts, the entry
+        // waits for a journal recovery on restart.
+        let entry = JournalEntry::delete(
+            "id".to_owned(),
+            "media",
+            "drain-race",
+            "cache-key".to_owned(),
+            1,
+        );
+        assert!(jobs.enqueue_locked(key.clone(), entry));
+        assert!(jobs.latest.contains_key(&key));
+        assert!(jobs.running.contains(&key));
     }
 }
