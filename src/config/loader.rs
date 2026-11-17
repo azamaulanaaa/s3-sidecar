@@ -109,7 +109,7 @@ pub fn load(options: &LoadOptions) -> Result<LoadedConfig, ConfigError> {
     let config: Config = serde_json::from_value(merged)
         .map_err(|error| ConfigError::Deserialize(error.to_string()))?;
     let mut config = config;
-    load_otel_headers(&mut config)?;
+    load_otel_headers(&mut config, &sources)?;
     let warnings = validate(&config)?;
 
     Ok(LoadedConfig {
@@ -120,10 +120,18 @@ pub fn load(options: &LoadOptions) -> Result<LoadedConfig, ConfigError> {
     })
 }
 
-fn load_otel_headers(config: &mut Config) -> Result<(), ConfigError> {
+/// Merge headers from the headers file into the configuration.
+///
+/// A file header replaces an inline header only when the file has higher
+/// precedence. Inline headers at the same or higher precedence stay unchanged.
+fn load_otel_headers(config: &mut Config, sources: &SourceMap) -> Result<(), ConfigError> {
     let Some(path) = config.otel.headers_file.clone() else {
         return Ok(());
     };
+    let file_source = sources
+        .get("otel.headers_file")
+        .copied()
+        .unwrap_or_default();
     let text = fs::read_to_string(&path).map_err(|source| ConfigError::ReadHeaders {
         path: path.clone(),
         source,
@@ -147,11 +155,14 @@ fn load_otel_headers(config: &mut Config) -> Result<(), ConfigError> {
                 path.display()
             )));
         };
-        config
-            .otel
-            .headers
-            .entry(name)
-            .or_insert_with(|| SecretString::new(value));
+        let inline_source = sources.get(&format!("otel.headers.{name}")).copied();
+        let file_wins = match inline_source {
+            Some(inline_source) => file_source > inline_source,
+            None => true,
+        };
+        if file_wins {
+            config.otel.headers.insert(name, SecretString::new(value));
+        }
     }
     Ok(())
 }
@@ -952,7 +963,7 @@ buckets = ["media"]
     }
 
     #[test]
-    fn inline_otel_headers_win_over_the_headers_file() {
+    fn inline_headers_at_equal_precedence_win_over_the_headers_file() {
         let dir = tempdir().unwrap();
         let headers_path = dir.path().join("otel-headers.json");
         std::fs::write(&headers_path, r#"{"x-api-key":"from-file"}"#).unwrap();
@@ -975,6 +986,75 @@ buckets = ["media"]
                 .get("x-api-key")
                 .map(SecretString::expose_secret),
             Some("from-env")
+        );
+    }
+
+    #[test]
+    fn headers_file_at_higher_precedence_overrides_inline_headers() {
+        let dir = tempdir().unwrap();
+        let headers_path = dir.path().join("otel-headers.json");
+        std::fs::write(&headers_path, r#"{"x-api-key":"from-file"}"#).unwrap();
+        let file = r#"
+[otel.headers]
+"x-api-key" = "from-config"
+"#;
+        let env = vec![(
+            "S3_SIDECAR_OTEL__HEADERS_FILE".to_owned(),
+            headers_path.display().to_string(),
+        )];
+        let loaded = load_with(dir.path(), Some(file), env, json!({})).unwrap();
+        assert_eq!(
+            loaded
+                .config
+                .otel
+                .headers
+                .get("x-api-key")
+                .map(SecretString::expose_secret),
+            Some("from-file")
+        );
+    }
+
+    #[test]
+    fn inline_headers_at_higher_precedence_win_over_the_headers_file() {
+        let dir = tempdir().unwrap();
+        let headers_path = dir.path().join("otel-headers.json");
+        std::fs::write(&headers_path, r#"{"x-api-key":"from-file"}"#).unwrap();
+        let file = format!("[otel]\nheaders_file = \"{}\"\n", headers_path.display());
+        let env = vec![(
+            "S3_SIDECAR_OTEL__HEADERS".to_owned(),
+            r#"{"x-api-key":"from-env"}"#.to_owned(),
+        )];
+        let loaded = load_with(dir.path(), Some(&file), env, json!({})).unwrap();
+        assert_eq!(
+            loaded
+                .config
+                .otel
+                .headers
+                .get("x-api-key")
+                .map(SecretString::expose_secret),
+            Some("from-env")
+        );
+    }
+
+    #[test]
+    fn flag_headers_file_overrides_env_inline_headers() {
+        let dir = tempdir().unwrap();
+        let headers_path = dir.path().join("otel-headers.json");
+        std::fs::write(&headers_path, r#"{"x-api-key":"from-file"}"#).unwrap();
+        let env = vec![(
+            "S3_SIDECAR_OTEL__HEADERS".to_owned(),
+            r#"{"x-api-key":"from-env"}"#.to_owned(),
+        )];
+        let flags = json!({"otel": {"headers_file": headers_path.display().to_string()}});
+        let loaded = load_with(dir.path(), None, env, flags).unwrap();
+        assert_eq!(
+            loaded
+                .config
+                .otel
+                .headers
+                .get("x-api-key")
+                .map(SecretString::expose_secret),
+            Some("from-file")
         );
     }
 }
