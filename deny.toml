@@ -13,6 +13,13 @@ version = 2
 db-urls = ["https://github.com/RustSec/advisory-db"]
 # Fail the check when a crate version is yanked.
 yanked = "deny"
+# These three advisories are transitive and come from openraft through display-more.
+# The affected crates are unmaintained and no safe upgrade exists.
+ignore = [
+  "RUSTSEC-2026-0543", # chrono 0.4.45 is unmaintained and has no safe upgrade.
+  "RUSTSEC-2026-0555", # chrono-tz 0.8.6 is unmaintained and has no safe upgrade.
+  "RUSTSEC-2026-0559", # chrono-tz-build 0.2.1 is unmaintained and has no safe upgrade.
+]
 
 [licenses]
 version = 2
