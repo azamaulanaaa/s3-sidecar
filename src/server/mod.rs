@@ -711,7 +711,11 @@ async fn limited_forward(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, S3Error> {
-    if let Ok(Some(length)) = content_length(&headers)
+    // An aws-chunked body includes chunk framing in its encoded Content-Length.
+    // The decoded object can be much smaller. The prepare_request function checks
+    // the decoded length for streaming payloads, so skip this encoded check here.
+    if !is_aws_chunked(&headers)
+        && let Ok(Some(length)) = content_length(&headers)
         && length > state.config.server.max_body_bytes
     {
         return Err(S3Error::entity_too_large());
@@ -756,6 +760,17 @@ fn is_streaming_request(method: &Method, headers: &HeaderMap, uri: &Uri, has_bod
         .is_some_and(|length| length > 0)
         || headers.contains_key(header::TRANSFER_ENCODING)
         || has_body
+}
+
+// Check whether the request body uses aws-chunked framing. The encoded
+// Content-Length then includes the chunk framing and not only the object.
+fn is_aws_chunked(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
 }
 
 fn idle_stream<S, E>(stream: S, idle: Duration) -> BodyStream

@@ -348,6 +348,49 @@ async fn content_length_over_the_limit_returns_413() {
 }
 
 #[tokio::test]
+async fn aws_chunked_body_with_a_decoded_length_under_the_limit_succeeds() {
+    let (origin, _) = spawn_origin(Duration::ZERO, 0, false).await;
+    let mut config = config(origin);
+    let max_body_bytes = 16;
+    config.server.max_body_bytes = max_body_bytes;
+    let (server, base) = spawn(config).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/media/aws-chunked-within-limit");
+    let parsed = Url::parse(&url).unwrap();
+    let credential = credential();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_ENCODING,
+        HeaderValue::from_static("aws-chunked"),
+    );
+    headers.insert(
+        "x-amz-decoded-content-length",
+        HeaderValue::from_static("11"),
+    );
+    sign_request(
+        &Method::PUT,
+        &parsed,
+        &mut headers,
+        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        &credential,
+        "us-east-1",
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    // The encoded body is 26 bytes and exceeds the limit. The decoded object
+    // is 11 bytes and stays under the limit.
+    let body = "6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n";
+    assert!(body.len() as u64 > max_body_bytes);
+    let mut builder = client.request(Method::PUT, url).body(body.to_owned());
+    for (name, value) in &headers {
+        builder = builder.header(name, value);
+    }
+    let response = builder.send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    stop(server).await;
+}
+
+#[tokio::test]
 async fn a_chunked_body_over_the_limit_returns_413() {
     let (origin, _) = spawn_origin(Duration::ZERO, 0, false).await;
     let mut config = config(origin);
