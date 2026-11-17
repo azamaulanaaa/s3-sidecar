@@ -91,6 +91,14 @@ impl BackingHandle {
     fn put_count(&self) -> u64 {
         self.counts.puts.load(Ordering::Relaxed)
     }
+
+    fn stored_body(&self, key: &str) -> Option<Bytes> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|stored| stored.body.clone())
+    }
 }
 
 async fn spawn_backing() -> (String, BackingHandle) {
@@ -642,6 +650,45 @@ async fn put(
         .send()
         .await
         .unwrap()
+}
+
+// Build a signed PUT whose stream body has no content length. reqwest sends
+// the body with chunked transfer encoding.
+fn signed_chunked_put(
+    client: &reqwest::Client,
+    url: &str,
+    body: &[u8],
+    extra: &[(&str, &str)],
+) -> reqwest::RequestBuilder {
+    let parsed = Url::parse(url).unwrap();
+    let credential = credential();
+    let mut headers = HeaderMap::new();
+    for (name, value) in extra {
+        headers.insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    sign_request(
+        &Method::PUT,
+        &parsed,
+        &mut headers,
+        "UNSIGNED-PAYLOAD",
+        &credential,
+        "us-east-1",
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let chunks: Vec<Result<Bytes, std::io::Error>> = body
+        .chunks(4)
+        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+        .collect();
+    let stream = futures_util::stream::iter(chunks);
+    let mut builder = client.request(Method::PUT, url);
+    for (name, value) in &headers {
+        builder = builder.header(name, value);
+    }
+    builder.body(reqwest::Body::wrap_stream(stream))
 }
 
 #[tokio::test]
@@ -2142,4 +2189,48 @@ async fn gc_removes_orphan_and_tombstoned_blobs() {
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn lengthless_put_keeps_the_full_body_in_the_staged_blob() {
+    let (backing, handle) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let body = b"a length-less request body with several chunks".to_vec();
+    let response = signed_chunked_put(
+        &client,
+        &format!("{}/media/chunked", sidecar.url),
+        &body,
+        &[],
+    )
+    .send()
+    .await
+    .unwrap();
+    let status = response.status();
+    let text = body_text(response).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    let metadata = sidecar
+        .state
+        .cluster()
+        .unwrap()
+        .state()
+        .get_metadata("media", "chunked")
+        .unwrap()
+        .unwrap();
+    let stored = handle
+        .stored_body(&format!("objects/{}", metadata.blob))
+        .unwrap();
+    assert_eq!(&stored[..], &body[..]);
+    assert_eq!(usize::try_from(metadata.size).unwrap(), body.len());
+    assert_eq!(metadata.etag, md5_hex(&body));
 }

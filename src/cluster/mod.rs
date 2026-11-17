@@ -1391,7 +1391,6 @@ impl Cluster {
             let stream: BodyStream = Box::pin(futures_util::stream::empty());
             stream
         });
-        let length = input.content_length.unwrap_or(0);
         let response = crate::multipart::put_object(
             &self.client,
             &self.credential,
@@ -1399,7 +1398,7 @@ impl Cluster {
             &format!("objects/{blob}"),
             HeaderMap::new(),
             body,
-            Some(length),
+            input.content_length,
             &self.config.multipart,
             &self.metrics,
         )
