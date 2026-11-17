@@ -9,9 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::body::Body;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::Response;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
 use tracing::{Instrument, info_span, warn};
 
 use super::blob::CLUSTER_TOKEN_HEADER;
@@ -588,10 +587,11 @@ impl Cluster {
             if let Some(range) = headers.get(header::RANGE) {
                 request_headers.insert(header::RANGE, range.clone());
             }
+            let repair = self.config.cluster.read_repair && headers.get(header::RANGE).is_none();
             let response = self
                 .http
-                .get(url)
-                .headers(crate::telemetry::injected_headers(request_headers))
+                .get(url.clone())
+                .headers(crate::telemetry::injected_headers(request_headers.clone()))
                 .send()
                 .await
                 .map_err(|error| {
@@ -604,19 +604,15 @@ impl Cluster {
             self.metrics.peer_fetch();
             let status = response.status();
             let response_headers = response.headers().clone();
-            let repair = self.config.cluster.read_repair
-                && headers.get(header::RANGE).is_none()
-                && status == StatusCode::OK;
-            let body = if repair {
+            if repair && status == StatusCode::OK {
                 self.metrics.read_repaired();
-                self.repair_body(response, metadata)
-            } else {
-                Body::from_stream(
-                    response
-                        .bytes_stream()
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
-                )
-            };
+                self.spawn_read_repair(url, request_headers, metadata);
+            }
+            let body = Body::from_stream(
+                response
+                    .bytes_stream()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+            );
             let mut output = Response::new(body);
             *output.status_mut() = status;
             for (name, value) in &response_headers {
@@ -633,8 +629,12 @@ impl Cluster {
         Ok(None)
     }
 
-    fn repair_body(&self, response: reqwest::Response, metadata: &Metadata) -> Body {
-        let (sender, mut receiver) = mpsc::channel::<Result<bytes::Bytes, io::Error>>(2);
+    /// Start a read repair that fetches the blob again and writes it later.
+    ///
+    /// The client streams the first peer response. A second fetch feeds the
+    /// repair write, so the client never waits for that write.
+    fn spawn_read_repair(&self, url: String, headers: HeaderMap, metadata: &Metadata) {
+        let http = self.http.clone();
         let client = self.client.clone();
         let credential = std::sync::Arc::clone(&self.credential);
         let config = std::sync::Arc::clone(&self.config);
@@ -643,18 +643,31 @@ impl Cluster {
         let blob = metadata.blob.clone();
         let length = metadata.size;
         tokio::spawn(async move {
-            let stream = async_stream::try_stream! {
-                while let Some(item) = receiver.recv().await {
-                    yield item?;
+            let response = match http
+                .get(url)
+                .headers(crate::telemetry::injected_headers(headers))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => response,
+                Ok(_) => return,
+                Err(error) => {
+                    warn!(%error, "read repair fetch failed");
+                    return;
                 }
             };
+            let stream: crate::auth::body::BodyStream = Box::pin(
+                response
+                    .bytes_stream()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+            );
             if let Err(error) = crate::multipart::put_object(
                 &client,
                 &credential,
                 &bucket,
                 &format!("objects/{blob}"),
                 HeaderMap::new(),
-                Box::pin(stream),
+                stream,
                 Some(length),
                 &config.multipart,
                 &metrics,
@@ -664,22 +677,6 @@ impl Cluster {
                 warn!(%error, "read repair write failed");
             }
         });
-        let stream: crate::auth::body::BodyStream = Box::pin(async_stream::try_stream! {
-            let mut body = response.bytes_stream();
-            let mut sender = Some(sender);
-            while let Some(chunk) = body.next().await {
-                let bytes = chunk.map_err(|error| {
-                    io::Error::new(io::ErrorKind::InvalidData, error)
-                })?;
-                if let Some(channel) = sender.as_ref()
-                    && channel.send(Ok(bytes.clone())).await.is_err()
-                {
-                    sender = None;
-                }
-                yield bytes;
-            }
-        });
-        Body::from_stream(stream)
     }
 
     /// Run one bounded replica reconciliation pass.

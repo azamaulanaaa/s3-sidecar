@@ -4,6 +4,7 @@
 //! internal blob transport.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,9 +36,14 @@ const CLUSTER_TOKEN: &str = "cluster-token";
 #[derive(Clone, Default)]
 struct Backing {
     objects: Arc<Mutex<HashMap<String, Bytes>>>,
+    put_stall_ms: Arc<AtomicU64>,
 }
 
 impl Backing {
+    fn stall_puts(&self, millis: u64) {
+        self.put_stall_ms.store(millis, Ordering::Relaxed);
+    }
+
     fn has(&self, uuid: &str) -> bool {
         self.objects
             .lock()
@@ -71,8 +77,17 @@ async fn backing_handler(
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
+    if method == Method::PUT {
+        let stall = state.put_stall_ms.load(Ordering::Relaxed);
+        if stall > 0 {
+            tokio::time::sleep(Duration::from_millis(stall)).await;
+        }
+    }
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_default();
     if method == Method::GET && uri.path() == "/data" {
         return xml(
             StatusCode::OK,
@@ -751,6 +766,43 @@ async fn read_repair_does_not_store_when_disabled() {
     assert_eq!(response.text().await.unwrap(), "no-repair");
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!cluster.node(missing).backing.has(&blob));
+}
+
+#[tokio::test]
+async fn read_repair_does_not_delay_the_client_response() {
+    let cluster = spawn_cluster(ReadMode::LocalThenPeer, 2, true).await;
+    let client = client_request();
+    let url = format!("{}/media/repair-slow", cluster.node("a").url);
+    let body = vec![7_u8; 8 * 1024 * 1024];
+    assert_eq!(put(&client, &url, &body).await.status(), StatusCode::OK);
+    wait_metadata(&cluster, "repair-slow", Duration::from_secs(10)).await;
+    let metadata = metadata(&cluster, "a", "repair-slow");
+    let missing = ["a", "b", "c"]
+        .into_iter()
+        .find(|node| !metadata.replicas.iter().any(|value| value == node))
+        .unwrap();
+    let blob = metadata.blob.clone();
+    assert!(!cluster.node(missing).backing.has(&blob));
+
+    let backing = cluster.node(missing).backing.clone();
+    backing.stall_puts(3_000);
+    let started = Instant::now();
+    let response = get(
+        &client,
+        &format!("{}/media/repair-slow", cluster.node(missing).url),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let received = response.bytes().await.unwrap();
+    assert_eq!(received.as_ref(), body.as_slice());
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "client waited {elapsed:?} for the repair write"
+    );
+
+    backing.stall_puts(0);
+    wait_present(&backing, &blob, Duration::from_secs(10)).await;
 }
 
 #[tokio::test]
