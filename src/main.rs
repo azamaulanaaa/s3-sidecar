@@ -1,4 +1,7 @@
-#![allow(clippy::multiple_crate_versions)]
+#![expect(
+    clippy::multiple_crate_versions,
+    reason = "the TLS and HTTP dependency tree has duplicate transitive versions"
+)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;

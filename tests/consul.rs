@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+#![expect(
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    reason = "test code uses unwrap and long cases"
+)]
 
 //! Consul backend integration tests with an in-memory Consul API.
 
@@ -183,7 +187,10 @@ async fn spawn_backing() -> (String, Backing) {
     (format!("http://{address}"), backing)
 }
 
-#[allow(clippy::format_push_string)]
+#[expect(
+    clippy::format_push_string,
+    reason = "the test builds the expected body with push_str"
+)]
 async fn backing_handler(
     State(state): State<Backing>,
     method: Method,

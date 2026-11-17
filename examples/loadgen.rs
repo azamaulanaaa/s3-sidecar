@@ -235,7 +235,10 @@ fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the report converts the request count to f64 for throughput"
+)]
 fn report(args: &Args, latencies: &mut [u64], errors: usize, elapsed: Duration) {
     latencies.sort_unstable();
     let completed = latencies.len();
@@ -270,7 +273,10 @@ fn percentile(sorted: &[u64], percent: usize) -> u64 {
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the converter divides microseconds by 1000.0"
+)]
 fn micros_to_ms(micros: u64) -> f64 {
     micros as f64 / 1000.0
 }

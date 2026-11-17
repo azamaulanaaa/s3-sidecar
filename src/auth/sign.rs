@@ -16,7 +16,10 @@ use crate::errors::S3Error;
 ///
 /// Returns an internal error when a header value cannot be built.
 // The signer needs the request, the credential, and the signing context.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the signer needs the request, the credential, and the signing context"
+)]
 pub fn sign_request(
     method: &Method,
     url: &Url,

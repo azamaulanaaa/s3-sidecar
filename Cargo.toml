@@ -59,6 +59,10 @@ zeroize = { version = "1", features = ["derive"] }
 opentelemetry_sdk = { version = "0.33.1", features = ["testing"] }
 tempfile = "3"
 
+[lints.rust]
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }

@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
 //! Cluster-mode integration tests with an in-process fake backing S3.
 
@@ -124,7 +124,11 @@ async fn spawn_backing() -> (String, BackingHandle) {
     )
 }
 
-#[allow(clippy::too_many_lines, clippy::format_push_string)]
+#[expect(
+    clippy::too_many_lines,
+    clippy::format_push_string,
+    reason = "the test covers the full flow and builds the body with push_str"
+)]
 async fn backing_handler(
     State(state): State<BackingState>,
     method: Method,
@@ -770,7 +774,10 @@ async fn put_get_head_delete_and_list() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the function handles each case in order"
+)]
 async fn copy_object_preserves_and_replaces_metadata() {
     let (backing, handle) = spawn_backing().await;
     let dir = tempfile::tempdir().unwrap();
@@ -1603,7 +1610,10 @@ async fn metadata_survives_restart() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the function handles each case in order"
+)]
 async fn multipart_create_upload_complete_and_abort() {
     let (backing, _) = spawn_backing().await;
     let dir = tempfile::tempdir().unwrap();
@@ -1921,7 +1931,6 @@ async fn list_buckets_and_head_bucket_use_cluster_metadata() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn list_objects_v1_supports_marker_and_delimiter() {
     let (backing, _) = spawn_backing().await;
     let dir = tempfile::tempdir().unwrap();

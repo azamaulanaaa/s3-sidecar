@@ -7,6 +7,7 @@ pub mod network;
 pub mod store;
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -89,6 +90,23 @@ pub struct RaftNode {
     timeout: Duration,
     metrics: Arc<Metrics>,
     election_state: Mutex<ElectionState>,
+}
+
+impl fmt::Debug for RaftNode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RaftNode")
+            .field("raft", &self.raft)
+            .field("store", &self.store)
+            .field("node_id", &self.node_id)
+            .field("nodes", &self.nodes)
+            .field("secret", &"[REDACTED]")
+            .field("http", &self.http)
+            .field("timeout", &self.timeout)
+            .field("metrics", &self.metrics)
+            .field("election_state", &self.election_state)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -349,7 +367,6 @@ impl RaftNode {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 

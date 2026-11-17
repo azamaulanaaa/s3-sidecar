@@ -5,7 +5,10 @@
 //! `cargo-deny` policy in `deny.toml` checks duplicates and documents each
 //! exception.
 
-#![allow(clippy::multiple_crate_versions)]
+#![expect(
+    clippy::multiple_crate_versions,
+    reason = "the TLS and HTTP dependency tree has duplicate transitive versions"
+)]
 //!
 //! This build implements the proxy core: layered configuration, `SigV4`
 //! authentication, and byte-preserving pass-through to one origin endpoint.

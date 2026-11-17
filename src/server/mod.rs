@@ -46,6 +46,7 @@ pub const REQUEST_ID_HEADER: &str = "x-s3-sidecar-request-id";
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Shared server state.
+#[derive(Debug)]
 pub struct AppState {
     config: Arc<Config>,
     credentials: CredentialStore,
@@ -290,7 +291,7 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 /// A handle that triggers graceful shutdown.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ShutdownHandle {
     sender: watch::Sender<bool>,
 }
@@ -335,6 +336,7 @@ impl ShutdownHandle {
 }
 
 /// A running server with a programmatic shutdown handle.
+#[derive(Debug)]
 pub struct Server {
     local_addr: SocketAddr,
     shutdown: ShutdownHandle,
@@ -799,7 +801,10 @@ where
     Box::pin(stream)
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the proxy streams the body and handles each timeout case"
+)]
 async fn forward(
     state: &AppState,
     method: &Method,
@@ -996,7 +1001,11 @@ async fn forward(
 /// write-through upload completes at origin and fills the cache. A create
 /// failure can fall back to origin when `on_cache_error` permits it.
 // The router needs the request context and the prepared request.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the router needs the request context and the prepared request"
+)]
 async fn multipart_request(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -1443,7 +1452,10 @@ async fn proxy_request(
 ///
 /// Invalidation runs only after origin accepts the request. A cache failure
 /// is logged and does not change the origin response.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "batch delete needs the request context and the cache policy"
+)]
 async fn batch_delete(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -1520,7 +1532,11 @@ async fn invalidate_deleted_key(cache: &Arc<Cache>, bucket: &str, key: &str) {
 }
 
 // The read path needs the request context and the cache policy.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the read path needs the request context and the cache policy"
+)]
 async fn read_path(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -1695,7 +1711,11 @@ async fn read_path(
 }
 
 // The read path passes request headers, credentials, and cache metadata.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the read path passes headers, credentials, and cache metadata"
+)]
 async fn origin_read(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -1820,7 +1840,10 @@ async fn origin_read(
     forward_response(method, response, state.idle_timeout()).await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the cached response needs the range and metadata"
+)]
 async fn serve_cached(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -2076,7 +2099,11 @@ fn response_from_stream(
 }
 
 // The write path needs the request context and the cache policy.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the write path needs the request context and the cache policy"
+)]
 async fn write_put(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -2216,7 +2243,10 @@ async fn write_put(
 }
 
 // The write-through path tees one client body to origin and cache.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the write-through path tees one body to origin and cache"
+)]
 async fn write_through_put(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -2339,7 +2369,10 @@ fn tee_body(body: BodyStream, sender: mpsc::Sender<Result<Bytes, io::Error>>) ->
 }
 
 // The delete path needs the request context and the cache policy.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the delete path needs the request context and the cache policy"
+)]
 async fn write_delete(
     state: &AppState,
     cache: &Arc<Cache>,
@@ -2470,7 +2503,10 @@ fn check_bucket(auth: &AuthContext, uri: &Uri, headers: &HeaderMap) -> Result<()
     Ok(())
 }
 
-#[allow(clippy::format_push_string)]
+#[expect(
+    clippy::format_push_string,
+    reason = "the bucket list body is built with push_str"
+)]
 fn list_buckets_response(credential: &ClientCredential) -> Response {
     let owner = credential.access_key_id();
     let creation_date = now().format(&Rfc3339).unwrap_or_default();
@@ -3109,7 +3145,7 @@ pub fn log_config(config: &Config, path: Option<&std::path::Path>) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use super::*;
 

@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code uses unwrap and expect for fixtures"
+)]
 
 //! End-to-end checks against a real S3 origin and a running sidecar.
 //!
@@ -95,7 +99,10 @@ fn request(
 #[tokio::test]
 #[ignore = "requires a running sidecar and rustfs or MinIO"]
 // The test walks the S3 operations in order.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the function handles each case in order"
+)]
 async fn object_list_copy_multipart_and_auth() {
     let settings = settings();
     let client = reqwest::Client::new();

@@ -15,6 +15,7 @@ const MAX_LINE_SIZE: usize = 8 * 1024;
 const MAX_TRAILERS: usize = 32;
 
 /// Chunk signature mode.
+#[derive(Debug)]
 pub enum ChunkMode {
     /// Verify each chunk signature.
     Signed(StreamingContext),
@@ -267,7 +268,6 @@ fn find_crlf(buffer: &BytesMut) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use axum::body::Body;
     use futures_util::StreamExt;

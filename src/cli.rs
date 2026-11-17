@@ -49,7 +49,10 @@ pub struct CheckArgs {
 
 /// Configuration flags. The names follow the TOML paths in kebab-case.
 // Each boolean flag is one independent command-line switch.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each boolean flag is one command-line switch"
+)]
 #[derive(Debug, Args, Default)]
 pub struct ConfigFlags {
     /// Path to the TOML configuration file.
@@ -437,7 +440,10 @@ impl ConfigFlags {
     /// Returns an error for invalid JSON, a missing secret file, or a stdin
     /// secret that was not supplied.
     // The flag table is flat on purpose: each flag maps to one TOML path.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the flag table maps each flag to one TOML path"
+    )]
     pub fn to_layer(&self, stdin_secret: Option<&SecretString>) -> Result<Value, ConfigError> {
         let mut object = Map::new();
 
@@ -1097,7 +1103,7 @@ impl std::fmt::Display for StdinTarget {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use std::fs;
 

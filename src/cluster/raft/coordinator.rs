@@ -43,6 +43,7 @@ pub struct ReadIndexReply {
 }
 
 /// A coordinator backed by one openraft node.
+#[derive(Debug)]
 pub struct RaftCoordinator {
     store: Arc<MetadataStore>,
     metrics: Arc<Metrics>,

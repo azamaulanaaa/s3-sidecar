@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! In-process fake S3 for multipart and data-path tests.
 
 use std::collections::{BTreeMap, HashMap};
@@ -192,7 +190,10 @@ pub async fn spawn() -> (String, FakeS3) {
     )
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the function handles each case in order"
+)]
 async fn handler(
     State(state): State<FakeState>,
     method: Method,

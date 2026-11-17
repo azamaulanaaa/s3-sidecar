@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code uses unwrap and expect for fixtures"
+)]
 
 //! Blob replication, peer fetch, read repair, delete propagation, and the
 //! internal blob transport.
@@ -288,7 +292,10 @@ async fn raw_cluster_status(url: &str, method: &str, path: &str) -> StatusCode {
     StatusCode::from_u16(code.parse().unwrap()).unwrap()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test helper receives all fixture inputs"
+)]
 fn cluster_base(
     id: &str,
     url: &str,
@@ -353,7 +360,10 @@ fn cluster_base(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test helper receives all fixture inputs"
+)]
 fn raft_config(
     id: &str,
     index: usize,
@@ -874,7 +884,11 @@ async fn delete_propagates_to_every_replica() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines, clippy::similar_names)]
+#[expect(
+    clippy::too_many_lines,
+    clippy::similar_names,
+    reason = "the test covers the full flow and uses similar field names"
+)]
 async fn restart_resumes_a_queued_replication_job() {
     let dir = TempDir::new().unwrap();
     let (backing_a_url, backing_a) = spawn_backing().await;
@@ -1180,7 +1194,10 @@ async fn shutdown_raft(node: &Node) {
     }
 }
 
-#[allow(clippy::used_underscore_binding)]
+#[expect(
+    clippy::used_underscore_binding,
+    reason = "the test reads an underscore-prefixed field"
+)]
 async fn stop_raft(node: &Node) {
     shutdown_raft(node).await;
     node._task.abort();

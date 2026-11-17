@@ -28,6 +28,7 @@ use crate::config::{OtelConfig, OtelProtocol};
 use crate::errors::S3Error;
 
 /// The process-wide OpenTelemetry providers.
+#[derive(Debug)]
 pub struct Telemetry {
     meter_provider: Option<SdkMeterProvider>,
     tracer_provider: Option<SdkTracerProvider>,
@@ -509,7 +510,7 @@ pub fn injected_headers(headers: HeaderMap) -> HeaderMap {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use super::*;
 

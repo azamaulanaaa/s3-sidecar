@@ -100,7 +100,10 @@ pub struct CacheMetadata {
 
 impl CacheMetadata {
     /// Build metadata for an entry that origin already has.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the metadata records all origin response fields"
+    )]
     #[must_use]
     pub fn synced(
         origin_bucket: &str,
@@ -257,7 +260,7 @@ pub fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use super::*;
 

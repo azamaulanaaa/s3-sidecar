@@ -9,6 +9,7 @@ pub mod replication;
 pub mod state;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -50,6 +51,17 @@ pub struct WriteBody {
     pub failure: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
+impl fmt::Debug for WriteBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WriteBody")
+            .field("body", &self.body.as_ref().map(|_| "<stream>"))
+            .field("content_length", &self.content_length)
+            .field("failure", &self.failure)
+            .finish()
+    }
+}
+
 /// Summary of one garbage collection pass.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GcReport {
@@ -77,6 +89,27 @@ pub struct Cluster {
     reconcile_cursor: AtomicUsize,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     active_replication: Mutex<BTreeSet<String>>,
+}
+
+impl fmt::Debug for Cluster {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Cluster")
+            .field("config", &self.config)
+            .field("state", &self.state)
+            .field("single", &self.single)
+            .field("raft", &self.raft)
+            .field("consul", &self.consul)
+            .field("client", &self.client)
+            .field("credential", &self.credential)
+            .field("http", &self.http)
+            .field("node_id", &self.node_id)
+            .field("metrics", &self.metrics)
+            .field("reconcile_cursor", &self.reconcile_cursor)
+            .field("tasks", &self.tasks)
+            .field("active_replication", &self.active_replication)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Cluster {
@@ -611,7 +644,10 @@ impl Cluster {
     ///
     /// Returns `NoSuchKey` when the source is absent and a service error when
     /// the backing copy or the commit fails.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the copy path handles each backing store case"
+    )]
     pub async fn copy_object(
         &self,
         bucket: &str,
@@ -1105,7 +1141,6 @@ impl Cluster {
     ///
     /// Returns an error when the backing upload or the commit fails. Returns
     /// `NotImplemented` when the request carries an encryption header.
-    #[allow(clippy::too_many_lines)]
     pub async fn complete_multipart(
         &self,
         upload_id: &str,
@@ -1766,7 +1801,11 @@ fn copy_headers(source: &HeaderMap, target: &mut HeaderMap) {
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::format_push_string)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::format_push_string,
+    reason = "the listing response needs the listing context and push_str"
+)]
 fn list_response(
     bucket: &str,
     prefix: &str,
@@ -1816,7 +1855,11 @@ fn list_response(
     xml_response(StatusCode::OK, xml)
 }
 
-#[allow(clippy::too_many_arguments, clippy::format_push_string)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::format_push_string,
+    reason = "the listing response needs the listing context and push_str"
+)]
 fn list_response_v1(
     bucket: &str,
     prefix: &str,
@@ -2207,7 +2250,7 @@ pub fn fuzz_s3_xml(input: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use super::*;
     use crate::cluster::state::ObjectState;

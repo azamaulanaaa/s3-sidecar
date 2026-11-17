@@ -295,7 +295,10 @@ struct SecretEnv {
     path: Vec<&'static str>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the mapping lists each environment key one time"
+)]
 fn env_key(key: &str) -> Option<(EnvKind, Vec<&'static str>)> {
     let entry = match key {
         "MODE" => (EnvKind::Text, vec!["mode"]),
@@ -593,7 +596,7 @@ fn test_cache_flags(mut flags: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use std::path::PathBuf;
 
@@ -1062,7 +1065,7 @@ buckets = ["media"]
 
 #[cfg(test)]
 mod provenance_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use serde_json::json;
     use tempfile::tempdir;

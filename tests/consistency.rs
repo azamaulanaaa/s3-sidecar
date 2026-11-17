@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code uses unwrap and expect for fixtures"
+)]
 
 //! Write acknowledgement policies and the failure matrix with an in-memory
 //! Consul metadata authority.
@@ -68,7 +72,10 @@ async fn spawn_backing() -> (String, Backing) {
     (format!("http://{address}"), backing)
 }
 
-#[allow(clippy::format_push_string)]
+#[expect(
+    clippy::format_push_string,
+    reason = "the test builds the expected body with push_str"
+)]
 async fn backing_handler(
     State(state): State<Backing>,
     method: Method,
@@ -272,7 +279,10 @@ async fn delete(client: &reqwest::Client, url: &str) -> reqwest::Response {
         .unwrap()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test helper receives all fixture inputs"
+)]
 fn node_config(
     id: &str,
     url: &str,
@@ -506,7 +516,10 @@ async fn spawn_consul_cluster(
         .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test helper receives all fixture inputs"
+)]
 async fn spawn_consul_cluster_with_metrics(
     ids: &[&str],
     write_ack: WriteAck,
@@ -907,7 +920,10 @@ async fn stale_replica_after_delete_is_hidden_by_the_tombstone() {
 }
 
 #[tokio::test]
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "the test compares similarly named fields"
+)]
 async fn restart_after_a_failed_quorum_write_leaves_no_partial_object() {
     let dir = TempDir::new().unwrap();
     let memory = Arc::new(MemoryConsul::new());

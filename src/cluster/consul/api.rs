@@ -3,6 +3,7 @@
 //! The production client uses the Consul HTTP API. Tests use an in-memory
 //! implementation of the same trait.
 
+use std::fmt;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -124,6 +125,18 @@ pub struct HttpConsul {
     base: String,
     token: String,
     watch_wait: Duration,
+}
+
+impl fmt::Debug for HttpConsul {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpConsul")
+            .field("client", &self.client)
+            .field("base", &self.base)
+            .field("token", &"[REDACTED]")
+            .field("watch_wait", &self.watch_wait)
+            .finish()
+    }
 }
 
 impl HttpConsul {

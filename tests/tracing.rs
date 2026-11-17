@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code uses unwrap and expect for fixtures"
+)]
 
 //! Trace, log, propagation, sampling, and OTLP export tests.
 
@@ -557,7 +561,10 @@ fn control_paths_are_not_redacted() {
 #[derive(Debug, Clone, Default)]
 struct SpanSink(Arc<Mutex<Vec<SpanData>>>);
 
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the exporter trait requires async methods"
+)]
 impl SpanExporter for SpanSink {
     async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
         self.0.lock().unwrap().extend(batch);
@@ -568,7 +575,10 @@ impl SpanExporter for SpanSink {
 #[derive(Debug, Clone, Default)]
 struct LogSink(Arc<Mutex<Vec<SdkLogRecord>>>);
 
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the exporter trait requires async methods"
+)]
 impl LogExporter for LogSink {
     async fn export(&self, batch: LogBatch<'_>) -> OTelSdkResult {
         let mut records = self.0.lock().unwrap();

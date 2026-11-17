@@ -6,6 +6,7 @@ pub mod sign;
 pub mod verify;
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use hmac::{Hmac, Mac};
@@ -26,6 +27,7 @@ pub const MAX_CLOCK_SKEW_SECONDS: i64 = 900;
 pub const MAX_PRESIGN_SECONDS: u64 = 604_800;
 
 /// A client credential and its bucket allow-list.
+#[derive(Debug)]
 pub struct ClientCredential {
     access_key_id: String,
     secret_access_key: SecretString,
@@ -84,6 +86,7 @@ impl ClientCredential {
 }
 
 /// A set of client credentials.
+#[derive(Debug)]
 pub struct CredentialStore {
     clients: HashMap<String, Arc<ClientCredential>>,
 }
@@ -125,6 +128,7 @@ impl CredentialStore {
 }
 
 /// Verified authentication data.
+#[derive(Debug)]
 pub struct AuthContext {
     credential: Arc<ClientCredential>,
     payload: PayloadKind,
@@ -164,6 +168,7 @@ impl AuthContext {
 }
 
 /// Payload verification mode.
+#[derive(Debug)]
 pub enum PayloadKind {
     /// The payload is not signed.
     Unsigned,
@@ -176,6 +181,7 @@ pub enum PayloadKind {
 }
 
 /// State needed to verify signed `aws-chunked` chunks.
+#[derive(Debug)]
 pub struct StreamingContext {
     pub(crate) signing_key: SigningKey,
     pub(crate) seed_signature: String,
@@ -187,6 +193,12 @@ pub struct StreamingContext {
 
 /// A secret HMAC key that is erased on drop.
 pub struct SigningKey([u8; 32]);
+
+impl fmt::Debug for SigningKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SigningKey([REDACTED])")
+    }
+}
 
 impl SigningKey {
     pub(crate) fn new(value: [u8; 32]) -> Self {

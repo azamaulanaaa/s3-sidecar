@@ -1,8 +1,7 @@
 //! HTTP transport for internal raft messages.
 
-#![allow(clippy::unused_async_trait_impl)]
-
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 
 use openraft::BasicNode;
@@ -40,6 +39,18 @@ pub struct HttpNetworkFactory {
     addresses: BTreeMap<String, String>,
 }
 
+impl fmt::Debug for HttpNetworkFactory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpNetworkFactory")
+            .field("client", &self.client)
+            .field("token", &"[REDACTED]")
+            .field("timeout", &self.timeout)
+            .field("addresses", &self.addresses)
+            .finish()
+    }
+}
+
 impl HttpNetworkFactory {
     /// Build one factory.
     ///
@@ -68,7 +79,10 @@ impl HttpNetworkFactory {
     }
 }
 
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the openraft trait requires async methods"
+)]
 impl RaftNetworkFactory<TypeConfig> for HttpNetworkFactory {
     type Network = HttpNetwork;
 
@@ -94,6 +108,18 @@ pub struct HttpNetwork {
     address: String,
     token: String,
     timeout: Duration,
+}
+
+impl fmt::Debug for HttpNetwork {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpNetwork")
+            .field("client", &self.client)
+            .field("address", &self.address)
+            .field("token", &"[REDACTED]")
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl HttpNetwork {

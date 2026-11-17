@@ -1,7 +1,5 @@
 //! In-memory raft network for tests.
 
-#![allow(clippy::unused_async_trait_impl)]
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -38,7 +36,7 @@ fn lock(registry: &Registry) -> MutexGuard<'_, BTreeMap<String, RaftHandle>> {
 }
 
 /// In-memory network factory.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct MemoryNetworkFactory {
     registry: Registry,
 }
@@ -51,7 +49,10 @@ impl MemoryNetworkFactory {
     }
 }
 
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the openraft trait requires async methods"
+)]
 impl RaftNetworkFactory<TypeConfig> for MemoryNetworkFactory {
     type Network = MemoryNetwork;
 
@@ -64,6 +65,7 @@ impl RaftNetworkFactory<TypeConfig> for MemoryNetworkFactory {
 }
 
 /// One in-memory network client.
+#[derive(Debug)]
 pub struct MemoryNetwork {
     target: String,
     registry: Registry,

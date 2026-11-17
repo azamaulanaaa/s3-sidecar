@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
 //! Raft backend integration tests.
 
@@ -560,7 +560,10 @@ async fn single_node_raft_serves_put_get_list_and_delete() {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the function handles each case in order"
+)]
 async fn http_transport_replicates_and_serves_owner_headers() {
     let dir = TempDir::new().unwrap();
     let mut listeners = Vec::new();

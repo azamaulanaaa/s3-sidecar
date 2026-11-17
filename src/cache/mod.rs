@@ -144,6 +144,7 @@ struct ClientUpload {
     part_sizes: Arc<Mutex<HashMap<u32, u64>>>,
 }
 
+#[derive(Debug)]
 struct SyncJobs {
     latest: HashMap<CacheKey, JournalEntry>,
     running: HashSet<CacheKey>,
@@ -172,6 +173,7 @@ impl SyncJobs {
 }
 
 /// A cache lookup result.
+#[derive(Debug)]
 pub enum Lookup {
     /// The cache has a usable entry.
     Hit(Box<CacheMetadata>),
@@ -184,6 +186,7 @@ pub enum Lookup {
 }
 
 /// The read-through cache and write-back journal.
+#[derive(Debug)]
 pub struct Cache {
     config: Arc<Config>,
     client: S3Client,
@@ -580,7 +583,10 @@ impl Cache {
     /// Returns an error when the cache cannot store the blob, journal, or
     /// metadata.
     // The write path needs the body, its headers, and a fallback signal.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the write path needs the body, its headers, and a fallback signal"
+    )]
     pub async fn stage_put(
         self: &Arc<Self>,
         bucket: &str,
@@ -672,7 +678,10 @@ impl Cache {
     }
 
     /// Store an origin response while a client reads it.
-    #[allow(clippy::needless_pass_by_value)]
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "the response is streamed, so the function takes ownership"
+    )]
     pub fn tee_response(
         self: &Arc<Self>,
         response: reqwest::Response,
@@ -1261,7 +1270,10 @@ impl Cache {
     /// # Errors
     ///
     /// Returns an error when the metadata or index write fails.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the commit needs the origin response metadata"
+    )]
     pub async fn commit_synced_blob(
         self: &Arc<Self>,
         origin_bucket: &str,
@@ -1331,7 +1343,10 @@ impl Cache {
     ///
     /// Returns an error when the cache cannot start the upload or the response
     /// does not contain an upload id.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the upload start needs the request metadata and headers"
+    )]
     pub async fn create_client_upload(
         &self,
         bucket: &str,
@@ -2178,6 +2193,7 @@ impl SyncFailure {
 }
 
 /// A blob written to the cache for a write-through request.
+#[derive(Debug)]
 pub struct StoredBlob {
     cache_key: String,
     size: u64,
@@ -2186,6 +2202,7 @@ pub struct StoredBlob {
 }
 
 /// A completed client multipart upload response from the cache.
+#[derive(Debug)]
 pub struct ClientComplete {
     /// Response headers from the cache.
     pub headers: HeaderMap,
@@ -2198,6 +2215,7 @@ pub struct ClientComplete {
 }
 
 /// A list parts response from the cache.
+#[derive(Debug)]
 pub struct ClientListParts {
     /// Response headers from the cache.
     pub headers: HeaderMap,
@@ -2381,7 +2399,10 @@ fn count_part_bytes(
     Box::pin(stream)
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the converter takes ownership of the storage error"
+)]
 fn storage_error(error: StorageError) -> CacheError {
     match error {
         StorageError::Sign(_) => CacheError::Metadata,
@@ -2466,10 +2487,10 @@ fn unescape_xml(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::cast_precision_loss
+    reason = "callers clamp the fraction to 0.0..=1.0 before the cast"
 )]
 fn watermark(max_bytes: u64, fraction: f64) -> u64 {
     let clamped = fraction.clamp(0.0, 1.0);
@@ -2495,7 +2516,7 @@ pub fn fuzz_s3_xml(input: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use super::*;
 

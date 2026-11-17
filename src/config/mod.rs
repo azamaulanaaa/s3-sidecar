@@ -214,7 +214,10 @@ impl OtelProtocol {
 }
 
 /// OpenTelemetry export settings for metrics, traces, and logs.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each setting is one independent export switch"
+)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct OtelConfig {
@@ -1465,7 +1468,7 @@ fn is_http_url(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use std::time::Duration;
 

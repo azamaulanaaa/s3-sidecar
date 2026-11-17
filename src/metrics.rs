@@ -77,7 +77,10 @@ impl Default for Metrics {
 impl Metrics {
     /// Build the instruments from one meter.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the constructor builds one instrument per metric"
+    )]
     pub fn new(meter: &Meter) -> Self {
         Self {
             cache_hits: counter(meter, "s3_sidecar.cache.hits", "Cache hits."),
@@ -672,11 +675,7 @@ fn histogram(meter: &Meter, name: &'static str, description: &'static str) -> Hi
 }
 
 fn millis(elapsed: Duration) -> f64 {
-    // The histogram stores floating-point milliseconds. Precision loss above
-    // 2^53 ms is acceptable for a latency value.
-    #[allow(clippy::cast_precision_loss)]
-    let value = elapsed.as_secs_f64() * 1_000.0;
-    value
+    elapsed.as_secs_f64() * 1_000.0
 }
 
 fn record_leader(gauge: &Gauge<u64>, leader: Option<&str>) {
@@ -692,7 +691,7 @@ fn record_leader(gauge: &Gauge<u64>, leader: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use opentelemetry::metrics::MeterProvider;
     use opentelemetry_sdk::metrics::data::{

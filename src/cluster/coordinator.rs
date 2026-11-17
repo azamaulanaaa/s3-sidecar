@@ -254,6 +254,7 @@ pub trait Coordinator: Send + Sync {
 }
 
 /// A single-node coordinator. It starts at term 1 and is always the leader.
+#[derive(Debug)]
 pub struct SingleNode {
     term: u64,
     state: Arc<MetadataStore>,
@@ -324,7 +325,7 @@ impl Coordinator for SingleNode {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use std::sync::Barrier;
     use std::thread;

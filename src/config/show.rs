@@ -6,7 +6,10 @@ use super::Config;
 use super::loader::{Source, SourceMap};
 
 // The table builder lists each field one time, in field order.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the builder lists each field one time in field order"
+)]
 pub(crate) fn render(config: &Config, sources: &SourceMap) -> String {
     let mut rows: Vec<(String, String, String)> = Vec::new();
 

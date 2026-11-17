@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
 //! Cache-mode integration tests with an in-process fake origin and fake cache.
 
@@ -249,7 +249,10 @@ async fn spawn_origin() -> (String, OriginHandle) {
     )
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the function handles each case in order"
+)]
 async fn origin_handler(
     State(state): State<OriginState>,
     method: Method,
@@ -413,7 +416,11 @@ async fn origin_handler(
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::format_push_string)]
+#[expect(
+    clippy::too_many_lines,
+    clippy::format_push_string,
+    reason = "the test covers the full flow and builds the body with push_str"
+)]
 fn origin_list_response(state: &OriginState, bucket: &str, query: &str) -> Response {
     if let Some(token) = query_text(query, "continuation-token") {
         *state.last_token.lock().unwrap() = Some(token);
@@ -573,7 +580,10 @@ async fn spawn_cache() -> (String, CacheHandle) {
     )
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the function handles each case in order"
+)]
 async fn cache_handler(
     State(state): State<CacheState>,
     method: Method,
@@ -901,7 +911,10 @@ fn other_client_config() -> ClientConfig {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the test helper receives all fixture inputs"
+)]
 fn config(
     origin: String,
     cache: String,

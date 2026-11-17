@@ -78,7 +78,10 @@ struct OriginPage {
 ///
 /// Returns an error when the origin listing fails or `encoding-type` is not
 /// valid.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the listing merge handles each page item in order"
+)]
 pub(crate) async fn merged_response(
     state: &AppState,
     write_state: (Vec<CacheMetadata>, Vec<String>),
@@ -299,7 +302,10 @@ struct ListPage<'a> {
     encode: bool,
 }
 
-#[allow(clippy::format_push_string)]
+#[expect(
+    clippy::format_push_string,
+    reason = "the listing XML is built with push_str"
+)]
 fn list_response(page: &ListPage<'_>) -> Response {
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
     xml.push_str("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
@@ -446,7 +452,10 @@ fn emit_item(item: &Item, contents: &mut Vec<String>, prefixes: &mut Vec<String>
 }
 
 /// Read one origin listing page.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the origin page request needs the listing context"
+)]
 async fn fetch_origin_page(
     state: &AppState,
     credential: &std::sync::Arc<ClientCredential>,
@@ -554,7 +563,10 @@ fn parse_common_prefixes(xml: &str) -> Vec<String> {
 }
 
 /// Build one `<Contents>` block from a pending write.
-#[allow(clippy::format_push_string)]
+#[expect(
+    clippy::format_push_string,
+    reason = "the contents block is built with push_str"
+)]
 fn pending_block(meta: &CacheMetadata, encode: bool) -> String {
     let mut xml = String::from("<Contents>");
     if encode {

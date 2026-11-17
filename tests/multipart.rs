@@ -1,4 +1,8 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test code uses unwrap and expect for fixtures"
+)]
 
 //! Tests for the shared multipart writer and its data-path callers.
 

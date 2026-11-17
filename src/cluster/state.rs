@@ -242,7 +242,10 @@ pub enum ApplyResult {
 
 /// Outcome of one applied log entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the variants carry the applied and rejected payloads"
+)]
 pub enum ApplyOutcome {
     /// The entry changed the state.
     Applied(ApplyResult),
@@ -264,6 +267,7 @@ pub struct Applied {
 }
 
 /// A durable metadata state machine.
+#[derive(Debug)]
 pub struct MetadataStore {
     db: Arc<Database>,
     applied: AtomicU64,
@@ -550,7 +554,10 @@ impl MetadataStore {
         Ok(ApplyOutcome::Applied(ApplyResult::Blank))
     }
 
-    #[allow(clippy::unused_self)]
+    #[expect(
+        clippy::unused_self,
+        reason = "the method uses the transaction, not the struct state"
+    )]
     fn write_commit(
         &self,
         write: &redb::WriteTransaction,
@@ -598,7 +605,11 @@ impl MetadataStore {
         Ok(ApplyOutcome::Applied(ApplyResult::Commit(metadata)))
     }
 
-    #[allow(clippy::unused_self, clippy::too_many_arguments)]
+    #[expect(
+        clippy::unused_self,
+        clippy::too_many_arguments,
+        reason = "the method uses the transaction and needs all request fields"
+    )]
     fn write_delete(
         &self,
         write: &redb::WriteTransaction,
@@ -639,7 +650,10 @@ impl MetadataStore {
         Ok(ApplyOutcome::Applied(ApplyResult::Delete(metadata)))
     }
 
-    #[allow(clippy::unused_self)]
+    #[expect(
+        clippy::unused_self,
+        reason = "the method uses the transaction, not the struct state"
+    )]
     fn write_abort(
         &self,
         write: &redb::WriteTransaction,
@@ -656,7 +670,10 @@ impl MetadataStore {
         Ok(())
     }
 
-    #[allow(clippy::unused_self)]
+    #[expect(
+        clippy::unused_self,
+        reason = "the method uses the transaction, not the struct state"
+    )]
     fn write_bucket_config(
         &self,
         write: &redb::WriteTransaction,
@@ -672,7 +689,10 @@ impl MetadataStore {
         Ok(ApplyOutcome::Applied(ApplyResult::BucketConfig(config)))
     }
 
-    #[allow(clippy::unused_self)]
+    #[expect(
+        clippy::unused_self,
+        reason = "the method uses the transaction, not the struct state"
+    )]
     fn write_applied(
         &self,
         write: &redb::WriteTransaction,
@@ -1368,7 +1388,6 @@ impl MetadataStore {
         self.install_state_record(bytes, Some(record))
     }
 
-    #[allow(clippy::too_many_lines)]
     fn install_state_record(&self, bytes: &[u8], record: Option<&[u8]>) -> Result<(), CoordError> {
         let export: StateExport = serde_json::from_slice(bytes).map_err(CoordError::from)?;
         let _guard = self
@@ -1625,7 +1644,7 @@ pub fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use crate::cluster::raft::CommittedLeaderIdOf;
     use openraft::LogId;

@@ -1,7 +1,5 @@
 //! `redb` storage for the raft log and the raft state machine adapter.
 
-#![allow(clippy::unused_async_trait_impl)]
-
 use std::fmt::Debug;
 use std::io;
 use std::ops::{Bound, RangeBounds};
@@ -26,7 +24,7 @@ const COMMITTED_KEY: &str = "committed";
 const LAST_PURGED_KEY: &str = "last_purged";
 
 /// Durable raft log storage.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RaftLogStore {
     db: Arc<Database>,
 }
@@ -68,7 +66,10 @@ impl RaftLogStore {
     }
 }
 
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the openraft trait requires async methods"
+)]
 impl RaftLogReader<TypeConfig> for RaftLogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send>(
         &mut self,
@@ -93,7 +94,10 @@ impl RaftLogReader<TypeConfig> for RaftLogStore {
     }
 }
 
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the openraft trait requires async methods"
+)]
 impl RaftLogStorage<TypeConfig> for RaftLogStore {
     type LogReader = Self;
 
@@ -240,7 +244,7 @@ impl RaftLogStore {
 pub type SnapshotData = Vec<u8>;
 
 /// The raft state machine adapter.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct RaftStore {
     store: Arc<MetadataStore>,
 }
@@ -254,6 +258,7 @@ impl RaftStore {
 }
 
 /// Snapshot builder for the sidecar state machine.
+#[derive(Debug)]
 pub struct SnapshotBuilder {
     store: Arc<MetadataStore>,
 }
@@ -264,7 +269,10 @@ struct SnapshotRecord {
     data: Vec<u8>,
 }
 
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the openraft trait requires async methods"
+)]
 impl RaftStateMachine<TypeConfig> for RaftStore {
     type SnapshotData = SnapshotData;
     type SnapshotBuilder = SnapshotBuilder;
@@ -339,7 +347,10 @@ impl RaftStateMachine<TypeConfig> for RaftStore {
     }
 }
 
-#[allow(clippy::unused_async_trait_impl)]
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the openraft trait requires async methods"
+)]
 impl RaftSnapshotBuilder<TypeConfig> for SnapshotBuilder {
     type SnapshotData = SnapshotData;
 
@@ -383,14 +394,17 @@ fn io_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the converter takes ownership of the coordinator error"
+)]
 fn coord_error(error: crate::cluster::coordinator::CoordError) -> io::Error {
     io::Error::other(error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use openraft::vote::RaftLeaderId;
     use openraft::{LogId, RaftSnapshotBuilder};

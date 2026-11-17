@@ -29,6 +29,19 @@ pub struct ForwardRequest {
     pub content_length: Option<u64>,
 }
 
+impl fmt::Debug for ForwardRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ForwardRequest")
+            .field("method", &self.method)
+            .field("path_and_query", &self.path_and_query)
+            .field("headers", &self.headers)
+            .field("body", &self.body.as_ref().map(|_| "<stream>"))
+            .field("content_length", &self.content_length)
+            .finish()
+    }
+}
+
 /// An error from the upstream S3 client.
 pub enum StorageError {
     /// The request could not be signed.
@@ -89,7 +102,7 @@ impl std::error::Error for StorageError {
 }
 
 /// An S3 client for one endpoint.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct S3Client {
     http: Client,
     endpoint: Url,
@@ -417,7 +430,7 @@ fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use axum::http::StatusCode;
 

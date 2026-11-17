@@ -28,12 +28,14 @@ pub struct IndexEntry {
     pub state: EntryState,
 }
 
+#[derive(Debug)]
 struct IndexState {
     total: u64,
     loaded: bool,
 }
 
 /// A `redb` backed LRU index. The index is advisory.
+#[derive(Debug)]
 pub struct CacheIndex {
     db: Database,
     state: Mutex<IndexState>,
@@ -274,7 +276,7 @@ impl CacheIndex {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use tempfile::tempdir;
 

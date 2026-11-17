@@ -60,7 +60,10 @@ impl Failure {
 ///
 /// Returns a signing, status, body, size, timeout, or transport error. A
 /// multipart failure aborts the upload before it returns.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the uploader receives the full request context"
+)]
 pub async fn put_object(
     client: &S3Client,
     credential: &ClientCredential,
@@ -94,7 +97,10 @@ pub async fn put_object(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the single PUT path receives the full request context"
+)]
 async fn put_single(
     client: &S3Client,
     credential: &ClientCredential,
@@ -118,7 +124,11 @@ async fn put_single(
         .await
 }
 
-#[allow(clippy::too_many_arguments, clippy::result_large_err)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::result_large_err,
+    reason = "the error carries the upload id for abort"
+)]
 async fn put_multipart(
     client: &S3Client,
     credential: &ClientCredential,
@@ -172,7 +182,10 @@ async fn put_multipart(
         .map_err(|(error, reason)| Failure::after_start(error, reason, &upload_id))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the upload loop needs the body, part size, and metrics"
+)]
 async fn run_upload(
     client: &S3Client,
     credential: &ClientCredential,
@@ -508,7 +521,7 @@ impl PartReader {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use super::*;
     use crate::config::size::Size;

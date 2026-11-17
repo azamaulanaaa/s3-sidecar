@@ -33,7 +33,7 @@ struct Inner {
 }
 
 /// One in-memory Consul.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MemoryConsul {
     inner: Arc<Mutex<Inner>>,
     notify: Arc<Notify>,

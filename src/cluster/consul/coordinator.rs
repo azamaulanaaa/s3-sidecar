@@ -1,6 +1,7 @@
 //! Consul coordinator: leader election, metadata proposals, and
 //! materialization.
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
@@ -39,7 +40,10 @@ pub struct LeaderRecord {
 
 /// Reply from the leader for one forwarded proposal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the variants carry the applied and rejected payloads"
+)]
 pub enum ProposeReply {
     /// The leader applied the entry.
     Applied(Applied),
@@ -67,6 +71,23 @@ pub struct ConsulCoordinator {
     materialized: AtomicBool,
     started: AtomicBool,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl fmt::Debug for ConsulCoordinator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConsulCoordinator")
+            .field("config", &self.config)
+            .field("store", &self.store)
+            .field("metrics", &self.metrics)
+            .field("http", &self.http)
+            .field("leadership", &self.leadership)
+            .field("applied", &self.applied)
+            .field("materialized", &self.materialized)
+            .field("started", &self.started)
+            .field("tasks", &self.tasks)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConsulCoordinator {
@@ -872,7 +893,6 @@ fn retag_entry(entry: Entry, term: u64) -> Entry {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn map_consul(error: ConsulError) -> CoordError {
     if error.is_transport() {
         CoordError::Unavailable
@@ -1023,7 +1043,7 @@ fn decode_hex(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![expect(clippy::unwrap_used, reason = "test code uses unwrap for fixtures")]
 
     use std::collections::BTreeMap;
 

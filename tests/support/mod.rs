@@ -1,4 +1,7 @@
-#![allow(dead_code)]
+#![expect(
+    dead_code,
+    reason = "support helpers are used by only some test targets"
+)]
 
 //! In-memory OpenTelemetry metric helpers for integration tests.
 
