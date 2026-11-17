@@ -1944,7 +1944,7 @@ fn has_client_condition(headers: &HeaderMap) -> bool {
 
 fn evaluate_read_conditions(headers: &HeaderMap, meta: &CacheMetadata) -> CacheCondition {
     if let Some(condition) = header_string(headers, header::IF_NONE_MATCH) {
-        if etag_condition_matches(&condition, &meta.etag) {
+        if etag_condition_matches(&condition, &meta.etag, EtagComparison::Weak) {
             return CacheCondition::NotModified;
         }
     } else if let Some(value) = header_string(headers, header::IF_MODIFIED_SINCE)
@@ -1953,7 +1953,7 @@ fn evaluate_read_conditions(headers: &HeaderMap, meta: &CacheMetadata) -> CacheC
         return CacheCondition::NotModified;
     }
     if let Some(condition) = header_string(headers, header::IF_MATCH) {
-        if !etag_condition_matches(&condition, &meta.etag) {
+        if !etag_condition_matches(&condition, &meta.etag, EtagComparison::Strong) {
             return CacheCondition::Failed;
         }
     } else if let Some(value) = header_string(headers, header::IF_UNMODIFIED_SINCE)
@@ -1964,19 +1964,35 @@ fn evaluate_read_conditions(headers: &HeaderMap, meta: &CacheMetadata) -> CacheC
     CacheCondition::Ok
 }
 
-/// Compare one `If-Match` or `If-None-Match` value with a stored entity tag.
-fn etag_condition_matches(condition: &str, etag: &str) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EtagComparison {
+    Strong,
+    Weak,
+}
+
+/// Compare an `If-Match` or `If-None-Match` value with a stored entity tag.
+/// Strong comparison rejects weak validators on both sides.
+/// Weak comparison ignores the `W/` prefix on both sides.
+fn etag_condition_matches(condition: &str, etag: &str, comparison: EtagComparison) -> bool {
     let condition = condition.trim();
     if condition == "*" {
         return true;
     }
     let etag = etag.trim();
+    let etag_weak = etag.starts_with("W/");
     let etag = etag.strip_prefix("W/").unwrap_or(etag);
     let etag = etag.trim_matches('"');
     condition.split(',').any(|item| {
         let item = item.trim();
+        let item_weak = item.starts_with("W/");
         let item = item.strip_prefix("W/").unwrap_or(item);
-        item.trim_matches('"') == etag
+        if item.trim_matches('"') != etag {
+            return false;
+        }
+        match comparison {
+            EtagComparison::Strong => !item_weak && !etag_weak,
+            EtagComparison::Weak => true,
+        }
     })
 }
 
@@ -2090,12 +2106,12 @@ async fn write_put(
     if if_none_match.is_some() || if_match.is_some() {
         if let Some(meta) = cached_metadata(cache, bucket, key).await {
             if let Some(condition) = &if_none_match
-                && etag_condition_matches(condition, &meta.etag)
+                && etag_condition_matches(condition, &meta.etag, EtagComparison::Weak)
             {
                 return Err(precondition_failed());
             }
             if let Some(condition) = &if_match
-                && !etag_condition_matches(condition, &meta.etag)
+                && !etag_condition_matches(condition, &meta.etag, EtagComparison::Strong)
             {
                 return Err(precondition_failed());
             }
@@ -2336,7 +2352,7 @@ async fn write_delete(
 ) -> Result<Response, S3Error> {
     if let Some(condition) = header_string(&prepared.headers, header::IF_MATCH) {
         if let Some(meta) = cached_metadata(cache, bucket, key).await {
-            if !etag_condition_matches(&condition, &meta.etag) {
+            if !etag_condition_matches(&condition, &meta.etag, EtagComparison::Strong) {
                 return Err(precondition_failed());
             }
         } else {
@@ -3136,6 +3152,51 @@ mod tests {
         let xml = "<ListPartsResult><IsTruncated>false</IsTruncated></ListPartsResult>";
         let output = rewrite_xml_tag(xml, "Key", "a&b");
         assert!(output.contains("<Key>a&amp;b</Key>"));
+    }
+
+    #[test]
+    fn strong_comparison_accepts_a_matching_strong_etag() {
+        assert!(etag_condition_matches(
+            "\"etag\"",
+            "\"etag\"",
+            EtagComparison::Strong,
+        ));
+    }
+
+    #[test]
+    fn strong_comparison_rejects_a_weak_condition() {
+        assert!(!etag_condition_matches(
+            "W/\"etag\"",
+            "\"etag\"",
+            EtagComparison::Strong,
+        ));
+    }
+
+    #[test]
+    fn strong_comparison_rejects_a_weak_stored_etag() {
+        assert!(!etag_condition_matches(
+            "\"etag\"",
+            "W/\"etag\"",
+            EtagComparison::Strong,
+        ));
+    }
+
+    #[test]
+    fn strong_comparison_rejects_a_weak_item_in_a_list() {
+        assert!(!etag_condition_matches(
+            "\"other\", W/\"etag\"",
+            "\"etag\"",
+            EtagComparison::Strong,
+        ));
+    }
+
+    #[test]
+    fn weak_comparison_accepts_a_weak_condition() {
+        assert!(etag_condition_matches(
+            "W/\"etag\"",
+            "\"etag\"",
+            EtagComparison::Weak,
+        ));
     }
 
     #[tokio::test]

@@ -3023,6 +3023,55 @@ async fn write_back_if_match_checks_the_cached_etag() {
 }
 
 #[tokio::test]
+async fn write_back_rejects_a_weak_if_match_etag() {
+    let (origin_url, origin) = spawn_origin().await;
+    let permit = origin.block_puts();
+    let (cache_url, _cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let first = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/weak-if-match", sidecar.url),
+        Some(b"first".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let etag = first
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_owned();
+    let weak = format!("W/{etag}");
+    let response = signed_request_with_headers(
+        &client,
+        Method::PUT,
+        &format!("{}/media/weak-if-match", sidecar.url),
+        Some(b"second".to_vec()),
+        &[("if-match", weak.as_str())],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    drop(permit);
+}
+
+#[tokio::test]
 async fn cached_get_honors_if_none_match() {
     let (origin_url, origin) = spawn_origin().await;
     origin.put("media/cond-get", b"hello", "\"etag-get\"");
