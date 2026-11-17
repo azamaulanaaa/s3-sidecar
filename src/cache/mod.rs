@@ -62,7 +62,10 @@ pub enum CacheError {
     Metadata,
     /// The LRU index failed.
     #[error("cache index failed: {0}")]
-    Index(String),
+    Index(#[from] redb::Error),
+    /// The index could not encode or decode a record.
+    #[error("the index record is not valid: {0}")]
+    Codec(#[from] serde_json::Error),
     /// The body is larger than `max_object_bytes`.
     #[error("the object is too large for the cache")]
     TooLarge,
@@ -81,10 +84,34 @@ impl CacheError {
         match self {
             Self::Unavailable | Self::Body => true,
             Self::Status(status) => *status >= 500 || *status == 408 || *status == 429,
-            Self::Metadata | Self::Index(_) | Self::TooLarge | Self::BlobMissing => false,
+            Self::Metadata
+            | Self::Index(_)
+            | Self::Codec(_)
+            | Self::TooLarge
+            | Self::BlobMissing => false,
         }
     }
 }
+
+macro_rules! impl_from_redb {
+    ($($error:ty),+ $(,)?) => {
+        $(
+            impl From<$error> for CacheError {
+                fn from(error: $error) -> Self {
+                    Self::Index(redb::Error::from(error))
+                }
+            }
+        )+
+    };
+}
+
+impl_from_redb!(
+    redb::DatabaseError,
+    redb::TransactionError,
+    redb::TableError,
+    redb::StorageError,
+    redb::CommitError,
+);
 
 /// One key in the origin namespace.
 pub type CacheKey = (String, String);
@@ -2471,6 +2498,25 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn index_error_keeps_the_source() {
+        let io_error = std::io::Error::other("disk failure");
+        let source = redb::Error::from(io_error);
+        let error: CacheError = source.into();
+        assert!(matches!(error, CacheError::Index(_)));
+        let reported = std::error::Error::source(&error).unwrap();
+        assert!(reported.downcast_ref::<redb::Error>().is_some());
+    }
+
+    #[test]
+    fn codec_error_keeps_the_source() {
+        let source = serde_json::from_str::<u8>("not json").unwrap_err();
+        let error: CacheError = source.into();
+        assert!(matches!(error, CacheError::Codec(_)));
+        let reported = std::error::Error::source(&error).unwrap();
+        assert!(reported.downcast_ref::<serde_json::Error>().is_some());
+    }
 
     #[test]
     fn watermark_scales_the_limit() {

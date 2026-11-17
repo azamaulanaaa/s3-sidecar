@@ -46,19 +46,13 @@ impl CacheIndex {
     ///
     /// Returns an error when the database cannot be opened or read.
     pub fn open(path: &Path) -> Result<Self, CacheError> {
-        let db = Database::create(path).map_err(|error| CacheError::Index(error.to_string()))?;
+        let db = Database::create(path).map_err(CacheError::from)?;
         // Creating the table on open makes later read transactions valid even
         // when the index is new and empty.
         {
-            let write = db
-                .begin_write()
-                .map_err(|error| CacheError::Index(error.to_string()))?;
-            write
-                .open_table(TABLE)
-                .map_err(|error| CacheError::Index(error.to_string()))?;
-            write
-                .commit()
-                .map_err(|error| CacheError::Index(error.to_string()))?;
+            let write = db.begin_write().map_err(CacheError::from)?;
+            write.open_table(TABLE).map_err(CacheError::from)?;
+            write.commit().map_err(CacheError::from)?;
         }
         let index = Self {
             db,
@@ -81,18 +75,11 @@ impl CacheIndex {
     ///
     /// Returns an error when the database commit fails.
     pub fn flush(&self) -> Result<(), CacheError> {
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CacheError::from)?;
         {
-            write
-                .open_table(TABLE)
-                .map_err(|error| CacheError::Index(error.to_string()))?;
+            write.open_table(TABLE).map_err(CacheError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CacheError::Index(error.to_string()))
+        write.commit().map_err(CacheError::from)
     }
 
     /// Return the tracked byte count.
@@ -120,23 +107,15 @@ impl CacheIndex {
     pub fn insert(&self, key: &str, entry: &IndexEntry) -> Result<(), CacheError> {
         let mut state = self.lock();
         let previous = self.get_locked(key)?;
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CacheError::from)?;
         {
-            let mut table = write
-                .open_table(TABLE)
-                .map_err(|error| CacheError::Index(error.to_string()))?;
-            let bytes =
-                serde_json::to_vec(entry).map_err(|error| CacheError::Index(error.to_string()))?;
+            let mut table = write.open_table(TABLE).map_err(CacheError::from)?;
+            let bytes = serde_json::to_vec(entry).map_err(CacheError::from)?;
             table
                 .insert(key, bytes.as_slice())
-                .map_err(|error| CacheError::Index(error.to_string()))?;
+                .map_err(CacheError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        write.commit().map_err(CacheError::from)?;
         if let Some(previous) = previous {
             state.total = state.total.saturating_sub(previous.size);
         }
@@ -155,21 +134,12 @@ impl CacheIndex {
         if previous.is_none() {
             return Ok(false);
         }
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CacheError::from)?;
         {
-            let mut table = write
-                .open_table(TABLE)
-                .map_err(|error| CacheError::Index(error.to_string()))?;
-            table
-                .remove(key)
-                .map_err(|error| CacheError::Index(error.to_string()))?;
+            let mut table = write.open_table(TABLE).map_err(CacheError::from)?;
+            table.remove(key).map_err(CacheError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        write.commit().map_err(CacheError::from)?;
         if let Some(previous) = previous {
             state.total = state.total.saturating_sub(previous.size);
         }
@@ -221,14 +191,9 @@ impl CacheIndex {
         entries.sort_by_key(|(_, entry)| (entry.last_access, entry.validated_at));
         let mut total = state.total;
         let mut evicted = Vec::new();
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CacheError::from)?;
         {
-            let mut table = write
-                .open_table(TABLE)
-                .map_err(|error| CacheError::Index(error.to_string()))?;
+            let mut table = write.open_table(TABLE).map_err(CacheError::from)?;
             for (key, entry) in entries {
                 if total <= target {
                     break;
@@ -236,16 +201,12 @@ impl CacheIndex {
                 if entry.state != EntryState::Synced {
                     continue;
                 }
-                table
-                    .remove(key.as_str())
-                    .map_err(|error| CacheError::Index(error.to_string()))?;
+                table.remove(key.as_str()).map_err(CacheError::from)?;
                 total = total.saturating_sub(entry.size);
                 evicted.push((key, entry));
             }
         }
-        write
-            .commit()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        write.commit().map_err(CacheError::from)?;
         state.total = total;
         Ok(evicted)
     }
@@ -257,30 +218,20 @@ impl CacheIndex {
     /// Returns an error when the database write fails.
     pub fn rebuild(&self, entries: Vec<(String, IndexEntry)>) -> Result<(), CacheError> {
         let mut state = self.lock();
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CacheError::from)?;
         let mut total = 0_u64;
         {
-            let mut table = write
-                .open_table(TABLE)
-                .map_err(|error| CacheError::Index(error.to_string()))?;
-            table
-                .retain(|_, _| false)
-                .map_err(|error| CacheError::Index(error.to_string()))?;
+            let mut table = write.open_table(TABLE).map_err(CacheError::from)?;
+            table.retain(|_, _| false).map_err(CacheError::from)?;
             for (key, entry) in entries {
-                let bytes = serde_json::to_vec(&entry)
-                    .map_err(|error| CacheError::Index(error.to_string()))?;
+                let bytes = serde_json::to_vec(&entry).map_err(CacheError::from)?;
                 table
                     .insert(key.as_str(), bytes.as_slice())
-                    .map_err(|error| CacheError::Index(error.to_string()))?;
+                    .map_err(CacheError::from)?;
                 total = total.saturating_add(entry.size);
             }
         }
-        write
-            .commit()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        write.commit().map_err(CacheError::from)?;
         state.total = total;
         state.loaded = true;
         Ok(())
@@ -292,42 +243,27 @@ impl CacheIndex {
     }
 
     fn entries_locked(&self) -> Result<Vec<(String, IndexEntry)>, CacheError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
-        let table = read
-            .open_table(TABLE)
-            .map_err(|error| CacheError::Index(error.to_string()))?;
-        let iter = table
-            .iter()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CacheError::from)?;
+        let table = read.open_table(TABLE).map_err(CacheError::from)?;
+        let iter = table.iter().map_err(CacheError::from)?;
         let mut output = Vec::new();
         for item in iter {
-            let (key, value) = item.map_err(|error| CacheError::Index(error.to_string()))?;
-            let entry: IndexEntry = serde_json::from_slice(value.value())
-                .map_err(|error| CacheError::Index(error.to_string()))?;
+            let (key, value) = item.map_err(CacheError::from)?;
+            let entry: IndexEntry =
+                serde_json::from_slice(value.value()).map_err(CacheError::from)?;
             output.push((key.value().to_owned(), entry));
         }
         Ok(output)
     }
 
     fn get_locked(&self, key: &str) -> Result<Option<IndexEntry>, CacheError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CacheError::Index(error.to_string()))?;
-        let table = read
-            .open_table(TABLE)
-            .map_err(|error| CacheError::Index(error.to_string()))?;
-        let value = table
-            .get(key)
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CacheError::from)?;
+        let table = read.open_table(TABLE).map_err(CacheError::from)?;
+        let value = table.get(key).map_err(CacheError::from)?;
         let Some(value) = value else {
             return Ok(None);
         };
-        let entry = serde_json::from_slice(value.value())
-            .map_err(|error| CacheError::Index(error.to_string()))?;
+        let entry = serde_json::from_slice(value.value()).map_err(CacheError::from)?;
         Ok(Some(entry))
     }
 

@@ -263,6 +263,8 @@ impl S3Error {
         if let Ok(value) = HeaderValue::from_str(request_id) {
             headers.insert("x-amz-request-id", value.clone());
             headers.insert("x-s3-sidecar-request-id", value);
+        } else {
+            tracing::warn!("the request id is not a valid header value");
         }
         for (name, value) in &self.extra_headers {
             if let (Ok(name), Ok(value)) = (
@@ -270,6 +272,8 @@ impl S3Error {
                 HeaderValue::from_str(value),
             ) {
                 headers.insert(name, value);
+            } else {
+                tracing::warn!("an extra response header is not valid");
             }
         }
         response
@@ -304,5 +308,52 @@ fn push_escaped(xml: &mut String, value: &str) {
             '\'' => xml.push_str("&apos;"),
             other => xml.push(other),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn internal_error() -> S3Error {
+        S3Error::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "failure",
+        )
+    }
+
+    #[test]
+    fn valid_request_id_is_present_in_headers() {
+        let response = internal_error().into_response("req-42");
+        assert_eq!(response.headers()["x-amz-request-id"], "req-42");
+        assert_eq!(response.headers()["x-s3-sidecar-request-id"], "req-42");
+    }
+
+    #[test]
+    fn invalid_request_id_is_absent_from_headers() {
+        let response = internal_error().into_response("bad\nvalue");
+        assert!(response.headers().get("x-amz-request-id").is_none());
+        assert!(response.headers().get("x-s3-sidecar-request-id").is_none());
+    }
+
+    #[test]
+    fn invalid_extra_headers_are_absent_from_response() {
+        let mut error = internal_error();
+        error
+            .extra_headers
+            .push(("bad\nname".to_owned(), "value".to_owned()));
+        error
+            .extra_headers
+            .push(("x-amz-meta-bad".to_owned(), "bad\nvalue".to_owned()));
+        error
+            .extra_headers
+            .push(("x-amz-meta-ok".to_owned(), "ok".to_owned()));
+        let response = error.into_response("req-42");
+        assert!(response.headers().get("bad\nname").is_none());
+        assert!(response.headers().get("x-amz-meta-bad").is_none());
+        assert_eq!(response.headers()["x-amz-meta-ok"], "ok");
     }
 }

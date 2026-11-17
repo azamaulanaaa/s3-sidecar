@@ -2014,8 +2014,12 @@ fn map_coord_error(error: CoordError) -> S3Error {
         CoordError::StaleTerm { .. } | CoordError::Unavailable | CoordError::Indeterminate(_) => {
             S3Error::no_leader()
         }
-        CoordError::Storage(message) => {
-            warn!(error = %message, "cluster metadata operation failed");
+        error @ (CoordError::Storage(_)
+        | CoordError::Codec(_)
+        | CoordError::Io(_)
+        | CoordError::Backend(_)
+        | CoordError::Message(_)) => {
+            warn!(error = %error, "cluster metadata operation failed");
             S3Error::internal()
         }
         CoordError::NotImplemented(message) => S3Error::not_implemented(message),

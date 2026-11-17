@@ -151,9 +151,7 @@ impl RaftNode {
             snapshot_policy: SnapshotPolicy::LogsSinceLast(64),
             ..RaftSettings::default()
         };
-        let settings = settings
-            .validate()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let settings = settings.validate().map_err(CoordError::backend)?;
         let log_store = RaftLogStore::new(store.database());
         let state_machine = RaftStore::new(Arc::clone(&store));
         let raft = Raft::new(
@@ -164,13 +162,13 @@ impl RaftNode {
             state_machine,
         )
         .await
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
+        .map_err(CoordError::backend)?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(raft_config.rpc_timeout.as_duration())
             .read_timeout(raft_config.rpc_timeout.as_duration())
             .build()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+            .map_err(CoordError::backend)?;
         let node = Arc::new(Self {
             raft,
             store,
@@ -188,12 +186,12 @@ impl RaftNode {
                 .raft
                 .is_initialized()
                 .await
-                .map_err(|error| CoordError::Storage(error.to_string()))?
+                .map_err(CoordError::backend)?
         {
             node.raft
                 .initialize(nodes)
                 .await
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::backend)?;
         }
         node.refresh_metrics();
         Ok(node)
@@ -317,11 +315,9 @@ impl RaftNode {
             Err(RaftError::APIError(ClientWriteError::LogEntryDiscarded(error))) => {
                 Err(CoordError::Indeterminate(error.to_string()))
             }
-            Err(RaftError::Fatal(Fatal::StorageError(error))) => {
-                Err(CoordError::Storage(error.to_string()))
-            }
+            Err(RaftError::Fatal(Fatal::StorageError(error))) => Err(CoordError::backend(error)),
             Err(RaftError::Fatal(_)) => Err(CoordError::Unavailable),
-            Err(error) => Err(CoordError::Storage(error.to_string())),
+            Err(error) => Err(CoordError::backend(error)),
         }
     }
 

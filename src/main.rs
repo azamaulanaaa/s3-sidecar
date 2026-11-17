@@ -35,7 +35,8 @@ async fn serve(flags: &ConfigFlags) -> Result<(), String> {
     let node_id = server::telemetry_node_id(&loaded.config);
     let telemetry =
         Telemetry::new(&loaded.config.otel, node_id.as_deref()).map_err(|error| error.message)?;
-    observability::init_with(&loaded.config.otel, telemetry.as_ref())?;
+    observability::init_with(&loaded.config.otel, telemetry.as_ref())
+        .map_err(|error| error.to_string())?;
     server::log_config(&loaded.config, loaded.config_path.as_deref());
     server::serve_with_telemetry(loaded.config, &loaded.warnings, telemetry)
         .await

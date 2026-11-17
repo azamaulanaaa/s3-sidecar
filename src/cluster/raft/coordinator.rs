@@ -70,7 +70,7 @@ impl RaftCoordinator {
     pub fn attach(&self, node: Arc<RaftNode>) -> Result<(), CoordError> {
         self.runtime
             .set(node)
-            .map_err(|_| CoordError::Storage("the raft node is already attached".to_owned()))
+            .map_err(|_| CoordError::Message("the raft node is already attached".to_owned()))
     }
 
     /// Return the running raft node.
@@ -122,7 +122,7 @@ impl RaftCoordinator {
             return self.write_local(node, entry).await;
         }
         let address = node.node_addr(&leader).ok_or_else(|| {
-            CoordError::Storage(format!("no address for raft leader \"{leader}\""))
+            CoordError::Message(format!("no address for raft leader \"{leader}\""))
         })?;
         let url = format!("{}/_raft/propose", address.trim_end_matches('/'));
         let response = node
@@ -151,15 +151,12 @@ impl RaftCoordinator {
             };
         }
         if !response.status().is_success() {
-            return Err(CoordError::Storage(format!(
+            return Err(CoordError::Message(format!(
                 "raft leader returned status {}",
                 response.status()
             )));
         }
-        let reply: ProposeReply = response
-            .json()
-            .await
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let reply: ProposeReply = response.json().await.map_err(CoordError::backend)?;
         applied_from_reply(&reply.log_id, reply.outcome)
     }
 
@@ -168,7 +165,7 @@ impl RaftCoordinator {
             .raft()
             .ensure_linearizable(ReadPolicy::ReadIndex)
             .await
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+            .map_err(CoordError::backend)?;
         Ok(read_log_id.index())
     }
 
@@ -179,7 +176,7 @@ impl RaftCoordinator {
             return self.read_index_local(node).await;
         }
         let address = node.node_addr(&leader).ok_or_else(|| {
-            CoordError::Storage(format!("no address for raft leader \"{leader}\""))
+            CoordError::Message(format!("no address for raft leader \"{leader}\""))
         })?;
         let url = format!("{}/_raft/read_index", address.trim_end_matches('/'));
         let response = node
@@ -198,15 +195,12 @@ impl RaftCoordinator {
             return Err(CoordError::Unavailable);
         }
         if !response.status().is_success() {
-            return Err(CoordError::Storage(format!(
+            return Err(CoordError::Message(format!(
                 "raft leader returned status {}",
                 response.status()
             )));
         }
-        let reply: ReadIndexReply = response
-            .json()
-            .await
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let reply: ReadIndexReply = response.json().await.map_err(CoordError::backend)?;
         Ok(reply.index)
     }
 }
@@ -260,7 +254,7 @@ impl Coordinator for RaftCoordinator {
                 .wait(Some(timeout))
                 .applied_index_at_least(Some(index), "linearizable read barrier")
                 .await
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::backend)?;
             Ok(index)
         })
     }

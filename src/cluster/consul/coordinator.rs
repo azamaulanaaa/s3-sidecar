@@ -314,8 +314,7 @@ impl ConsulCoordinator {
             id: self.config.node_id.clone(),
             addr: self.config.advertise_addr.trim_end_matches('/').to_owned(),
         };
-        let value =
-            serde_json::to_vec(&record).map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = serde_json::to_vec(&record).map_err(CoordError::from)?;
         let acquired = self
             .api
             .acquire(LEADER_KEY, value, &session)
@@ -418,7 +417,7 @@ impl ConsulCoordinator {
             .map_err(|_| CoordError::Unavailable)?;
         match response.status() {
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
-                return Err(CoordError::Storage(
+                return Err(CoordError::Message(
                     "the consul leader rejected the proposal token".to_owned(),
                 ));
             }
@@ -426,16 +425,13 @@ impl ConsulCoordinator {
                 return Err(CoordError::Unavailable);
             }
             status if !status.is_success() => {
-                return Err(CoordError::Storage(format!(
+                return Err(CoordError::Message(format!(
                     "the consul leader returned status {status}"
                 )));
             }
             _ => {}
         }
-        let reply: ProposeReply = response
-            .json()
-            .await
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let reply: ProposeReply = response.json().await.map_err(CoordError::from)?;
         match reply {
             ProposeReply::Applied(applied) => {
                 self.materialize_applied(&entry, &applied)?;
@@ -493,8 +489,7 @@ impl ConsulCoordinator {
             }
             let cas = current_entry.as_ref().map_or(0, |entry| entry.modify_index);
             let metadata = commit_metadata(current.as_ref(), request);
-            let value = serde_json::to_vec(&metadata)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let value = serde_json::to_vec(&metadata).map_err(CoordError::from)?;
             if !self
                 .api
                 .put_cas(&key, value, cas)
@@ -509,7 +504,7 @@ impl ConsulCoordinator {
                 .await
                 .map_err(map_consul)?
                 .ok_or_else(|| {
-                    CoordError::Storage("the committed key is not readable".to_owned())
+                    CoordError::Message("the committed key is not readable".to_owned())
                 })?;
             let mut metadata = decode_metadata(&stored.value)?;
             metadata.version = stored.modify_index;
@@ -541,8 +536,7 @@ impl ConsulCoordinator {
                 .transpose()?;
             let cas = current_entry.as_ref().map_or(0, |entry| entry.modify_index);
             let metadata = tombstone_metadata(current.as_ref(), owner, deleted_at);
-            let value = serde_json::to_vec(&metadata)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let value = serde_json::to_vec(&metadata).map_err(CoordError::from)?;
             if !self
                 .api
                 .put_cas(&path, value, cas)
@@ -556,7 +550,7 @@ impl ConsulCoordinator {
                 .get(&path, true)
                 .await
                 .map_err(map_consul)?
-                .ok_or_else(|| CoordError::Storage("the deleted key is not readable".to_owned()))?;
+                .ok_or_else(|| CoordError::Message("the deleted key is not readable".to_owned()))?;
             let mut metadata = decode_metadata(&stored.value)?;
             metadata.version = stored.modify_index;
             self.store.materialize_metadata(bucket, key, &metadata)?;
@@ -590,8 +584,7 @@ impl ConsulCoordinator {
                 });
             }
             let cas = current.as_ref().map_or(0, |entry| entry.modify_index);
-            let value = serde_json::to_vec(&config)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let value = serde_json::to_vec(&config).map_err(CoordError::from)?;
             if !self
                 .api
                 .put_cas(&path, value, cas)
@@ -699,8 +692,8 @@ impl ConsulCoordinator {
             let Some(bucket) = decode_bucket_key(&entry.key) else {
                 continue;
             };
-            let config: BucketConfigRecord = serde_json::from_slice(&entry.value)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let config: BucketConfigRecord =
+                serde_json::from_slice(&entry.value).map_err(CoordError::from)?;
             self.store.materialize_bucket_config(&bucket, &config)?;
         }
         Ok(())
@@ -884,16 +877,16 @@ fn map_consul(error: ConsulError) -> CoordError {
     if error.is_transport() {
         CoordError::Unavailable
     } else {
-        CoordError::Storage(error.to_string())
+        CoordError::backend(error)
     }
 }
 
 fn parse_leader(entry: &KvEntry) -> Result<LeaderRecord, CoordError> {
-    serde_json::from_slice(&entry.value).map_err(|error| CoordError::Storage(error.to_string()))
+    serde_json::from_slice(&entry.value).map_err(CoordError::from)
 }
 
 fn decode_metadata(value: &[u8]) -> Result<Metadata, CoordError> {
-    serde_json::from_slice(value).map_err(|error| CoordError::Storage(error.to_string()))
+    serde_json::from_slice(value).map_err(CoordError::from)
 }
 
 fn decode_metadata_entry(

@@ -10,6 +10,11 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::config::OtelConfig;
 use crate::telemetry::Telemetry;
 
+/// An error from the tracing setup.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot install tracing: {0}")]
+pub struct ObservabilityError(#[from] tracing_subscriber::util::TryInitError);
+
 /// Install the stderr formatter. This does not start OpenTelemetry.
 pub fn init() {
     let _ = install(&OtelConfig::default(), None);
@@ -20,8 +25,12 @@ pub fn init() {
 /// # Errors
 ///
 /// Returns an error when a subscriber is already installed.
-pub fn init_with(config: &OtelConfig, telemetry: Option<&Telemetry>) -> Result<(), String> {
-    install(config, telemetry).map_err(|error| format!("cannot install tracing: {error}"))
+pub fn init_with(
+    config: &OtelConfig,
+    telemetry: Option<&Telemetry>,
+) -> Result<(), ObservabilityError> {
+    install(config, telemetry)?;
+    Ok(())
 }
 
 fn install(

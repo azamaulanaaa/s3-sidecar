@@ -53,7 +53,7 @@ impl HttpNetworkFactory {
             .connect_timeout(timeout)
             .read_timeout(timeout)
             .build()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+            .map_err(CoordError::backend)?;
         let addresses = config
             .nodes
             .iter()

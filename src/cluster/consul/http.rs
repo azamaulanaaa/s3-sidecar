@@ -56,8 +56,14 @@ pub async fn propose(
         Err(
             CoordError::StaleTerm { .. } | CoordError::Unavailable | CoordError::Indeterminate(_),
         ) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(CoordError::Storage(message)) => {
-            warn!(error = %message, "consul proposal failed");
+        Err(
+            error @ (CoordError::Storage(_)
+            | CoordError::Codec(_)
+            | CoordError::Io(_)
+            | CoordError::Backend(_)
+            | CoordError::Message(_)),
+        ) => {
+            warn!(error = %error, "consul proposal failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
         Err(CoordError::NotImplemented(message)) => {

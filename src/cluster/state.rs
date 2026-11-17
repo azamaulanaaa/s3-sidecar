@@ -302,77 +302,46 @@ impl MetadataStore {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            std::fs::create_dir_all(parent).map_err(CoordError::from)?;
         }
-        let db = Database::create(path).map_err(|error| CoordError::Storage(error.to_string()))?;
+        let db = Database::create(path).map_err(CoordError::from)?;
         {
-            let write = db
-                .begin_write()
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let write = db.begin_write().map_err(CoordError::from)?;
             {
-                write
-                    .open_table(METADATA)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                write.open_table(METADATA).map_err(CoordError::from)?;
             }
             {
-                write
-                    .open_table(BUCKET_CONFIG)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                write.open_table(BUCKET_CONFIG).map_err(CoordError::from)?;
             }
             {
-                write
-                    .open_table(UPLOADS)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                write.open_table(UPLOADS).map_err(CoordError::from)?;
             }
             {
-                write
-                    .open_table(RAFT_LOG)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                write.open_table(RAFT_LOG).map_err(CoordError::from)?;
             }
             {
-                write
-                    .open_table(RAFT_META)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                write.open_table(RAFT_META).map_err(CoordError::from)?;
             }
             {
-                write
-                    .open_table(SNAPSHOT)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                write.open_table(SNAPSHOT).map_err(CoordError::from)?;
             }
             {
-                write
-                    .open_table(REPLICATION)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                write.open_table(REPLICATION).map_err(CoordError::from)?;
             }
             {
-                let mut system = write
-                    .open_table(SYSTEM)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
-                if system
-                    .get(APPLIED_KEY)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?
-                    .is_none()
-                {
-                    system
-                        .insert(APPLIED_KEY, 0)
-                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                let mut system = write.open_table(SYSTEM).map_err(CoordError::from)?;
+                if system.get(APPLIED_KEY).map_err(CoordError::from)?.is_none() {
+                    system.insert(APPLIED_KEY, 0).map_err(CoordError::from)?;
                 }
             }
-            write
-                .commit()
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            write.commit().map_err(CoordError::from)?;
         }
         let applied = {
-            let read = db
-                .begin_read()
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            let system = read
-                .open_table(SYSTEM)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let read = db.begin_read().map_err(CoordError::from)?;
+            let system = read.open_table(SYSTEM).map_err(CoordError::from)?;
             system
                 .get(APPLIED_KEY)
-                .map_err(|error| CoordError::Storage(error.to_string()))?
+                .map_err(CoordError::from)?
                 .map_or(0, |value| value.value())
         };
         Ok(Self {
@@ -394,13 +363,8 @@ impl MetadataStore {
     ///
     /// Returns an error when the database commit fails.
     pub fn flush(&self) -> Result<(), CoordError> {
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        let write = self.db.begin_write().map_err(CoordError::from)?;
+        write.commit().map_err(CoordError::from)
     }
 
     /// Return the last applied index.
@@ -415,21 +379,13 @@ impl MetadataStore {
     ///
     /// Returns an error when the value cannot be read.
     pub fn last_applied_log(&self) -> Result<Option<LogIdOf>, CoordError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(RAFT_META)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let value = table
-            .get(LAST_APPLIED_KEY)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(RAFT_META).map_err(CoordError::from)?;
+        let value = table.get(LAST_APPLIED_KEY).map_err(CoordError::from)?;
         let Some(value) = value else {
             return Ok(None);
         };
-        let log_id = serde_json::from_slice(value.value())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let log_id = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
         Ok(Some(log_id))
     }
 
@@ -439,21 +395,13 @@ impl MetadataStore {
     ///
     /// Returns an error when the value cannot be read.
     pub fn stored_membership(&self) -> Result<StoredMembershipOf, CoordError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(RAFT_META)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let value = table
-            .get(MEMBERSHIP_KEY)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(RAFT_META).map_err(CoordError::from)?;
+        let value = table.get(MEMBERSHIP_KEY).map_err(CoordError::from)?;
         let Some(value) = value else {
             return Ok(StoredMembershipOf::default());
         };
-        let membership = serde_json::from_slice(value.value())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let membership = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
         Ok(membership)
     }
 
@@ -503,7 +451,7 @@ impl MetadataStore {
                 result,
             }),
             ApplyOutcome::Rejected(reason) => Err(CoordError::Rejected(reason)),
-            ApplyOutcome::Duplicate => Err(CoordError::Storage(
+            ApplyOutcome::Duplicate => Err(CoordError::Message(
                 "the reserved applied index was already applied".to_owned(),
             )),
         }
@@ -521,10 +469,7 @@ impl MetadataStore {
         {
             return Ok(ApplyOutcome::Duplicate);
         }
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         let outcome = match entry {
             Entry::Commit { request, .. } => self.write_commit(&write, log_id, request)?,
             Entry::Abort { bucket, key, .. } => {
@@ -543,9 +488,7 @@ impl MetadataStore {
             } => self.write_bucket_config(&write, bucket, *request)?,
         };
         self.write_applied(&write, log_id)?;
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        write.commit().map_err(CoordError::from)?;
         self.applied.store(log_id.index, Ordering::Release);
         Ok(outcome)
     }
@@ -570,24 +513,16 @@ impl MetadataStore {
         {
             return Ok(ApplyOutcome::Duplicate);
         }
-        let value = serde_json::to_vec(membership)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = serde_json::to_vec(membership).map_err(CoordError::from)?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         {
-            let mut table = write
-                .open_table(RAFT_META)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(RAFT_META).map_err(CoordError::from)?;
             table
                 .insert(MEMBERSHIP_KEY, value.as_slice())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::from)?;
         }
         self.write_applied(&write, log_id)?;
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        write.commit().map_err(CoordError::from)?;
         self.applied.store(log_id.index, Ordering::Release);
         Ok(ApplyOutcome::Applied(ApplyResult::Blank))
     }
@@ -608,14 +543,9 @@ impl MetadataStore {
         {
             return Ok(ApplyOutcome::Duplicate);
         }
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         self.write_applied(&write, log_id)?;
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        write.commit().map_err(CoordError::from)?;
         self.applied.store(log_id.index, Ordering::Release);
         Ok(ApplyOutcome::Applied(ApplyResult::Blank))
     }
@@ -720,12 +650,8 @@ impl MetadataStore {
         if read_metadata_in_write(write, &encoded)?
             .is_some_and(|metadata| metadata.state == ObjectState::Pending)
         {
-            let mut table = write
-                .open_table(METADATA)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            table
-                .remove(encoded.as_slice())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(METADATA).map_err(CoordError::from)?;
+            table.remove(encoded.as_slice()).map_err(CoordError::from)?;
         }
         Ok(())
     }
@@ -738,14 +664,11 @@ impl MetadataStore {
         config: BucketConfigRecord,
     ) -> Result<ApplyOutcome, CoordError> {
         let key = encode_component(bucket);
-        let value =
-            serde_json::to_vec(&config).map_err(|error| CoordError::Storage(error.to_string()))?;
-        let mut table = write
-            .open_table(BUCKET_CONFIG)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = serde_json::to_vec(&config).map_err(CoordError::from)?;
+        let mut table = write.open_table(BUCKET_CONFIG).map_err(CoordError::from)?;
         table
             .insert(key.as_slice(), value.as_slice())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+            .map_err(CoordError::from)?;
         Ok(ApplyOutcome::Applied(ApplyResult::BucketConfig(config)))
     }
 
@@ -755,23 +678,18 @@ impl MetadataStore {
         write: &redb::WriteTransaction,
         log_id: &LogIdOf,
     ) -> Result<(), CoordError> {
-        let value =
-            serde_json::to_vec(log_id).map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = serde_json::to_vec(log_id).map_err(CoordError::from)?;
         {
-            let mut table = write
-                .open_table(RAFT_META)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(RAFT_META).map_err(CoordError::from)?;
             table
                 .insert(LAST_APPLIED_KEY, value.as_slice())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::from)?;
         }
         {
-            let mut system = write
-                .open_table(SYSTEM)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut system = write.open_table(SYSTEM).map_err(CoordError::from)?;
             system
                 .insert(APPLIED_KEY, log_id.index)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::from)?;
         }
         Ok(())
     }
@@ -783,21 +701,13 @@ impl MetadataStore {
     /// Returns a storage error.
     pub fn get_metadata(&self, bucket: &str, key: &str) -> Result<Option<Metadata>, CoordError> {
         let encoded = encode_metadata_key(bucket, key);
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(METADATA)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let value = table
-            .get(encoded.as_slice())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(METADATA).map_err(CoordError::from)?;
+        let value = table.get(encoded.as_slice()).map_err(CoordError::from)?;
         let Some(value) = value else {
             return Ok(None);
         };
-        let metadata = serde_json::from_slice(value.value())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let metadata = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
         Ok(Some(metadata))
     }
 
@@ -809,24 +719,18 @@ impl MetadataStore {
     pub fn scan_bucket(&self, bucket: &str) -> Result<Vec<(String, Metadata)>, CoordError> {
         let start = bucket_prefix(bucket);
         let end = bucket_prefix_end(bucket);
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(METADATA)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(METADATA).map_err(CoordError::from)?;
         let range = table
             .range::<&[u8]>(start.as_slice()..end.as_slice())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+            .map_err(CoordError::from)?;
         let mut output = Vec::new();
         for item in range {
-            let (key, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
+            let (key, value) = item.map_err(CoordError::from)?;
             let Some((_, object_key)) = decode_metadata_key(key.value()) else {
                 continue;
             };
-            let metadata = serde_json::from_slice(value.value())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let metadata = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
             output.push((object_key, metadata));
         }
         Ok(output)
@@ -838,24 +742,16 @@ impl MetadataStore {
     ///
     /// Returns a storage error.
     pub fn scan_all(&self) -> Result<Vec<(String, String, Metadata)>, CoordError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(METADATA)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let range = table
-            .range::<&[u8]>(..)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(METADATA).map_err(CoordError::from)?;
+        let range = table.range::<&[u8]>(..).map_err(CoordError::from)?;
         let mut output = Vec::new();
         for item in range {
-            let (key, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
+            let (key, value) = item.map_err(CoordError::from)?;
             let Some((bucket, object_key)) = decode_metadata_key(key.value()) else {
                 continue;
             };
-            let metadata = serde_json::from_slice(value.value())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let metadata = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
             output.push((bucket, object_key, metadata));
         }
         Ok(output)
@@ -868,21 +764,13 @@ impl MetadataStore {
     /// Returns a storage error.
     pub fn bucket_config(&self, bucket: &str) -> Result<Option<BucketConfigRecord>, CoordError> {
         let key = encode_component(bucket);
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(BUCKET_CONFIG)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let value = table
-            .get(key.as_slice())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(BUCKET_CONFIG).map_err(CoordError::from)?;
+        let value = table.get(key.as_slice()).map_err(CoordError::from)?;
         let Some(value) = value else {
             return Ok(None);
         };
-        let record = serde_json::from_slice(value.value())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let record = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
         Ok(Some(record))
     }
 
@@ -896,23 +784,15 @@ impl MetadataStore {
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let value =
-            serde_json::to_vec(record).map_err(|error| CoordError::Storage(error.to_string()))?;
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = serde_json::to_vec(record).map_err(CoordError::from)?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         {
-            let mut table = write
-                .open_table(UPLOADS)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(UPLOADS).map_err(CoordError::from)?;
             table
                 .insert(record.upload_id.as_bytes(), value.as_slice())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Return one multipart upload record.
@@ -921,21 +801,13 @@ impl MetadataStore {
     ///
     /// Returns a storage error.
     pub fn upload(&self, upload_id: &str) -> Result<Option<UploadRecord>, CoordError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(UPLOADS)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let value = table
-            .get(upload_id.as_bytes())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(UPLOADS).map_err(CoordError::from)?;
+        let value = table.get(upload_id.as_bytes()).map_err(CoordError::from)?;
         let Some(value) = value else {
             return Ok(None);
         };
-        let record = serde_json::from_slice(value.value())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let record = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
         Ok(Some(record))
     }
 
@@ -949,21 +821,14 @@ impl MetadataStore {
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         {
-            let mut table = write
-                .open_table(UPLOADS)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(UPLOADS).map_err(CoordError::from)?;
             table
                 .remove(upload_id.as_bytes())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Return every multipart upload record.
@@ -972,21 +837,13 @@ impl MetadataStore {
     ///
     /// Returns a storage error.
     pub fn uploads(&self) -> Result<Vec<UploadRecord>, CoordError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(UPLOADS)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let range = table
-            .range::<&[u8]>(..)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(UPLOADS).map_err(CoordError::from)?;
+        let range = table.range::<&[u8]>(..).map_err(CoordError::from)?;
         let mut output = Vec::new();
         for item in range {
-            let (_, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
-            let record = serde_json::from_slice(value.value())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let (_, value) = item.map_err(CoordError::from)?;
+            let record = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
             output.push(record);
         }
         Ok(output)
@@ -1042,21 +899,12 @@ impl MetadataStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let encoded = encode_metadata_key(bucket, key);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         {
-            let mut table = write
-                .open_table(METADATA)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            table
-                .remove(encoded.as_slice())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(METADATA).map_err(CoordError::from)?;
+            table.remove(encoded.as_slice()).map_err(CoordError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Store one metadata row from a remote coordinator.
@@ -1075,14 +923,9 @@ impl MetadataStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let encoded = encode_metadata_key(bucket, key);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         write_metadata(&write, &encoded, metadata)?;
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Remove one metadata row that the remote coordinator no longer holds.
@@ -1099,23 +942,14 @@ impl MetadataStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let encoded = encode_metadata_key(bucket, key);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         if read_metadata_in_write(&write, &encoded)?
             .is_some_and(|metadata| metadata.state != ObjectState::Pending)
         {
-            let mut table = write
-                .open_table(METADATA)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            table
-                .remove(encoded.as_slice())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(METADATA).map_err(CoordError::from)?;
+            table.remove(encoded.as_slice()).map_err(CoordError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Store one bucket config from a remote coordinator.
@@ -1133,23 +967,15 @@ impl MetadataStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let key = encode_component(bucket);
-        let value =
-            serde_json::to_vec(config).map_err(|error| CoordError::Storage(error.to_string()))?;
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let value = serde_json::to_vec(config).map_err(CoordError::from)?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         {
-            let mut table = write
-                .open_table(BUCKET_CONFIG)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(BUCKET_CONFIG).map_err(CoordError::from)?;
             table
                 .insert(key.as_slice(), value.as_slice())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Add a pending row for an in-flight multipart upload.
@@ -1169,10 +995,7 @@ impl MetadataStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let encoded = encode_metadata_key(bucket, key);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         if read_metadata_in_write(&write, &encoded)?.is_some() {
             return Ok(());
         }
@@ -1199,9 +1022,7 @@ impl MetadataStore {
             storage_class: None,
         };
         write_metadata(&write, &encoded, &metadata)?;
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Remove a pending row for one key.
@@ -1215,23 +1036,14 @@ impl MetadataStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let encoded = encode_metadata_key(bucket, key);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         if read_metadata_in_write(&write, &encoded)?
             .is_some_and(|metadata| metadata.state == ObjectState::Pending)
         {
-            let mut table = write
-                .open_table(METADATA)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            table
-                .remove(encoded.as_slice())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(METADATA).map_err(CoordError::from)?;
+            table.remove(encoded.as_slice()).map_err(CoordError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Return one replication job.
@@ -1240,21 +1052,13 @@ impl MetadataStore {
     ///
     /// Returns a storage error.
     pub fn replication_job(&self, uuid: &str) -> Result<Option<ReplicationJob>, CoordError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(REPLICATION)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let value = table
-            .get(uuid.as_bytes())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(REPLICATION).map_err(CoordError::from)?;
+        let value = table.get(uuid.as_bytes()).map_err(CoordError::from)?;
         let Some(value) = value else {
             return Ok(None);
         };
-        let job = serde_json::from_slice(value.value())
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let job = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
         Ok(Some(job))
     }
 
@@ -1271,10 +1075,7 @@ impl MetadataStore {
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         let existing = read_replication_job_in_write(&write, &job.uuid)?;
         let merged = match (existing, job.op) {
             (Some(existing), ReplicationOp::Put) if existing.op == ReplicationOp::Put => {
@@ -1295,9 +1096,7 @@ impl MetadataStore {
             _ => job.clone(),
         };
         write_replication_job(&write, &merged)?;
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Remove one replication job.
@@ -1310,21 +1109,12 @@ impl MetadataStore {
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         {
-            let mut table = write
-                .open_table(REPLICATION)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            table
-                .remove(uuid.as_bytes())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(REPLICATION).map_err(CoordError::from)?;
+            table.remove(uuid.as_bytes()).map_err(CoordError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Claim one due replication job for the lease period.
@@ -1346,22 +1136,15 @@ impl MetadataStore {
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         let candidates = {
-            let table = write
-                .open_table(REPLICATION)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            let range = table
-                .range::<&[u8]>(..)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let table = write.open_table(REPLICATION).map_err(CoordError::from)?;
+            let range = table.range::<&[u8]>(..).map_err(CoordError::from)?;
             let mut found = None;
             for item in range {
-                let (_, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
-                let job: ReplicationJob = serde_json::from_slice(value.value())
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                let (_, value) = item.map_err(CoordError::from)?;
+                let job: ReplicationJob =
+                    serde_json::from_slice(value.value()).map_err(CoordError::from)?;
                 if job.next_at > now || job.is_leased(now) {
                     continue;
                 }
@@ -1380,9 +1163,7 @@ impl MetadataStore {
         leased.lease_owner = Some(owner.to_owned());
         leased.lease_expires_at = Some(now.saturating_add(lease));
         write_replication_job(&write, &leased)?;
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        write.commit().map_err(CoordError::from)?;
         Ok(Some(job))
     }
 
@@ -1396,10 +1177,7 @@ impl MetadataStore {
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         let Some(mut job) = read_replication_job_in_write(&write, uuid)? else {
             return Ok(());
         };
@@ -1408,24 +1186,17 @@ impl MetadataStore {
             job.done.push(target.to_owned());
         }
         {
-            let mut table = write
-                .open_table(REPLICATION)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(REPLICATION).map_err(CoordError::from)?;
             if job.targets.is_empty() {
-                table
-                    .remove(uuid.as_bytes())
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                table.remove(uuid.as_bytes()).map_err(CoordError::from)?;
             } else {
-                let value = serde_json::to_vec(&job)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                let value = serde_json::to_vec(&job).map_err(CoordError::from)?;
                 table
                     .insert(uuid.as_bytes(), value.as_slice())
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                    .map_err(CoordError::from)?;
             }
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Set the retry time for one replication job.
@@ -1443,10 +1214,7 @@ impl MetadataStore {
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         let Some(mut job) = read_replication_job_in_write(&write, uuid)? else {
             return Ok(());
         };
@@ -1455,9 +1223,7 @@ impl MetadataStore {
         job.lease_owner = None;
         job.lease_expires_at = None;
         write_replication_job(&write, &job)?;
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Return every replication job.
@@ -1466,21 +1232,13 @@ impl MetadataStore {
     ///
     /// Returns a storage error.
     pub fn replication_jobs(&self) -> Result<Vec<ReplicationJob>, CoordError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(REPLICATION)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let range = table
-            .range::<&[u8]>(..)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(REPLICATION).map_err(CoordError::from)?;
+        let range = table.range::<&[u8]>(..).map_err(CoordError::from)?;
         let mut output = Vec::new();
         for item in range {
-            let (_, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
-            let job = serde_json::from_slice(value.value())
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let (_, value) = item.map_err(CoordError::from)?;
+            let job = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
             output.push(job);
         }
         Ok(output)
@@ -1526,25 +1284,17 @@ impl MetadataStore {
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
         let mut objects = Vec::new();
         {
-            let table = read
-                .open_table(METADATA)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            let range = table
-                .range::<&[u8]>(..)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let table = read.open_table(METADATA).map_err(CoordError::from)?;
+            let range = table.range::<&[u8]>(..).map_err(CoordError::from)?;
             for item in range {
-                let (key, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
+                let (key, value) = item.map_err(CoordError::from)?;
                 let Some((bucket, object_key)) = decode_metadata_key(key.value()) else {
                     continue;
                 };
-                let metadata = serde_json::from_slice(value.value())
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                let metadata = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
                 objects.push(ObjectRecord {
                     bucket,
                     key: object_key,
@@ -1554,62 +1304,38 @@ impl MetadataStore {
         }
         let mut buckets = Vec::new();
         {
-            let table = read
-                .open_table(BUCKET_CONFIG)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            let range = table
-                .range::<&[u8]>(..)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let table = read.open_table(BUCKET_CONFIG).map_err(CoordError::from)?;
+            let range = table.range::<&[u8]>(..).map_err(CoordError::from)?;
             for item in range {
-                let (key, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
+                let (key, value) = item.map_err(CoordError::from)?;
                 let bucket = decode_component(key.value());
-                let config = serde_json::from_slice(value.value())
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                let config = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
                 buckets.push(BucketRecord { bucket, config });
             }
         }
         let uploads = {
-            let table = read
-                .open_table(UPLOADS)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            let range = table
-                .range::<&[u8]>(..)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let table = read.open_table(UPLOADS).map_err(CoordError::from)?;
+            let range = table.range::<&[u8]>(..).map_err(CoordError::from)?;
             let mut output = Vec::new();
             for item in range {
-                let (_, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
-                let record = serde_json::from_slice(value.value())
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                let (_, value) = item.map_err(CoordError::from)?;
+                let record = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
                 output.push(record);
             }
             output
         };
         let last_applied = {
-            let table = read
-                .open_table(RAFT_META)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            let value = table
-                .get(LAST_APPLIED_KEY)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let table = read.open_table(RAFT_META).map_err(CoordError::from)?;
+            let value = table.get(LAST_APPLIED_KEY).map_err(CoordError::from)?;
             value
-                .map(|value| {
-                    serde_json::from_slice(value.value())
-                        .map_err(|error| CoordError::Storage(error.to_string()))
-                })
+                .map(|value| serde_json::from_slice(value.value()).map_err(CoordError::from))
                 .transpose()?
         };
         let membership = {
-            let table = read
-                .open_table(RAFT_META)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            let value = table
-                .get(MEMBERSHIP_KEY)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let table = read.open_table(RAFT_META).map_err(CoordError::from)?;
+            let value = table.get(MEMBERSHIP_KEY).map_err(CoordError::from)?;
             value
-                .map(|value| {
-                    serde_json::from_slice(value.value())
-                        .map_err(|error| CoordError::Storage(error.to_string()))
-                })
+                .map(|value| serde_json::from_slice(value.value()).map_err(CoordError::from))
                 .transpose()?
         };
         let export = StateExport {
@@ -1619,7 +1345,7 @@ impl MetadataStore {
             last_applied,
             membership,
         };
-        serde_json::to_vec(&export).map_err(|error| CoordError::Storage(error.to_string()))
+        serde_json::to_vec(&export).map_err(CoordError::from)
     }
 
     /// Replace the applied state from snapshot JSON bytes.
@@ -1644,119 +1370,86 @@ impl MetadataStore {
 
     #[allow(clippy::too_many_lines)]
     fn install_state_record(&self, bytes: &[u8], record: Option<&[u8]>) -> Result<(), CoordError> {
-        let export: StateExport = serde_json::from_slice(bytes)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let export: StateExport = serde_json::from_slice(bytes).map_err(CoordError::from)?;
         let _guard = self
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         {
-            let mut table = write
-                .open_table(METADATA)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            table
-                .retain(|_, _| false)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(METADATA).map_err(CoordError::from)?;
+            table.retain(|_, _| false).map_err(CoordError::from)?;
             for object in &export.objects {
                 let key = encode_metadata_key(&object.bucket, &object.key);
-                let value = serde_json::to_vec(&object.metadata)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                let value = serde_json::to_vec(&object.metadata).map_err(CoordError::from)?;
                 table
                     .insert(key.as_slice(), value.as_slice())
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                    .map_err(CoordError::from)?;
             }
         }
         {
-            let mut table = write
-                .open_table(BUCKET_CONFIG)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            table
-                .retain(|_, _| false)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(BUCKET_CONFIG).map_err(CoordError::from)?;
+            table.retain(|_, _| false).map_err(CoordError::from)?;
             for bucket in &export.buckets {
                 let key = encode_component(&bucket.bucket);
-                let value = serde_json::to_vec(&bucket.config)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                let value = serde_json::to_vec(&bucket.config).map_err(CoordError::from)?;
                 table
                     .insert(key.as_slice(), value.as_slice())
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                    .map_err(CoordError::from)?;
             }
         }
         {
-            let mut table = write
-                .open_table(UPLOADS)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
-            table
-                .retain(|_, _| false)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(UPLOADS).map_err(CoordError::from)?;
+            table.retain(|_, _| false).map_err(CoordError::from)?;
             for upload in &export.uploads {
-                let value = serde_json::to_vec(upload)
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                let value = serde_json::to_vec(upload).map_err(CoordError::from)?;
                 table
                     .insert(upload.upload_id.as_bytes(), value.as_slice())
-                    .map_err(|error| CoordError::Storage(error.to_string()))?;
+                    .map_err(CoordError::from)?;
             }
         }
         {
-            let mut table = write
-                .open_table(RAFT_META)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(RAFT_META).map_err(CoordError::from)?;
             match &export.last_applied {
                 Some(log_id) => {
-                    let value = serde_json::to_vec(log_id)
-                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                    let value = serde_json::to_vec(log_id).map_err(CoordError::from)?;
                     table
                         .insert(LAST_APPLIED_KEY, value.as_slice())
-                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                        .map_err(CoordError::from)?;
                 }
                 None => {
-                    table
-                        .remove(LAST_APPLIED_KEY)
-                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                    table.remove(LAST_APPLIED_KEY).map_err(CoordError::from)?;
                 }
             }
             match &export.membership {
                 Some(membership) => {
-                    let value = serde_json::to_vec(membership)
-                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                    let value = serde_json::to_vec(membership).map_err(CoordError::from)?;
                     table
                         .insert(MEMBERSHIP_KEY, value.as_slice())
-                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                        .map_err(CoordError::from)?;
                 }
                 None => {
-                    table
-                        .remove(MEMBERSHIP_KEY)
-                        .map_err(|error| CoordError::Storage(error.to_string()))?;
+                    table.remove(MEMBERSHIP_KEY).map_err(CoordError::from)?;
                 }
             }
         }
         {
-            let mut system = write
-                .open_table(SYSTEM)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut system = write.open_table(SYSTEM).map_err(CoordError::from)?;
             let index = export
                 .last_applied
                 .as_ref()
                 .map_or(0, |log_id| log_id.index);
             system
                 .insert(APPLIED_KEY, index)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::from)?;
         }
         if let Some(record) = record {
-            let mut table = write
-                .open_table(SNAPSHOT)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(SNAPSHOT).map_err(CoordError::from)?;
             table
                 .insert(SNAPSHOT_KEY, record)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        write.commit().map_err(CoordError::from)?;
         let index = export
             .last_applied
             .as_ref()
@@ -1771,21 +1464,14 @@ impl MetadataStore {
     ///
     /// Returns a storage error.
     pub fn put_snapshot(&self, bytes: &[u8]) -> Result<(), CoordError> {
-        let write = self
-            .db
-            .begin_write()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let write = self.db.begin_write().map_err(CoordError::from)?;
         {
-            let mut table = write
-                .open_table(SNAPSHOT)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+            let mut table = write.open_table(SNAPSHOT).map_err(CoordError::from)?;
             table
                 .insert(SNAPSHOT_KEY, bytes)
-                .map_err(|error| CoordError::Storage(error.to_string()))?;
+                .map_err(CoordError::from)?;
         }
-        write
-            .commit()
-            .map_err(|error| CoordError::Storage(error.to_string()))
+        write.commit().map_err(CoordError::from)
     }
 
     /// Return the latest snapshot record.
@@ -1794,16 +1480,9 @@ impl MetadataStore {
     ///
     /// Returns a storage error.
     pub fn snapshot(&self) -> Result<Option<Vec<u8>>, CoordError> {
-        let read = self
-            .db
-            .begin_read()
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let table = read
-            .open_table(SNAPSHOT)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
-        let value = table
-            .get(SNAPSHOT_KEY)
-            .map_err(|error| CoordError::Storage(error.to_string()))?;
+        let read = self.db.begin_read().map_err(CoordError::from)?;
+        let table = read.open_table(SNAPSHOT).map_err(CoordError::from)?;
+        let value = table.get(SNAPSHOT_KEY).map_err(CoordError::from)?;
         Ok(value.map(|value| value.value().to_vec()))
     }
 }
@@ -1812,17 +1491,12 @@ fn read_metadata_in_write(
     write: &redb::WriteTransaction,
     key: &[u8],
 ) -> Result<Option<Metadata>, CoordError> {
-    let table = write
-        .open_table(METADATA)
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
-    let value = table
-        .get(key)
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    let table = write.open_table(METADATA).map_err(CoordError::from)?;
+    let value = table.get(key).map_err(CoordError::from)?;
     let Some(value) = value else {
         return Ok(None);
     };
-    let metadata = serde_json::from_slice(value.value())
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    let metadata = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
     Ok(Some(metadata))
 }
 
@@ -1830,17 +1504,12 @@ fn read_replication_job_in_write(
     write: &redb::WriteTransaction,
     uuid: &str,
 ) -> Result<Option<ReplicationJob>, CoordError> {
-    let table = write
-        .open_table(REPLICATION)
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
-    let value = table
-        .get(uuid.as_bytes())
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    let table = write.open_table(REPLICATION).map_err(CoordError::from)?;
+    let value = table.get(uuid.as_bytes()).map_err(CoordError::from)?;
     let Some(value) = value else {
         return Ok(None);
     };
-    let job = serde_json::from_slice(value.value())
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    let job = serde_json::from_slice(value.value()).map_err(CoordError::from)?;
     Ok(Some(job))
 }
 
@@ -1848,13 +1517,11 @@ fn write_replication_job(
     write: &redb::WriteTransaction,
     job: &ReplicationJob,
 ) -> Result<(), CoordError> {
-    let value = serde_json::to_vec(job).map_err(|error| CoordError::Storage(error.to_string()))?;
-    let mut table = write
-        .open_table(REPLICATION)
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    let value = serde_json::to_vec(job).map_err(CoordError::from)?;
+    let mut table = write.open_table(REPLICATION).map_err(CoordError::from)?;
     table
         .insert(job.uuid.as_bytes(), value.as_slice())
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
+        .map_err(CoordError::from)?;
     Ok(())
 }
 
@@ -1863,14 +1530,11 @@ fn write_metadata(
     key: &[u8],
     metadata: &Metadata,
 ) -> Result<(), CoordError> {
-    let value =
-        serde_json::to_vec(metadata).map_err(|error| CoordError::Storage(error.to_string()))?;
-    let mut table = write
-        .open_table(METADATA)
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
+    let value = serde_json::to_vec(metadata).map_err(CoordError::from)?;
+    let mut table = write.open_table(METADATA).map_err(CoordError::from)?;
     table
         .insert(key, value.as_slice())
-        .map_err(|error| CoordError::Storage(error.to_string()))?;
+        .map_err(CoordError::from)?;
     Ok(())
 }
 

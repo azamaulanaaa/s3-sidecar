@@ -78,7 +78,15 @@ impl fmt::Display for StorageError {
     }
 }
 
-impl std::error::Error for StorageError {}
+impl std::error::Error for StorageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sign(error) => Some(error),
+            Self::Transport(error) => Some(error),
+            Self::Status(_) | Self::Body | Self::TooLarge | Self::Timeout => None,
+        }
+    }
+}
 
 /// An S3 client for one endpoint.
 #[derive(Clone)]
@@ -411,7 +419,31 @@ fn backoff(attempt: u32, retry_after: Option<Duration>) -> Duration {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::encode_dot_segments;
+    use axum::http::StatusCode;
+
+    use super::{StorageError, encode_dot_segments};
+    use crate::errors::S3Error;
+
+    #[test]
+    fn sign_error_keeps_the_source() {
+        let error = StorageError::Sign(S3Error::internal());
+        let source = std::error::Error::source(&error).unwrap();
+        assert!(source.downcast_ref::<S3Error>().is_some());
+    }
+
+    #[test]
+    fn transport_error_keeps_the_source() {
+        let request_error = reqwest::Client::new().get("not a url").build().unwrap_err();
+        let error = StorageError::Transport(request_error);
+        let source = std::error::Error::source(&error).unwrap();
+        assert!(source.downcast_ref::<reqwest::Error>().is_some());
+    }
+
+    #[test]
+    fn status_error_has_no_source() {
+        let error = StorageError::Status(StatusCode::NOT_FOUND);
+        assert!(std::error::Error::source(&error).is_none());
+    }
 
     #[test]
     fn dot_segments_survive_url_parsing() {

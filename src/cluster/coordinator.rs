@@ -51,12 +51,57 @@ pub enum CoordError {
     /// The cluster changed leader and the commit status is unknown.
     #[error("the commit status is unknown: {0}")]
     Indeterminate(String),
-    /// The metadata store or raft backend failed.
+    /// The metadata store failed.
     #[error("the metadata store failed: {0}")]
-    Storage(String),
+    Storage(#[from] redb::Error),
+    /// The backend could not encode or decode a stored record.
+    #[error("the stored record is not valid: {0}")]
+    Codec(#[from] serde_json::Error),
+    /// A file operation failed.
+    #[error("a file operation failed: {0}")]
+    Io(#[from] std::io::Error),
+    /// A backend operation failed.
+    #[error("a backend operation failed: {0}")]
+    Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A coordination problem that carries no source error.
+    #[error("{0}")]
+    Message(String),
     /// The backend is not part of this build.
     #[error("{0}")]
     NotImplemented(&'static str),
+}
+
+impl CoordError {
+    /// Wrap a backend error and keep it as the source.
+    pub fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Backend(Box::new(error))
+    }
+}
+
+macro_rules! impl_from_redb {
+    ($($error:ty),+ $(,)?) => {
+        $(
+            impl From<$error> for CoordError {
+                fn from(error: $error) -> Self {
+                    Self::Storage(redb::Error::from(error))
+                }
+            }
+        )+
+    };
+}
+
+impl_from_redb!(
+    redb::DatabaseError,
+    redb::TransactionError,
+    redb::TableError,
+    redb::StorageError,
+    redb::CommitError,
+);
+
+impl From<reqwest::Error> for CoordError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::backend(error)
+    }
 }
 
 /// A commit proposal.
@@ -312,6 +357,40 @@ mod tests {
             storage_class: None,
             committed_at: 10,
         }
+    }
+
+    #[test]
+    fn codec_error_keeps_the_source() {
+        let source = serde_json::from_str::<u8>("not json").unwrap_err();
+        let error: CoordError = source.into();
+        assert!(matches!(error, CoordError::Codec(_)));
+        let reported = std::error::Error::source(&error).unwrap();
+        assert!(reported.downcast_ref::<serde_json::Error>().is_some());
+    }
+
+    #[test]
+    fn storage_error_keeps_the_source() {
+        let io_error = std::io::Error::other("disk failure");
+        let source = redb::Error::from(io_error);
+        let error: CoordError = source.into();
+        assert!(matches!(error, CoordError::Storage(_)));
+        let reported = std::error::Error::source(&error).unwrap();
+        assert!(reported.downcast_ref::<redb::Error>().is_some());
+    }
+
+    #[test]
+    fn io_error_keeps_the_source() {
+        let error: CoordError = std::io::Error::other("disk failure").into();
+        assert!(matches!(error, CoordError::Io(_)));
+        let reported = std::error::Error::source(&error).unwrap();
+        assert!(reported.downcast_ref::<std::io::Error>().is_some());
+    }
+
+    #[test]
+    fn backend_error_keeps_the_source() {
+        let error = CoordError::backend(std::io::Error::other("backend failure"));
+        let reported = std::error::Error::source(&error).unwrap();
+        assert!(reported.downcast_ref::<std::io::Error>().is_some());
     }
 
     #[test]
