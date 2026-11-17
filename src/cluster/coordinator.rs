@@ -11,7 +11,7 @@ use openraft::vote::RaftLeaderId;
 use super::raft::CommittedLeaderIdOf;
 
 use super::raft::LogIdOf;
-use super::state::{Applied, ApplyOutcome, BucketConfigRecord, MetadataStore};
+use super::state::{Applied, BucketConfigRecord, MetadataStore};
 
 /// Reason that the state machine rejected an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -266,21 +266,7 @@ impl Coordinator for SingleNode {
                     actual: term,
                 });
             }
-            let index = self.state.applied_index().saturating_add(1);
-            let outcome = self.state.apply_entry(&local_log_id(term, index), &entry)?;
-            match outcome {
-                ApplyOutcome::Applied(result) => Ok(Applied {
-                    index,
-                    term,
-                    result,
-                }),
-                ApplyOutcome::Rejected(reason) => Err(CoordError::Rejected(reason)),
-                ApplyOutcome::Duplicate => Ok(Applied {
-                    index: self.state.applied_index(),
-                    term,
-                    result: super::state::ApplyResult::Blank,
-                }),
-            }
+            self.state.apply_next(term, local_log_id, &entry)
         })
     }
 
@@ -288,5 +274,93 @@ impl Coordinator for SingleNode {
         self.metrics.read_index_called();
         let index = self.state.applied_index();
         Box::pin(async move { Ok(index) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Barrier;
+    use std::thread;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::cluster::state::ApplyResult;
+
+    fn commit_request(key: &str) -> CommitRequest {
+        CommitRequest {
+            bucket: "media".to_owned(),
+            key: key.to_owned(),
+            base_version: 0,
+            blob: format!("blob-{key}"),
+            size: 1,
+            checksum: "checksum".to_owned(),
+            content_type: None,
+            etag: "etag".to_owned(),
+            user_metadata: BTreeMap::new(),
+            owner: "a".to_owned(),
+            replicas: vec!["a".to_owned()],
+            if_none_match: false,
+            if_match: None,
+            cache_control: None,
+            content_encoding: None,
+            content_disposition: None,
+            content_language: None,
+            expires: None,
+            storage_class: None,
+            committed_at: 10,
+        }
+    }
+
+    #[test]
+    fn concurrent_single_node_proposals_get_unique_indexes() {
+        let dir = tempdir().unwrap();
+        let state = Arc::new(MetadataStore::open(&dir.path().join("meta.redb")).unwrap());
+        let meter = opentelemetry::global::meter("single-node-race-test");
+        let metrics = Arc::new(crate::metrics::Metrics::new(&meter));
+        let node = Arc::new(SingleNode::new(state, metrics));
+        let barrier = Arc::new(Barrier::new(2));
+        let rounds = 32usize;
+
+        let workers: Vec<_> = (0..2)
+            .map(|worker| {
+                let node = Arc::clone(&node);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .build()
+                        .unwrap();
+                    let mut applied = Vec::new();
+                    for round in 0..rounds {
+                        let key = format!("worker-{worker}-round-{round}");
+                        let entry = Entry::Commit {
+                            term: 1,
+                            request: Box::new(commit_request(&key)),
+                        };
+                        barrier.wait();
+                        applied.push(runtime.block_on(node.propose(entry)).unwrap());
+                    }
+                    applied
+                })
+            })
+            .collect();
+
+        let all: Vec<Applied> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        let expected = u64::try_from(rounds * 2).unwrap();
+        assert_eq!(all.len(), rounds * 2);
+        let mut indexes: Vec<u64> = all.iter().map(|applied| applied.index).collect();
+        indexes.sort_unstable();
+        indexes.dedup();
+        assert_eq!(indexes.len(), rounds * 2);
+        assert!(
+            all.iter()
+                .all(|applied| matches!(applied.result, ApplyResult::Commit(_)))
+        );
+        assert_eq!(node.applied_index(), expected);
     }
 }

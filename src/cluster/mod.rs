@@ -575,6 +575,7 @@ impl Cluster {
                 }
                 self.refresh_metrics();
                 let ApplyResult::Commit(metadata) = applied.result else {
+                    self.discard_staged_blob(blob, &acked).await;
                     return Err(S3Error::internal());
                 };
                 if policy == WriteAck::Leader {

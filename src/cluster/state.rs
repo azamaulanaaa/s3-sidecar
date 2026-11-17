@@ -453,6 +453,51 @@ impl MetadataStore {
             .write_lock
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        self.apply_entry_locked(log_id, entry)
+    }
+
+    /// Apply one entry at the next applied index.
+    ///
+    /// This method holds the write lock while it allocates the index and
+    /// applies the entry. Concurrent callers get unique, increasing indexes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state machine rejects the entry or the
+    /// storage layer fails.
+    pub fn apply_next(
+        &self,
+        term: u64,
+        log_id_of: impl FnOnce(u64, u64) -> LogIdOf,
+        entry: &Entry,
+    ) -> Result<Applied, CoordError> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let index = self
+            .last_applied_log()?
+            .map_or(1, |applied| applied.index.saturating_add(1));
+        let log_id = log_id_of(term, index);
+        match self.apply_entry_locked(&log_id, entry)? {
+            ApplyOutcome::Applied(result) => Ok(Applied {
+                index,
+                term,
+                result,
+            }),
+            ApplyOutcome::Rejected(reason) => Err(CoordError::Rejected(reason)),
+            ApplyOutcome::Duplicate => Err(CoordError::Storage(
+                "the reserved applied index was already applied".to_owned(),
+            )),
+        }
+    }
+
+    /// Apply one log entry while the caller holds the write lock.
+    fn apply_entry_locked(
+        &self,
+        log_id: &LogIdOf,
+        entry: &Entry,
+    ) -> Result<ApplyOutcome, CoordError> {
         if self
             .last_applied_log()?
             .is_some_and(|applied| log_id.index <= applied.index)
