@@ -637,6 +637,62 @@ async fn reconcile_restores_a_missing_owner_blob() {
 }
 
 #[tokio::test]
+async fn reconcile_repairs_a_missing_replica_from_a_non_replica_node() {
+    // Two replicas on three nodes. The node outside the replica set holds no
+    // local blob. Reconcile on that node must still repair a missing replica.
+    let cluster = spawn_cluster(ReadMode::Local, 2, false).await;
+    let client = client_request();
+    let url = format!("{}/media/reconcile-outsider", cluster.node("a").url);
+    assert_eq!(
+        put(&client, &url, b"outsider-repair").await.status(),
+        StatusCode::OK
+    );
+    wait_metadata(&cluster, "reconcile-outsider", Duration::from_secs(10)).await;
+    let before = metadata(&cluster, "a", "reconcile-outsider");
+    assert_eq!(before.replicas.len(), 2);
+    let blob = before.blob.clone();
+    for replica in &before.replicas {
+        wait_present(
+            &cluster.node(replica).backing,
+            &blob,
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+    wait_queue_empty(&cluster, Duration::from_secs(10)).await;
+
+    let outsider = ["a", "b", "c"]
+        .into_iter()
+        .find(|node| !before.replicas.iter().any(|value| value == node))
+        .unwrap();
+    let broken = before
+        .replicas
+        .iter()
+        .find(|node| **node != "a")
+        .unwrap()
+        .clone();
+    assert!(!cluster.node(outsider).backing.has(&blob));
+    cluster.node(&broken).backing.remove(&blob);
+    assert!(!cluster.node(&broken).backing.has(&blob));
+
+    cluster
+        .node(outsider)
+        .state
+        .cluster()
+        .unwrap()
+        .reconcile_once()
+        .await
+        .unwrap();
+    wait_present(
+        &cluster.node(&broken).backing,
+        &blob,
+        Duration::from_secs(10),
+    )
+    .await;
+    wait_queue_empty(&cluster, Duration::from_secs(10)).await;
+}
+
+#[tokio::test]
 async fn read_repair_stores_the_blob_when_enabled() {
     let cluster = spawn_cluster(ReadMode::LocalThenPeer, 2, true).await;
     let client = client_request();

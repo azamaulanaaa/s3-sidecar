@@ -453,8 +453,8 @@ impl Cluster {
             .is_ok_and(|response| response.status().is_success())
     }
 
-    /// Restore a missing owner blob from one reachable replica.
-    async fn repair_owner_blob(&self, metadata: &Metadata) -> bool {
+    /// Fetch the blob from one reachable replica into the local backing store.
+    async fn fetch_blob_from_replica(&self, metadata: &Metadata) -> bool {
         for node in &metadata.replicas {
             if node == &self.node_id {
                 continue;
@@ -470,6 +470,11 @@ impl Cluster {
             }
         }
         false
+    }
+
+    /// Restore a missing owner blob from one reachable replica.
+    async fn repair_owner_blob(&self, metadata: &Metadata) -> bool {
+        self.fetch_blob_from_replica(metadata).await
     }
 
     async fn copy_peer_blob(&self, address: &str, metadata: &Metadata) -> bool {
@@ -705,10 +710,11 @@ impl Cluster {
             } else {
                 metadata.replicas.clone()
             };
+            let mut local_has_blob = self.head_blob(&metadata.blob).await.is_some();
             for target in intended {
                 checked = checked.saturating_add(1);
                 let found = if target == self.node_id {
-                    self.head_blob(&metadata.blob).await.is_some()
+                    local_has_blob
                 } else if let Some(address) = self.config.cluster.node_addr(&target) {
                     self.peer_head(address, &metadata.blob).await
                 } else {
@@ -728,12 +734,17 @@ impl Cluster {
                         self.metrics.owner_blob_repaired();
                         present = present.saturating_add(1);
                         missing = missing.saturating_sub(1);
+                        local_has_blob = true;
                     } else if metadata.owner == self.node_id && repairs < OWNER_REPAIR_BATCH {
                         repairs = repairs.saturating_add(1);
                         self.metrics.owner_blob_unrecoverable();
                     }
                     continue;
                 }
+                if !local_has_blob && !self.fetch_blob_from_replica(metadata).await {
+                    continue;
+                }
+                local_has_blob = true;
                 let now = unix_now();
                 let job = ReplicationJob {
                     uuid: metadata.blob.clone(),
