@@ -68,6 +68,9 @@ pub struct LoadedConfig {
 
 const ENV_PREFIX: &str = "S3_SIDECAR_";
 
+/// Flags-layer key for bucket names from `--bucket`.
+pub(crate) const BUCKETS_ADD_KEY: &str = "__buckets_add";
+
 /// Load and validate the configuration.
 ///
 /// # Errors
@@ -98,13 +101,10 @@ pub fn load(options: &LoadOptions) -> Result<LoadedConfig, ConfigError> {
     let env_layer = build_env_layer(&options.env)?;
     merge(&mut merged, env_layer, Source::Env, "", &mut sources);
 
-    merge(
-        &mut merged,
-        options.flags.clone(),
-        Source::Flag,
-        "",
-        &mut sources,
-    );
+    let mut flags = options.flags.clone();
+    let bucket_names = take_bucket_names(&mut flags);
+    merge(&mut merged, flags, Source::Flag, "", &mut sources);
+    append_bucket_names(&mut merged, &bucket_names, &mut sources);
 
     let config: Config = serde_json::from_value(merged)
         .map_err(|error| ConfigError::Deserialize(error.to_string()))?;
@@ -453,6 +453,55 @@ fn merge(base: &mut Value, overlay: Value, source: Source, prefix: &str, sources
     }
 }
 
+/// Remove bucket names added by `--bucket` from the flags layer.
+fn take_bucket_names(flags: &mut Value) -> Vec<String> {
+    let Some(object) = flags.as_object_mut() else {
+        return Vec::new();
+    };
+    let Some(value) = object.remove(BUCKETS_ADD_KEY) else {
+        return Vec::new();
+    };
+    let Value::Array(items) = value else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter_map(|item| item.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Add bucket names to the merged configuration without replacing other buckets.
+fn append_bucket_names(merged: &mut Value, names: &[String], sources: &mut SourceMap) {
+    if names.is_empty() {
+        return;
+    }
+    let Some(object) = merged.as_object_mut() else {
+        return;
+    };
+    let buckets = object
+        .entry("buckets")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Value::Array(items) = buckets else {
+        return;
+    };
+    for name in names {
+        let exists = items
+            .iter()
+            .any(|item| item.get("name").and_then(Value::as_str) == Some(name.as_str()));
+        if exists {
+            continue;
+        }
+        let index = items.len();
+        items.push(json!({ "name": name }));
+        record_sources(
+            &items[index],
+            Source::Flag,
+            &format!("buckets[{index}]"),
+            sources,
+        );
+    }
+}
+
 fn record_sources(value: &Value, source: Source, path: &str, sources: &mut SourceMap) {
     match value {
         Value::Object(map) => {
@@ -540,6 +589,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{LoadOptions, Source, load, test_cache_flags};
+    use crate::cli::ConfigFlags;
     use crate::config::secret::SecretString;
 
     fn load_with(
@@ -604,6 +654,53 @@ name = "filebucket"
         assert_eq!(loaded.sources.get("server.bind"), Some(&Source::Flag));
         assert_eq!(loaded.sources.get("origin.endpoint"), Some(&Source::Env));
         assert_eq!(loaded.sources.get("buckets"), Some(&Source::Env));
+    }
+
+    #[test]
+    fn bucket_flag_adds_name_to_configured_buckets() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidecar.toml");
+        let file = r#"
+[cache]
+endpoint = "http://127.0.0.1:9002"
+bucket = "cache"
+max_bytes = 0
+[[buckets]]
+name = "media"
+ttl = "1h"
+cache_mode = "read"
+write_ack = "all"
+replicas = 3
+min_replicas = 2
+"#;
+        std::fs::write(&path, file).unwrap();
+        let flags = ConfigFlags {
+            bucket: vec!["logs".to_owned()],
+            ..ConfigFlags::default()
+        };
+        let layer = test_cache_flags(flags.to_layer(None).unwrap());
+        let loaded = load(&LoadOptions {
+            config_flag: Some(path),
+            env: Vec::new(),
+            flags: layer,
+            cwd: dir.path().to_path_buf(),
+            default_paths: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(loaded.config.buckets.len(), 2);
+        assert_eq!(loaded.config.buckets[0].name, "media");
+        assert_eq!(
+            loaded.config.buckets[0].ttl.unwrap().as_duration(),
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(
+            loaded.config.buckets[0].cache_mode,
+            Some(super::super::CacheMode::Read)
+        );
+        assert_eq!(loaded.config.buckets[0].replicas, Some(3));
+        assert_eq!(loaded.config.buckets[0].min_replicas, Some(2));
+        assert_eq!(loaded.config.buckets[1].name, "logs");
     }
 
     #[test]

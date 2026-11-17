@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::{Map, Value, json};
 
 use crate::config::ConfigError;
-use crate::config::loader::{read_secret_file, trim_line_end};
+use crate::config::loader::{BUCKETS_ADD_KEY, read_secret_file, trim_line_end};
 use crate::config::secret::SecretString;
 
 /// S3 sidecar command line.
@@ -892,14 +892,8 @@ impl ConfigFlags {
             set(&mut object, &["buckets"], parsed);
         }
         if !self.bucket.is_empty() {
-            let mut buckets = match object.remove("buckets") {
-                Some(Value::Array(buckets)) => buckets,
-                _ => Vec::new(),
-            };
-            for name in &self.bucket {
-                buckets.push(json!({ "name": name }));
-            }
-            set(&mut object, &["buckets"], Value::Array(buckets));
+            let names = self.bucket.iter().map(|name| json!(name)).collect();
+            object.insert(BUCKETS_ADD_KEY.to_owned(), Value::Array(names));
         }
 
         if let Some(value) = &self.clients_json {
