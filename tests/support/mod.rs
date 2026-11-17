@@ -110,6 +110,26 @@ pub fn gauge(data: &[ResourceMetrics], name: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Return the most recent value of a `u64` gauge across all exports.
+#[must_use]
+pub fn latest_gauge(data: &[ResourceMetrics], name: &str) -> u64 {
+    let mut latest = None;
+    for resource in data {
+        for scope in resource.scope_metrics() {
+            for item in scope.metrics() {
+                if item.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Gauge(gauge)) = item.data()
+                {
+                    for point in gauge.data_points() {
+                        latest = Some(point.value());
+                    }
+                }
+            }
+        }
+    }
+    latest.unwrap_or(0)
+}
+
 /// Return the last value of a `u64` gauge with one matching attribute.
 #[must_use]
 pub fn gauge_with(data: &[ResourceMetrics], name: &str, key: &str, value: &str) -> u64 {

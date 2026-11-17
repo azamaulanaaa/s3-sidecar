@@ -1924,6 +1924,98 @@ async fn small_cap_evicts_to_low_watermark() {
 }
 
 #[tokio::test]
+async fn pending_write_survives_forced_eviction() {
+    let (origin_url, origin) = spawn_origin().await;
+    origin.put("media/item", &[b'a'; 60], "\"etag-old\"");
+    origin.put("media/filler-one", &[b'b'; 60], "\"etag-one\"");
+    origin.put("media/filler-two", &[b'c'; 60], "\"etag-two\"");
+    let hold = origin.hold_put("media/item");
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let telemetry = support::TestMetrics::new();
+    let mut sidecar_config = config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        100,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    );
+    sidecar_config.cache.low_watermark = 0.0;
+    let sidecar = spawn_sidecar_with_metrics(sidecar_config, &telemetry).await;
+    let client = reqwest::Client::new();
+
+    let first_get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/item", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first_get.status(), StatusCode::OK);
+    assert_eq!(body_text(first_get).await, "a".repeat(60));
+    wait_for(Duration::from_secs(3), || {
+        let telemetry = telemetry.clone();
+        async move {
+            support::latest_gauge(&telemetry.collect(), "s3_sidecar.cache.tracked_bytes") == 60
+        }
+    })
+    .await;
+
+    let put = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/item", sidecar.url),
+        Some(b"new pending body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    hold.wait_started().await;
+    assert_eq!(
+        support::latest_gauge(&telemetry.collect(), "s3_sidecar.cache.tracked_bytes"),
+        16
+    );
+
+    for key in ["filler-one", "filler-two"] {
+        let get = signed_request(
+            &client,
+            Method::GET,
+            &format!("{}/media/{key}", sidecar.url),
+            None,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let _ = body_text(get).await;
+    }
+    wait_for(Duration::from_secs(3), || {
+        let telemetry = telemetry.clone();
+        async move { support::counter(&telemetry.collect(), "s3_sidecar.cache.evictions") >= 2 }
+    })
+    .await;
+
+    let get = signed_request(
+        &client,
+        Method::GET,
+        &format!("{}/media/item", sidecar.url),
+        None,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    assert_eq!(body_text(get).await, "new pending body");
+    assert!(cache.has(&blob_key("cache", "media", "item")));
+}
+
+#[tokio::test]
 async fn read_mode_put_invalidates_the_cache() {
     let (origin_url, origin) = spawn_origin().await;
     origin.put("media/item", b"old", "\"etag-1\"");

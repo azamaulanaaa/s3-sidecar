@@ -1678,6 +1678,8 @@ impl Cache {
         );
         lock(&self.tombstones).remove(&(bucket.to_owned(), key.to_owned()));
         self.enqueue((bucket.to_owned(), key.to_owned()), journal);
+        // Track the pending blob so eviction cannot delete its cache_key.
+        self.index_upsert(cache_key, meta).await?;
         Ok(())
     }
 
