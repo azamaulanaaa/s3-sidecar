@@ -826,16 +826,29 @@ impl Cluster {
         Ok(Some(stream_response(response, metadata)))
     }
 
-    /// Delete one object. A missing key also returns `204`.
+    /// Delete one object when the request conditions pass.
+    ///
+    /// A missing key also returns `204`. A failed condition returns `412`.
     ///
     /// # Errors
     ///
-    /// Returns an error when the delete proposal fails.
-    pub async fn delete(&self, bucket: &str, key: &str) -> Result<Response, S3Error> {
+    /// Returns `412` when a request condition fails. Returns an error when the
+    /// delete proposal fails.
+    pub async fn delete(
+        &self,
+        bucket: &str,
+        key: &str,
+        headers: &HeaderMap,
+    ) -> Result<Response, S3Error> {
         let current = self
             .state
             .get_metadata(bucket, key)
             .map_err(map_coord_error)?;
+        let if_none_match = header_is(headers, header::IF_NONE_MATCH, "*");
+        let if_match = header_string(headers, header::IF_MATCH);
+        if condition_failed(current.as_ref(), if_none_match, if_match.as_deref()) {
+            return Err(precondition_failed());
+        }
         let blob = current
             .as_ref()
             .map(|metadata| metadata.blob.clone())

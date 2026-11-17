@@ -1382,7 +1382,7 @@ async fn forward_cluster(
                 )
                 .await
         }
-        &Method::DELETE => cluster.delete(&bucket, &key).await,
+        &Method::DELETE => cluster.delete(&bucket, &key, &headers).await,
         _ => Err(S3Error::not_implemented(
             "This operation is not supported in cluster mode.",
         )),

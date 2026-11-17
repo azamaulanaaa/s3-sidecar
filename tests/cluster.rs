@@ -1483,6 +1483,81 @@ async fn tombstone_hides_the_key_and_delete_is_idempotent() {
 }
 
 #[tokio::test]
+async fn delete_checks_conditional_headers_before_proposing_a_tombstone() {
+    let (backing, _) = spawn_backing().await;
+    let dir = tempfile::tempdir().unwrap();
+    let sidecar = spawn_sidecar(cluster_config(
+        backing,
+        "a",
+        &dir.path().join("meta.redb"),
+        ReadMode::Local,
+        3_600,
+        86_400,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/media/cond-delete", sidecar.url);
+    let created = put(&client, &url, b"keep", &[]).await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let etag = created
+        .headers()
+        .get(header::ETAG)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    let response = signed_request(
+        &client,
+        Method::DELETE,
+        &url,
+        None,
+        &[("if-match", "\"wrong\"")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+    let response = signed_request(
+        &client,
+        Method::DELETE,
+        &url,
+        None,
+        &[("if-none-match", "*")],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+    let response = signed_request(&client, Method::GET, &url, None, &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, "keep");
+
+    let response = signed_request(
+        &client,
+        Method::DELETE,
+        &url,
+        None,
+        &[("if-match", etag.as_str())],
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = signed_request(&client, Method::GET, &url, None, &[])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn metadata_survives_restart() {
     let (backing, _) = spawn_backing().await;
     let dir = tempfile::tempdir().unwrap();
