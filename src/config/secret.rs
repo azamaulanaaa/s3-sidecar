@@ -46,7 +46,7 @@ impl Serialize for SecretString {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.0)
+        serializer.serialize_str(self.redacted())
     }
 }
 
@@ -56,5 +56,20 @@ impl<'de> Deserialize<'de> for SecretString {
         D: Deserializer<'de>,
     {
         String::deserialize(deserializer).map(Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn serialization_hides_the_secret_value() {
+        let secret = SecretString::new("super-secret-value");
+        let json = serde_json::to_string(&secret).unwrap();
+        assert!(!json.contains("super-secret-value"));
+        assert_eq!(json, "\"****\"");
     }
 }

@@ -26,6 +26,7 @@ pub const S3_MAX_PART_BYTES: u64 = 5 * 1_024 * 1_024 * 1_024;
 pub const S3_MAX_PARTS: u32 = 10_000;
 
 /// Run mode for the sidecar.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
@@ -46,6 +47,7 @@ impl fmt::Display for Mode {
 }
 
 /// Cache behavior for reads and writes.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheMode {
@@ -69,6 +71,7 @@ impl fmt::Display for CacheMode {
 }
 
 /// Cache write policy.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WritePolicy {
@@ -89,6 +92,7 @@ impl fmt::Display for WritePolicy {
 }
 
 /// Action when the cache is not available.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnCacheError {
@@ -109,6 +113,7 @@ impl fmt::Display for OnCacheError {
 }
 
 /// Coordination backend for cluster mode.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsensusBackend {
@@ -132,6 +137,7 @@ impl fmt::Display for ConsensusBackend {
 }
 
 /// Write acknowledgement level for a cluster bucket.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WriteAck {
@@ -1477,6 +1483,108 @@ mod tests {
     #[test]
     fn cache_mode_defaults_to_read_write() {
         assert_eq!(CacheMode::default(), CacheMode::ReadWrite);
+    }
+
+    #[test]
+    fn config_enums_keep_their_display_text() {
+        assert_eq!(Mode::Cache.to_string(), "cache");
+        assert_eq!(Mode::Cluster.to_string(), "cluster");
+        assert_eq!(CacheMode::Read.to_string(), "read");
+        assert_eq!(CacheMode::Write.to_string(), "write");
+        assert_eq!(CacheMode::ReadWrite.to_string(), "read_write");
+        assert_eq!(WritePolicy::WriteBack.to_string(), "write_back");
+        assert_eq!(WritePolicy::WriteThrough.to_string(), "write_through");
+        assert_eq!(OnCacheError::Origin.to_string(), "origin");
+        assert_eq!(OnCacheError::Fail.to_string(), "fail");
+        assert_eq!(ConsensusBackend::Single.to_string(), "single");
+        assert_eq!(ConsensusBackend::Raft.to_string(), "raft");
+        assert_eq!(ConsensusBackend::Consul.to_string(), "consul");
+        assert_eq!(WriteAck::Leader.to_string(), "leader");
+        assert_eq!(WriteAck::Quorum.to_string(), "quorum");
+        assert_eq!(WriteAck::All.to_string(), "all");
+    }
+
+    #[test]
+    fn config_enums_keep_their_serialized_names() {
+        assert_eq!(serde_json::to_string(&Mode::Cache).unwrap(), "\"cache\"");
+        assert_eq!(
+            serde_json::to_string(&Mode::Cluster).unwrap(),
+            "\"cluster\""
+        );
+        assert_eq!(serde_json::to_string(&CacheMode::Read).unwrap(), "\"read\"");
+        assert_eq!(
+            serde_json::to_string(&CacheMode::Write).unwrap(),
+            "\"write\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CacheMode::ReadWrite).unwrap(),
+            "\"read_write\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WritePolicy::WriteBack).unwrap(),
+            "\"write_back\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WritePolicy::WriteThrough).unwrap(),
+            "\"write_through\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OnCacheError::Origin).unwrap(),
+            "\"origin\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OnCacheError::Fail).unwrap(),
+            "\"fail\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConsensusBackend::Single).unwrap(),
+            "\"single\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConsensusBackend::Raft).unwrap(),
+            "\"raft\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ConsensusBackend::Consul).unwrap(),
+            "\"consul\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WriteAck::Leader).unwrap(),
+            "\"leader\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WriteAck::Quorum).unwrap(),
+            "\"quorum\""
+        );
+        assert_eq!(serde_json::to_string(&WriteAck::All).unwrap(), "\"all\"");
+    }
+
+    #[test]
+    fn config_enums_keep_their_deserialized_values() {
+        assert_eq!(
+            serde_json::from_str::<Mode>("\"cache\"").unwrap(),
+            Mode::Cache
+        );
+        assert_eq!(
+            serde_json::from_str::<CacheMode>("\"read_write\"").unwrap(),
+            CacheMode::ReadWrite
+        );
+        assert_eq!(
+            serde_json::from_str::<WritePolicy>("\"write_through\"").unwrap(),
+            WritePolicy::WriteThrough
+        );
+        assert_eq!(
+            serde_json::from_str::<OnCacheError>("\"fail\"").unwrap(),
+            OnCacheError::Fail
+        );
+        assert_eq!(
+            serde_json::from_str::<ConsensusBackend>("\"consul\"").unwrap(),
+            ConsensusBackend::Consul
+        );
+        assert_eq!(
+            serde_json::from_str::<WriteAck>("\"quorum\"").unwrap(),
+            WriteAck::Quorum
+        );
     }
 
     #[test]
