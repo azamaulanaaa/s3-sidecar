@@ -8,7 +8,7 @@ pub mod raft;
 pub mod replication;
 pub mod state;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -76,6 +76,7 @@ pub struct Cluster {
     metrics: Arc<Metrics>,
     reconcile_cursor: AtomicUsize,
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    active_replication: Mutex<BTreeSet<String>>,
 }
 
 impl Cluster {
@@ -184,6 +185,7 @@ impl Cluster {
             metrics,
             reconcile_cursor: AtomicUsize::new(0),
             tasks: Mutex::new(Vec::new()),
+            active_replication: Mutex::new(BTreeSet::new()),
         })))
     }
 

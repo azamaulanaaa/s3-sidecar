@@ -206,6 +206,23 @@ pub struct ReplicationJob {
     pub bucket: String,
     /// Object key that references the blob.
     pub key: String,
+    /// Token of the worker that holds the lease, when leased.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_owner: Option<String>,
+    /// Unix second when the lease expires, when leased.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<i64>,
+}
+
+impl ReplicationJob {
+    /// Return true while a worker holds an unexpired lease.
+    #[must_use]
+    pub fn is_leased(&self, now: i64) -> bool {
+        matches!(
+            (&self.lease_owner, self.lease_expires_at),
+            (Some(_), Some(expires)) if expires > now
+        )
+    }
 }
 
 /// Result of one applied entry.
@@ -1312,6 +1329,9 @@ impl MetadataStore {
 
     /// Claim one due replication job for the lease period.
     ///
+    /// Skip jobs in `active` and jobs that another worker leases. Set the
+    /// lease owner and expiry on the stored job before it is returned.
+    ///
     /// # Errors
     ///
     /// Returns a storage error.
@@ -1319,6 +1339,8 @@ impl MetadataStore {
         &self,
         now: i64,
         lease: i64,
+        owner: &str,
+        active: &[String],
     ) -> Result<Option<ReplicationJob>, CoordError> {
         let _guard = self
             .write_lock
@@ -1340,10 +1362,14 @@ impl MetadataStore {
                 let (_, value) = item.map_err(|error| CoordError::Storage(error.to_string()))?;
                 let job: ReplicationJob = serde_json::from_slice(value.value())
                     .map_err(|error| CoordError::Storage(error.to_string()))?;
-                if job.next_at <= now {
-                    found = Some(job);
-                    break;
+                if job.next_at > now || job.is_leased(now) {
+                    continue;
                 }
+                if active.iter().any(|uuid| uuid == &job.uuid) {
+                    continue;
+                }
+                found = Some(job);
+                break;
             }
             found
         };
@@ -1351,7 +1377,8 @@ impl MetadataStore {
             return Ok(None);
         };
         let mut leased = job.clone();
-        leased.next_at = now.saturating_add(lease);
+        leased.lease_owner = Some(owner.to_owned());
+        leased.lease_expires_at = Some(now.saturating_add(lease));
         write_replication_job(&write, &leased)?;
         write
             .commit()
@@ -1425,6 +1452,8 @@ impl MetadataStore {
         };
         job.attempts = attempts;
         job.next_at = next_at;
+        job.lease_owner = None;
+        job.lease_expires_at = None;
         write_replication_job(&write, &job)?;
         write
             .commit()

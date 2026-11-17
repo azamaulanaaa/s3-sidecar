@@ -1128,6 +1128,8 @@ fn replication_job_round_trips_through_the_store() {
         created_at: 0,
         bucket: "media".to_owned(),
         key: "key".to_owned(),
+        lease_owner: None,
+        lease_expires_at: None,
     };
     store.enqueue_replication_job(&job).unwrap();
     let jobs = store.replication_jobs().unwrap();
@@ -1135,4 +1137,57 @@ fn replication_job_round_trips_through_the_store() {
     assert_eq!(jobs[0].uuid, "blob");
     store.complete_replication_target("blob", "b").unwrap();
     assert!(store.replication_jobs().unwrap().is_empty());
+}
+
+#[test]
+fn lease_prevents_reclaim_until_expiry() {
+    let dir = TempDir::new().unwrap();
+    let store = MetadataStore::open(&dir.path().join("jobs.redb")).unwrap();
+    let job = ReplicationJob {
+        uuid: "blob".to_owned(),
+        op: ReplicationOp::Put,
+        targets: vec!["b".to_owned()],
+        done: Vec::new(),
+        attempts: 0,
+        next_at: 0,
+        created_at: 0,
+        bucket: "media".to_owned(),
+        key: "key".to_owned(),
+        lease_owner: None,
+        lease_expires_at: None,
+    };
+    store.enqueue_replication_job(&job).unwrap();
+
+    let claimed = store
+        .claim_due_replication_job(0, 30, "worker-a", &[])
+        .unwrap()
+        .expect("one job is due");
+    assert_eq!(claimed.uuid, "blob");
+
+    let stored = store.replication_job("blob").unwrap().unwrap();
+    assert_eq!(stored.lease_owner.as_deref(), Some("worker-a"));
+    assert_eq!(stored.lease_expires_at, Some(30));
+
+    let during_lease = store
+        .claim_due_replication_job(10, 30, "worker-b", &[])
+        .unwrap();
+    assert!(
+        during_lease.is_none(),
+        "worker-b must not re-claim a leased job"
+    );
+
+    let active = store
+        .claim_due_replication_job(40, 30, "worker-b", &["blob".to_owned()])
+        .unwrap();
+    assert!(
+        active.is_none(),
+        "an active job must be skipped after its lease expires"
+    );
+
+    let after_lease = store
+        .claim_due_replication_job(40, 30, "worker-b", &[])
+        .unwrap()
+        .expect("the job is due after the lease expires");
+    assert_eq!(after_lease.uuid, "blob");
+    assert_eq!(after_lease.lease_owner.as_deref(), Some("worker-a"));
 }

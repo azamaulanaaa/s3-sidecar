@@ -22,7 +22,10 @@ use super::{
 use crate::errors::S3Error;
 use crate::storage::{ForwardRequest, StorageError};
 
-const CLAIM_LEASE_SECONDS: i64 = 5;
+/// Multiply the peer copy timeout by this factor to get the claim lease.
+const CLAIM_LEASE_MARGIN: i64 = 4;
+/// Lower bound for the claim lease, in seconds.
+const MIN_CLAIM_LEASE_SECONDS: i64 = 30;
 const RECONCILE_BATCH: usize = 256;
 const OWNER_REPAIR_BATCH: usize = 16;
 const MAX_RETRY_SECONDS: u64 = 60;
@@ -114,6 +117,8 @@ impl Cluster {
             created_at: now,
             bucket: bucket.to_owned(),
             key: key.to_owned(),
+            lease_owner: None,
+            lease_expires_at: None,
         };
         if let Err(error) = self.state.enqueue_replication_job(&job) {
             warn!(%error, "cannot queue blob replication");
@@ -240,17 +245,40 @@ impl Cluster {
             created_at: now,
             bucket: bucket.to_owned(),
             key: key.to_owned(),
+            lease_owner: None,
+            lease_expires_at: None,
         };
         if let Err(error) = self.state.enqueue_replication_job(&job) {
             warn!(%error, "cannot queue blob delete");
         }
     }
 
+    /// Return the claim lease in seconds from the peer copy timeout.
+    fn replication_claim_lease(&self) -> i64 {
+        let seconds = i64::try_from(
+            self.config
+                .cluster
+                .replicate_timeout
+                .as_duration()
+                .as_secs(),
+        )
+        .unwrap_or(i64::MAX);
+        seconds
+            .saturating_mul(CLAIM_LEASE_MARGIN)
+            .max(MIN_CLAIM_LEASE_SECONDS)
+    }
+
     /// Process at most one due replication job. Returns true when a job ran.
     pub(crate) async fn replication_tick(&self) -> bool {
+        let lease = self.replication_claim_lease();
+        let owner = super::next_id();
+        let active: Vec<String> = super::lock(&self.active_replication)
+            .iter()
+            .cloned()
+            .collect();
         let job = match self
             .state
-            .claim_due_replication_job(unix_now(), CLAIM_LEASE_SECONDS)
+            .claim_due_replication_job(unix_now(), lease, &owner, &active)
         {
             Ok(job) => job,
             Err(error) => {
@@ -260,6 +288,11 @@ impl Cluster {
         };
         let Some(job) = job else {
             return false;
+        };
+        super::lock(&self.active_replication).insert(job.uuid.clone());
+        let _guard = ActiveReplicationGuard {
+            active: &self.active_replication,
+            uuid: job.uuid.clone(),
         };
         self.process_replication_job(&job).await;
         true
@@ -712,6 +745,8 @@ impl Cluster {
                     created_at: now,
                     bucket: bucket.clone(),
                     key: key.clone(),
+                    lease_owner: None,
+                    lease_expires_at: None,
                 };
                 if let Err(error) = self.state.enqueue_replication_job(&job) {
                     warn!(%error, "cannot queue reconciliation replication");
@@ -721,6 +756,18 @@ impl Cluster {
         self.reconcile_cursor.store(end % total, Ordering::Relaxed);
         self.metrics.set_reconcile(checked, present, missing);
         Ok(())
+    }
+}
+
+/// Remove one job id from the active set on drop.
+struct ActiveReplicationGuard<'a> {
+    active: &'a std::sync::Mutex<BTreeSet<String>>,
+    uuid: String,
+}
+
+impl Drop for ActiveReplicationGuard<'_> {
+    fn drop(&mut self) {
+        super::lock(self.active).remove(&self.uuid);
     }
 }
 
