@@ -64,37 +64,54 @@ pub fn metric<'a>(data: &'a [ResourceMetrics], name: &str) -> Option<&'a Metric>
         .find(|metric| metric.name() == name)
 }
 
-/// Return the value of a `u64` counter, summed over all data points.
+/// Return the most recent value of a `u64` counter across all exports.
 #[must_use]
 pub fn counter(data: &[ResourceMetrics], name: &str) -> u64 {
-    let Some(metric) = metric(data, name) else {
-        return 0;
-    };
-    let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
-        return 0;
-    };
-    sum.data_points()
-        .map(SumDataPoint::value)
-        .fold(0, u64::saturating_add)
+    let mut latest = None;
+    for resource in data {
+        for scope in resource.scope_metrics() {
+            for item in scope.metrics() {
+                if item.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Sum(sum)) = item.data()
+                {
+                    latest = Some(
+                        sum.data_points()
+                            .map(SumDataPoint::value)
+                            .fold(0, u64::saturating_add),
+                    );
+                }
+            }
+        }
+    }
+    latest.unwrap_or(0)
 }
 
-/// Return the value of a `u64` counter with one matching attribute.
+/// Return the most recent `u64` counter value with one matching attribute.
 #[must_use]
 pub fn counter_with(data: &[ResourceMetrics], name: &str, key: &str, value: &str) -> u64 {
-    let Some(metric) = metric(data, name) else {
-        return 0;
-    };
-    let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
-        return 0;
-    };
-    sum.data_points()
-        .filter(|point| {
-            point
-                .attributes()
-                .any(|attribute| attribute.key.as_str() == key && attribute.value.as_str() == value)
-        })
-        .map(SumDataPoint::value)
-        .fold(0, u64::saturating_add)
+    let mut latest = None;
+    for resource in data {
+        for scope in resource.scope_metrics() {
+            for item in scope.metrics() {
+                if item.name() == name
+                    && let AggregatedMetrics::U64(MetricData::Sum(sum)) = item.data()
+                {
+                    latest = Some(
+                        sum.data_points()
+                            .filter(|point| {
+                                point.attributes().any(|attribute| {
+                                    attribute.key.as_str() == key
+                                        && attribute.value.as_str() == value
+                                })
+                            })
+                            .map(SumDataPoint::value)
+                            .fold(0, u64::saturating_add),
+                    );
+                }
+            }
+        }
+    }
+    latest.unwrap_or(0)
 }
 
 /// Return the last value of a `u64` gauge.
@@ -177,4 +194,23 @@ pub fn histogram_sum(data: &[ResourceMetrics], name: &str) -> f64 {
         return 0.0;
     };
     histogram.data_points().map(HistogramDataPoint::sum).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_returns_latest_value_across_exports() {
+        let telemetry = TestMetrics::new();
+        telemetry.metrics.set_tracked(60);
+        let _ = telemetry.collect();
+
+        telemetry.metrics.evicted();
+        let _ = telemetry.collect();
+        telemetry.metrics.evicted();
+        let data = telemetry.collect();
+
+        assert_eq!(counter(&data, "s3_sidecar.cache.evictions"), 2);
+    }
 }
