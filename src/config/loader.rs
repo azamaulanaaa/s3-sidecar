@@ -516,6 +516,7 @@ fn append_bucket_names(merged: &mut Value, names: &[String], sources: &mut Sourc
 fn record_sources(value: &Value, source: Source, path: &str, sources: &mut SourceMap) {
     match value {
         Value::Object(map) => {
+            sources.insert(path.to_owned(), source);
             for (key, child) in map {
                 let child_path = if path.is_empty() {
                     key.clone()
@@ -1076,6 +1077,13 @@ mod provenance_tests {
             .unwrap_or_else(|| panic!("missing field {field} in\n{table}"))
     }
 
+    fn source_of<'a>(table: &'a str, field: &str) -> &'a str {
+        line(table, field)
+            .split_whitespace()
+            .last()
+            .unwrap_or_else(|| panic!("missing source for {field}"))
+    }
+
     #[test]
     fn show_config_reports_each_field_source() {
         let dir = tempdir().unwrap();
@@ -1155,5 +1163,27 @@ region = "us-east-1"
         let table = show_table(&loaded.config, &loaded.sources);
         assert!(line(&table, "server.bind").contains("flag"));
         assert!(line(&table, "origin.region").contains("env"));
+    }
+
+    #[test]
+    fn object_valued_fields_report_their_source() {
+        let dir = tempdir().unwrap();
+        let env = vec![(
+            "S3_SIDECAR_OTEL__HEADERS".to_owned(),
+            r#"{"x-api-key":"secret-value"}"#.to_owned(),
+        )];
+        let flags = json!({"otel": {"resource_attributes": {"team": "payments"}}});
+        let loaded = load(&LoadOptions {
+            config_flag: None,
+            env,
+            flags: test_cache_flags(flags),
+            cwd: dir.path().to_path_buf(),
+            default_paths: Vec::new(),
+        })
+        .unwrap();
+        let table = show_table(&loaded.config, &loaded.sources);
+
+        assert_eq!(source_of(&table, "otel.headers"), "env");
+        assert_eq!(source_of(&table, "otel.resource_attributes"), "flag");
     }
 }
