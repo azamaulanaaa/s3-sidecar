@@ -1038,14 +1038,15 @@ impl Cache {
                 let mut pending = lock(&self.pending);
                 remove_pending_if_current(&mut pending, &key, &path)
             };
-            // A delete tombstone wins over a write that finished after the
-            // delete. Do not put the metadata back into the cache.
+            // Skip metadata updates when a newer write owns the key or a
+            // delete tombstone is present. An older journal must not change
+            // the state or the ETag of the newer pending entry.
             if self.mode() == CacheMode::Write {
                 // A newer write owns the blob when this journal is not current.
                 if current && !self.is_tombstoned(bucket, &entry.key) {
                     self.invalidate(bucket, &entry.key).await;
                 }
-            } else if !self.is_tombstoned(bucket, &entry.key) {
+            } else if current && !self.is_tombstoned(bucket, &entry.key) {
                 let mut meta = self
                     .read_meta(bucket, &entry.key)
                     .await

@@ -195,6 +195,14 @@ impl CacheHandle {
         self.objects.lock().unwrap().contains_key(key)
     }
 
+    fn object(&self, key: &str) -> Option<Vec<u8>> {
+        self.objects
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|stored| stored.body.to_vec())
+    }
+
     fn fail_puts(&self) {
         *self.put_status.lock().unwrap() = Some(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -1701,6 +1709,70 @@ async fn newer_pending_write_keeps_the_cache_blob() {
         async move { !cache.has(&blob) && !cache.has(&format!("{blob}.meta")) }
     })
     .await;
+}
+
+#[tokio::test]
+async fn older_sync_does_not_mark_newer_pending_write_as_synced() {
+    let (origin_url, origin) = spawn_origin().await;
+    let hold = origin.hold_put("media/stale-etag");
+    let (cache_url, cache) = spawn_cache().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config(
+        origin_url,
+        cache_url,
+        CacheMode::ReadWrite,
+        0,
+        3_600,
+        WritePolicy::WriteBack,
+        OnCacheError::Origin,
+        &dir.path().join("index.redb"),
+    );
+    config.cache.sync_debounce_ms = 10;
+    let sidecar = spawn_sidecar(config).await;
+    let client = reqwest::Client::new();
+
+    let first = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/stale-etag", sidecar.url),
+        Some(b"first body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    hold.wait_started().await;
+
+    let second = signed_request(
+        &client,
+        Method::PUT,
+        &format!("{}/media/stale-etag", sidecar.url),
+        Some(b"second body".to_vec()),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+
+    let meta_key = format!("{}.meta", blob_key("cache", "media", "stale-etag"));
+    let pending_bytes = cache.object(&meta_key).unwrap();
+    let pending: CacheMetadata = serde_json::from_slice(&pending_bytes).unwrap();
+    assert_eq!(pending.state, EntryState::Pending);
+
+    // Let the older sync finish while the newer write is blocked at origin.
+    hold.release();
+    wait_for(Duration::from_secs(5), || {
+        let origin = origin.clone();
+        async move { origin.body("media/stale-etag").as_deref() == Some(b"first body") }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let current_bytes = cache.object(&meta_key).unwrap();
+    let current: CacheMetadata = serde_json::from_slice(&current_bytes).unwrap();
+    assert_eq!(current.state, EntryState::Pending);
+    assert_eq!(current.etag, pending.etag);
+    assert_ne!(current.etag, "\"etag-1\"");
 }
 
 #[tokio::test]
