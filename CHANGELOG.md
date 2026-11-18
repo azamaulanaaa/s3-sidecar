@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file.
 
 The format follows Keep a Changelog. This project uses Semantic Versioning.
 
+## [0.3.0-rc.3] - 2026-11-18
+
+This candidate adds the configuration, cache, replication, and cluster fixes
+made after rc.2 to the 0.3.0 candidate. The final 0.3.0 release follows after
+the candidate passes.
+
 ## [0.3.0-rc.2] - 2026-11-15
 
 This candidate adds the cache `ListObjects` merge and the cached-read `503`
@@ -39,6 +45,11 @@ after the candidate passes.
   `StartAfter` apply to the merged view.
 - Cache mode merged listings support `encoding-type=url`. Any other
   `encoding-type` value returns `400 InvalidArgument`.
+- The CLI now accepts `true` or `false` for its boolean flags. The flags are
+  `--cluster-read-repair`, `--otel-metrics`, `--otel-traces`, `--otel-logs`, and
+  `--otel-record-object-keys`. Each flag has a matching `--no-` flag that sets
+  the value to `false`. The `--no-` flag overrides a `true` value from the
+  config file.
 
 ### Changed
 
@@ -61,6 +72,11 @@ after the candidate passes.
 - The sidecar now reads multipart query parameters by exact name. A request
   path that contains `uploads` or `uploadId` as text no longer selects a
   multipart path.
+- In cache mode `write`, the sidecar removes the cache blob, its metadata
+  object, and its LRU index entry after origin accepts a write. A newer pending
+  write keeps its cache blob.
+- Error types now keep their underlying source errors in storage and telemetry
+  setup paths.
 
 ### Fixed
 
@@ -81,10 +97,42 @@ after the candidate passes.
   cargo-dist custom job. It also retries a denied first push three times.
 - A pending or fresh cached `GET` or `HEAD` returns `503 ServiceUnavailable`
   when the cache entry has no readable body.
+- A `--bucket` flag now adds its names to the buckets from the config file. The
+  flag no longer replaces those buckets.
+- The `otel.headers_file` setting now applies at its own configuration
+  precedence. A headers file from a higher-precedence source overrides inline
+  headers from a lower-precedence source.
+- The `show config` command now reports the source of object-valued settings.
+- A read repair no longer delays the client response. The sidecar streams the
+  first peer response to the client and fetches the blob again in the
+  background.
+- Reconciliation now fetches the blob before it queues a put. A node outside
+  the replica set can now repair a missing replica.
+- Replication workers now lease jobs before they process them. A worker cannot
+  re-claim a job that another worker holds or processes.
+- Cluster delete now evaluates `If-Match` and `If-None-Match` before it proposes
+  a tombstone. A failed condition returns `412 PreconditionFailed`.
+- Single-node proposals now allocate applied indexes under one lock. Concurrent
+  proposals get unique, increasing indexes.
+- A cluster PUT with no `Content-Length` now keeps the full body when it stages
+  the blob. The sidecar no longer assumes a zero length.
+- `If-Match` conditions now use strong ETag comparison. A weak validator such as
+  `W/"etag"` no longer matches. `If-None-Match` still uses weak comparison.
+- The `max_body_bytes` limit now uses the decoded length for `aws-chunked`
+  requests. Chunk framing no longer counts toward the limit.
+- An older sync no longer marks a newer pending write as synced. The newer write
+  keeps its state and ETag.
+- The cache now drains a queued entry and clears the worker flag under one lock.
+  A queued entry no longer waits after a worker exits.
+- The cache now indexes a pending write before it syncs. Eviction no longer
+  removes the blob that a pending write needs.
 
 ### Security
 
-No security fixes in this release.
+- A secret setting now serializes as a redacted value. The plaintext no longer
+  appears in serialized configuration.
+- The dependency audit now ignores three transitive advisories for unmaintained
+  chrono crates. No safe upgrade exists for those crates.
 
 ### Known limits
 
